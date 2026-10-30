@@ -69,6 +69,8 @@ const RETAINED_COLUMNS = [
   ["provider_limit_windows", "account_id, provider, window_name, utilization, status, resets_at, observed_at, run_id, home_path"],
   ["run_accounts", "run_id, account_id, account_label, account_identity, bound_at, home_path"],
   ["run_account_pins", "run_id, account_id, home_path, home_known"],
+  ["trusted_lifecycle_configs", "project_id, project_path, config_digest, trusted_at"],
+  ["worktree_lifecycle", "worktree_path, project_id, state, updated_at"],
 ];
 const RUN_RETAINED_FIELDS = RETAINED_COLUMNS.find(([name]) => name === "runs")[1];
 // The account a run launched with, and the login key it used: the key of
@@ -82,6 +84,16 @@ const RUN_ACCOUNT_FIELDS = `account.account_id AS accountId, account.account_lab
 const RUN_ACCOUNT_JOINS = "LEFT JOIN run_accounts AS account ON account.run_id = runs.id LEFT JOIN run_account_pins AS pin ON pin.run_id = runs.id";
 const PROVIDER_ACCOUNT_FIELDS = "id, provider, label, home_path AS homePath, created_at AS createdAt";
 const MAX_ACCOUNTS_PER_PROVIDER = 16;
+const MAX_TRUSTED_LIFECYCLE_CONFIGS = 16;
+const MAX_WORKTREE_LIFECYCLE_STATES = 512;
+// A running state is what archive maintenance waits for and what restore
+// turns into an unconfirmed interruption. Retention keeps it, and every state
+// the lifecycle service keeps (lifecycleStateKept), however many newer states
+// are saved; the service forgets those whose worktree is gone.
+const LIFECYCLE_STATE_RUNNING = "COALESCE(json_extract(state, '$.status'), '') = 'running'";
+const LIFECYCLE_STATE_KEPT = `${LIFECYCLE_STATE_RUNNING} OR COALESCE(json_extract(state, '$.outcomeUnknown'), 0) <> 0
+  OR COALESCE(json_extract(state, '$.status'), '') IN ('failed', 'cancelled', 'interrupted')
+  OR COALESCE(json_extract(state, '$.checkpoints'), '{}') <> '{}'`;
 const MAX_LIMIT_WINDOWS_PER_HOME = 8;
 
 const SETTING_RULES = {
@@ -272,7 +284,7 @@ export function createOutrightDatabase(options = {}) {
     },
     onWorkerReady: (snapshot) => {
       if (activeMessageFinds || terminalAuditScan || runReconciliationPending || deletionsInFlight.size !== 1
-        || db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()) {
+        || maintenanceMustWait(db)) {
         const error = databaseError(503, "Archive maintenance must wait for other work");
         error.code = "ARCHIVE_DEFERRED";
         throw error;
@@ -2112,8 +2124,56 @@ export function createOutrightDatabase(options = {}) {
     },
     untrustProject(projectId) { db.transaction(() => {
       const result = db.prepare("DELETE FROM trusted_projects WHERE project_id = ?").run(projectId);
-      if (result.changes) writeCriticalAudit("project.untrusted", { target: projectId });
+      // Repository setup and teardown commands are trusted per project too.
+      const lifecycle = db.prepare("DELETE FROM trusted_lifecycle_configs WHERE project_id = ?").run(projectId);
+      if (result.changes || lifecycle.changes) writeCriticalAudit("project.untrusted", { target: projectId });
     }).immediate(); },
+    // Trust in a worktree lifecycle configuration binds the project's identity
+    // and path to the exact bytes the user reviewed. A project keeps its most
+    // recent trusted versions, so branches with different configs coexist.
+    trustLifecycleConfig(projectId, projectPath, digest) {
+      withinRetainedBudget(() => {
+        db.prepare(`INSERT INTO trusted_lifecycle_configs (project_id, project_path, config_digest, trusted_at) VALUES (?, ?, ?, ?)
+          ON CONFLICT(project_id, config_digest) DO UPDATE SET project_path = excluded.project_path, trusted_at = excluded.trusted_at`)
+          .run(projectId, projectPath, digest, now());
+        db.prepare(`DELETE FROM trusted_lifecycle_configs WHERE project_id = ? AND config_digest NOT IN (
+          SELECT config_digest FROM trusted_lifecycle_configs WHERE project_id = ? ORDER BY trusted_at DESC, config_digest LIMIT ?)`)
+          .run(projectId, projectId, MAX_TRUSTED_LIFECYCLE_CONFIGS);
+        writeAudit("worktree.lifecycle.trusted", { target: projectId, path: projectPath, digest });
+      });
+    },
+    isLifecycleConfigTrusted(projectId, projectPath, digest) {
+      const row = db.prepare("SELECT project_path FROM trusted_lifecycle_configs WHERE project_id = ? AND config_digest = ?").get(projectId, digest);
+      return row?.project_path === projectPath;
+    },
+    listWorktreeLifecycle() {
+      // Oldest first, so the service's retention gives way in the same order.
+      return db.prepare("SELECT state FROM worktree_lifecycle ORDER BY updated_at, worktree_path DESC").all()
+        .map((row) => parseJson(row.state, null)).filter(Boolean);
+    },
+    // Lifecycle state is the durable record of a setup or teardown outcome.
+    // Like a critical audit it may spend the recovery reserve: a state the
+    // user must act on cannot be dropped at the quota edge. Each state is
+    // bounded by the lifecycle service, and only the newest settled states are kept.
+    saveWorktreeLifecycle(state) {
+      db.transaction(() => {
+        reserveRecoveryHeadroom(db, undefined, true);
+        db.prepare(`INSERT INTO worktree_lifecycle (worktree_path, project_id, state, updated_at) VALUES (?, ?, ?, ?)
+          ON CONFLICT(worktree_path) DO UPDATE SET project_id = excluded.project_id, state = excluded.state, updated_at = excluded.updated_at`)
+          .run(state.worktreePath, state.projectId, JSON.stringify(state), state.updatedAt ?? now());
+        // Retention never drops a state something still depends on.
+        db.prepare(`DELETE FROM worktree_lifecycle WHERE NOT (${LIFECYCLE_STATE_KEPT}) AND worktree_path NOT IN (
+          SELECT worktree_path FROM worktree_lifecycle ORDER BY updated_at DESC, worktree_path LIMIT ?)`).run(MAX_WORKTREE_LIFECYCLE_STATES);
+        reserveRecoveryHeadroom(db);
+      }).immediate();
+    },
+    deleteWorktreeLifecycle(worktreePath) {
+      db.transaction(() => {
+        reserveRecoveryHeadroom(db, undefined, true);
+        db.prepare("DELETE FROM worktree_lifecycle WHERE worktree_path = ?").run(worktreePath);
+        reserveRecoveryHeadroom(db);
+      }).immediate();
+    },
     isProjectTrusted(projectId, projectPath) {
       const row = db.prepare("SELECT project_path FROM trusted_projects WHERE project_id = ?").get(projectId);
       return row?.project_path === projectPath;
@@ -2599,13 +2659,20 @@ function deleteArchivedInBatches(db, id, inFlight, { automatic = false, cutoff, 
   return run();
 }
 
+// The offline archive phase closes the database, so it waits for agent runs
+// and for worktree setup or teardown, whose steps save progress as they go.
+function maintenanceMustWait(db) {
+  return Boolean(db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()
+    || db.prepare(`SELECT 1 FROM worktree_lifecycle WHERE ${LIFECYCLE_STATE_RUNNING} LIMIT 1`).get());
+}
+
 async function advanceArchiveDeletion(db, id, { filename, workers, lockGate, cutoverStatGate, cutoverCloseGate, cutoverPromoteGate, copyGate, copyStepGate, copyPhase, canMaintain, onWorkerStart, onWorkerReady, onWorkerExit, onWorkerRecoveryFailure, isClosing }) {
   const step = db.transaction(() => deleteArchivedBatch(db, id, filename)).immediate();
   if (step.done) { onWorkerExit(); return { deleted: 1, id }; }
   if (!step.oversized) return null;
   // The durable marker lets an active run or another cleanup finish before
   // this exclusive offline phase starts.
-  if (workers.size || !canMaintain() || db.prepare("SELECT 1 FROM runs WHERE status IN ('launching', 'running') LIMIT 1").get()) {
+  if (workers.size || !canMaintain() || maintenanceMustWait(db)) {
     return { deleted: 0, deferred: true, id };
   }
   // Only a committed cutover changes a task. Before the rebuild, task reads
@@ -2862,6 +2929,9 @@ function migrate(db, onSpacesMigrationStep) {
     );
     CREATE TABLE IF NOT EXISTS run_event_usage (run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, bytes INTEGER NOT NULL, last_seq INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS trusted_projects (project_id TEXT PRIMARY KEY, project_path TEXT NOT NULL, trusted_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS trusted_lifecycle_configs (project_id TEXT NOT NULL, project_path TEXT NOT NULL, config_digest TEXT NOT NULL,
+      trusted_at TEXT NOT NULL, PRIMARY KEY (project_id, config_digest));
+    CREATE TABLE IF NOT EXISTS worktree_lifecycle (worktree_path TEXT PRIMARY KEY, project_id TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, target TEXT, details TEXT, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS audit_retention_cursor (id INTEGER PRIMARY KEY CHECK (id = 1), cursor INTEGER NOT NULL DEFAULT 0,
       sweep_upper INTEGER NOT NULL DEFAULT 0);

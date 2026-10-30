@@ -140,7 +140,11 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
     return { path: destination, branch };
   }
 
-  async function removeWorktree({ projectId, worktreePath, confirmation }) {
+  // `prepare` runs after every check and before Git removes anything, so a
+  // failed teardown leaves the worktree intact. The scan's changedCount can
+  // be stale, so `prepare` calls `requireClean` before any teardown command
+  // runs: a fresh status that fails or lists a change keeps the worktree.
+  async function removeWorktree({ projectId, worktreePath, confirmation, prepare }) {
     const project = getProjects().find((item) => item.id === projectId);
     const worktree = project?.worktrees.find((item) => item.path === worktreePath);
     if (!project || !worktree) throw httpError(404, "Worktree not found");
@@ -150,6 +154,12 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
     if (database.findUnresolvedInterruptedRunForWorktree?.(worktreePath)) {
       throw httpError(409, "Resolve the interrupted run before removing this worktree");
     }
+    const requireClean = async () => {
+      if (await git(worktreePath, ["status", "--porcelain=v1", "-z", "--untracked-files=normal"])) {
+        throw httpError(409, "Worktree has uncommitted changes");
+      }
+    };
+    await prepare?.({ requireClean });
     await auditedMutation("git.worktree.remove.requested", "git.worktree.removed",
       { target: worktreePath, projectId }, () => git(project.path, ["worktree", "remove", worktreePath]));
     return { removed: true };

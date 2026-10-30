@@ -11,8 +11,9 @@ import { AGENT_SUPERVISOR, createAgentManager, defaultGroupMembers, hardenWindow
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { accountPin, createProviderAccounts } from "./provider-accounts.mjs";
 import { createGitService } from "./git-service.mjs";
+import { createWorktreeLifecycle } from "./worktree-lifecycle.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
-import { utilityProcesses } from "./subprocess-budget.mjs";
+import { lifecycleProcesses, utilityProcesses } from "./subprocess-budget.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
 import { RESOURCE_BUDGETS } from "./resource-budgets.mjs";
 
@@ -49,7 +50,7 @@ function abortableDelay(ms, signal) {
   });
 }
 
-export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), subprocesses = utilityProcesses, recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, databaseFactory = createOutrightDatabase, agentManagerFactory = createAgentManager, providerAccountsFactory = createProviderAccounts, hardenLaunchDirectory = process.platform === "win32" ? hardenWindowsLaunchDirectory : () => {}, terminalManagerFactory = createTerminalManager, hostRestarting = () => false } = {}) {
+export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowedHosts(), subprocesses = utilityProcesses, lifecycleSubprocesses = lifecycleProcesses, recoveryProcessAlive = (pid, handshake) => defaultRecoveryProcessAlive(pid, process.platform, defaultGroupMembers, process.kill, handshake, spawnSync), recoveryProcessIdentity = (pid, ownershipToken, platformOwnershipId) => defaultRecoveryProcessIdentity(pid, process.platform, readFileSync, spawnSync, ownershipToken, platformOwnershipId), terminateRecoveryProcess = defaultTerminateRecoveryProcess, recoveryTerminationGraceMs = 3500, recoveryTerminationTimeoutMs = 8000, deletionWorkerGate, deletionCopyGate, deletionCopyPhase, databaseFactory = createOutrightDatabase, agentManagerFactory = createAgentManager, providerAccountsFactory = createProviderAccounts, hardenLaunchDirectory = process.platform === "win32" ? hardenWindowsLaunchDirectory : () => {}, terminalManagerFactory = createTerminalManager, hostRestarting = () => false } = {}) {
   // The database-backed lease is acquired before reconciliation so another
   // live runtime can never have its queued/running rows treated as crash state.
   let agents;
@@ -138,6 +139,17 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     try { return database.getSettings().terminalReattach === true; } catch { return false; }
   } });
   const git = createGitService({ database, getProjects: () => latestScan?.projects ?? [], getConfig: () => loadOutrightConfig(configUrl), subprocesses });
+  // Setup and teardown never run beside agent work in the same worktree: the
+  // agent manager holds queued runs while a worktree is held, including while
+  // a step's processes are unconfirmed, and a run that waited launches when
+  // the hold ends. Neither starts beside an unresolved interrupted run.
+  const lifecycle = createWorktreeLifecycle({ database, subprocesses: lifecycleSubprocesses, publish: (event) => publish(event),
+    agentWork: (paths) => agents?.hasWorktreeWork(paths) ?? false,
+    interruptedRun: (paths) => paths.map((worktreePath) => database.findUnresolvedInterruptedRunForWorktree(worktreePath)).find(Boolean) ?? null,
+    onRelease: () => { if (!shuttingDown) agents?.resumeQueued(); },
+    onPersistError: (error) => {
+      if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:worktree-lifecycle]", error);
+    } });
   runtimeCapacity = function runtimeCapacity() {
     const capacity = database.capacity();
     return { ...capacity, activeProcesses: agents?.activeProcessCount() ?? 0,
@@ -145,7 +157,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       runRecoveryPhase: runRecovery.phase, runRecoveryError: runRecovery.error?.message ?? null,
       pendingRunOutcomes: agents?.pendingOutcomeCount() ?? 0,
       limits: { ...capacity.limits, maxPendingRunOutcomes: RESOURCE_BUDGETS.maxPendingRunOutcomes },
-      utilityProcesses: subprocesses.capacity(), utilityOwners: subprocesses.unknownOwnerStatus?.() ?? [],
+      utilityProcesses: subprocesses.capacity(), lifecycleProcesses: lifecycleSubprocesses.capacity?.() ?? null,
+      utilityOwners: subprocesses.unknownOwnerStatus?.() ?? [], lifecycleOwners: lifecycleSubprocesses.unknownOwnerStatus?.() ?? [],
       terminalProcesses: terminals.capacity() };
   };
   // Construct the agent manager after the remaining synchronous startup
@@ -164,7 +177,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           .catch((error) => console.error("Runtime shutdown recovery failed", error));
       }
     },
-    onProvidersChanged: (providers) => publish({ type: "providers.changed", payload: { providers } }), validateConversation: async (conversation) => {
+    onProvidersChanged: (providers) => publish({ type: "providers.changed", payload: { providers } }),
+    worktreeHeld: (worktreePath) => Boolean(lifecycle.hold(worktreePath)), validateConversation: async (conversation) => {
     const target = await resolveWorktreeTarget(conversation);
     return () => {
       if (database.getConversation(conversation.id)?.archived) throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
@@ -273,6 +287,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (resolved && !shuttingDown) await terminals.reconcileUnknown();
       }).catch(() => {});
     }
+    // Proving the previous runtime's setup and teardown steps gone releases
+    // the worktrees they held.
+    void Promise.resolve().then(() => lifecycle.reconcile()).then(onRecovered).catch(() => {});
   }
   startOwnershipRecovery();
 
@@ -286,6 +303,18 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     if (!project || !worktree) throw apiError(400, "Destination is not a discovered project worktree");
     if (await canonicalOf(worktree.path) !== canonical) throw apiError(400, "Worktree path does not match the discovered worktree");
     return { project, worktree, worktreePath: canonical };
+  }
+
+  // Lifecycle targets are named by path: scanner ids are path slugs, which two
+  // worktrees can share.
+  async function resolveLifecycleTarget({ projectId, worktreePath }) {
+    if (typeof worktreePath !== "string") throw apiError(400, "Worktree target is required");
+    const canonical = await git.requireWorktree(worktreePath);
+    const project = (await projects()).projects.find((item) => item.id === projectId);
+    for (const worktree of project?.worktrees ?? []) {
+      if (await canonicalOf(worktree.path) === canonical) return { project, worktree, worktreePath: canonical };
+    }
+    throw apiError(400, "Destination is not a discovered project worktree");
   }
 
   async function projects(force = false) {
@@ -304,6 +333,42 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         .finally(() => { inFlightScan = null; });
     }
     return inFlightScan;
+  }
+
+  // A created worktree exists whether or not its setup starts. Setup that
+  // cannot start is reported with the creation, never as its failure.
+  async function setupCreatedWorktree(createdPath) {
+    try {
+      const canonical = await git.requireWorktree(createdPath);
+      for (const project of latestScan?.projects ?? []) {
+        for (const worktree of project.worktrees) {
+          if (await canonicalOf(worktree.path) === canonical) {
+            return { state: await lifecycle.setup({ project, worktree, worktreePath: canonical }, { automatic: true, created: true }) };
+          }
+        }
+      }
+      return { error: "Setup did not start because the new worktree is not discovered yet; open Worktree setup to run it" };
+    } catch (error) {
+      return { error: `Setup did not start: ${error.message}`, code: error.details?.code ?? null };
+    }
+  }
+
+  // An acknowledgement of unconfirmed processes names the attempt the user
+  // was shown, by its run id.
+  function acknowledgedRunId(body) {
+    return typeof body.acknowledgeUnconfirmed === "string" ? body.acknowledgeUnconfirmed : undefined;
+  }
+
+  async function removeWorktreeAfterTeardown(body) {
+    if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.worktreePath !== "string") throw apiError(400, "Worktree target is required");
+    const remove = (prepare) => git.removeWorktree({ projectId: body.projectId, worktreePath: body.worktreePath, confirmation: body.confirmation, prepare });
+    const project = (await projects()).projects.find((item) => item.id === body.projectId);
+    const worktree = project?.worktrees.find((item) => item.path === body.worktreePath);
+    // An unknown target gets the guarded removal's own refusal.
+    if (!project || !worktree) return remove();
+    const worktreePath = await git.requireWorktree(worktree.path);
+    return lifecycle.removeWorktree({ project, worktree, worktreePath }, { remove,
+      skipTeardown: body.skipTeardown === true, acknowledgeUnconfirmed: acknowledgedRunId(body) });
   }
 
   async function refreshProjectsAfterMutation(result) {
@@ -366,14 +431,18 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   // whole-tree evidence, durably audited first; a refused audit or missing
   // evidence keeps the capacity charged.
   async function releaseUtilityOwner(id) {
-    if (typeof subprocesses.releaseUnknownOwner !== "function") throw apiError(404, "Unknown utility owner was not found");
-    const released = await subprocesses.releaseUnknownOwner(id, {
+    // Setup and teardown steps have their own budget and owners.
+    const budget = lifecycleSubprocesses.unknownOwnerStatus?.().some((owner) => owner.id === id) ? lifecycleSubprocesses : subprocesses;
+    if (typeof budget.releaseUnknownOwner !== "function") throw apiError(404, "Unknown utility owner was not found");
+    const released = await budget.releaseUnknownOwner(id, {
       audit: (outcome) => database.auditRequired("utility.owner.released", { target: outcome.id, proven: outcome.proven,
         reason: outcome.reason, platform: outcome.platform, recordedAt: outcome.recordedAt }),
     });
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
     // A terminal proof may have waited only for this helper slot.
     if (!shuttingDown) void terminals.reconcileUnknown().catch(() => {});
+    // The last unconfirmed step may now be proven gone.
+    if (!shuttingDown && budget === lifecycleSubprocesses) void lifecycle.reconcile().catch(() => {});
     return { released, capacity: runtimeCapacity() };
   }
 
@@ -396,6 +465,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (url.pathname === "/api/bootstrap" && request.method === "GET") {
         const scan = await projects();
         const spaces = database.listSpaces();
+        const lifecycleStates = await lifecycle.list();
         return json(response, 200, {
           ...scan,
           spaces,
@@ -404,6 +474,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
           settings: database.getSettings(),
           providers: agents.providers(),
           trustedProjects: database.listTrustedProjects(),
+          // Clients keep lifecycle events published after this revision.
+          worktreeLifecycle: lifecycleStates.states,
+          worktreeLifecycleRevision: lifecycleStates.revision,
           templates: database.listTemplates(),
           // Clients list saved sessions over /api/terminals; bootstrap
           // stays independent of the history population.
@@ -710,6 +783,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         }
         const currentInterrupted = database.findUnresolvedInterruptedRunForWorktree(conversation.worktreePath);
         if (currentInterrupted) throw apiError(409, "Resolve the interrupted run before starting more agent work", { code: "RUN_RECOVERY_REQUIRED", runId: currentInterrupted.id });
+        // An agent would race setup commands that are still changing the
+        // worktree, or work in one being torn down.
+        const lifecycleHold = lifecycle.hold(target.worktreePath) ?? lifecycle.hold(conversation.worktreePath);
+        if (lifecycleHold === "WORKTREE_LIFECYCLE_BUSY") throw apiError(409, "Worktree setup or teardown is running; start work when it finishes", { code: lifecycleHold });
+        if (lifecycleHold) throw apiError(409, "Setup or teardown processes in this worktree are not confirmed stopped; acknowledge them in Worktree setup first", { code: lifecycleHold });
         const { run, message: userMessage } = database.submitRun({ conversationId: conversation.id, worktreePath: conversation.worktreePath, ...runConfig, prompt }, prompt);
         publish({ type: "message.created", conversationId: conversation.id, payload: userMessage });
         return json(response, 202, await agents.schedule({ conversation: database.getConversation(conversation.id), run }));
@@ -964,8 +1042,28 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (url.pathname === "/api/context" && request.method === "GET") return json(response, 200, await git.context(requiredQuery(url, "path")));
       if (url.pathname === "/api/editor/open" && request.method === "POST") { const body = await readJson(request); return json(response, 200, await git.openInEditor(body.path, body.file, body.editor)); }
 
-      if (url.pathname === "/api/worktrees" && request.method === "POST") { const result = await git.createWorktree(await readJson(request)); return json(response, 201, await refreshProjectsAfterMutation(result)); }
-      if (url.pathname === "/api/worktrees" && request.method === "DELETE") { const result = await git.removeWorktree(await readJson(request)); return json(response, 200, await refreshProjectsAfterMutation(result)); }
+      if (url.pathname === "/api/worktrees" && request.method === "POST") {
+        const result = await refreshProjectsAfterMutation(await git.createWorktree(await readJson(request)));
+        return json(response, 201, { ...result, lifecycle: await setupCreatedWorktree(result.path) });
+      }
+      if (url.pathname === "/api/worktrees" && request.method === "DELETE") {
+        const result = await removeWorktreeAfterTeardown(await readJson(request));
+        return json(response, 200, await refreshProjectsAfterMutation(result));
+      }
+      if (url.pathname === "/api/worktrees/lifecycle" && request.method === "GET") {
+        const target = await resolveLifecycleTarget({ projectId: url.searchParams.get("projectId"), worktreePath: requiredQuery(url, "path") });
+        return json(response, 200, await lifecycle.describe(target));
+      }
+      const lifecycleMatch = url.pathname.match(/^\/api\/worktrees\/lifecycle\/(trust|setup|cancel|acknowledge)$/);
+      if (lifecycleMatch && request.method === "POST") {
+        const body = await readJson(request);
+        if (!body || typeof body !== "object" || Array.isArray(body)) throw apiError(400, "Worktree target is required");
+        const target = await resolveLifecycleTarget(body);
+        if (lifecycleMatch[1] === "trust") return json(response, 200, await lifecycle.trust(target, body.digest));
+        if (lifecycleMatch[1] === "cancel") return json(response, 200, { state: lifecycle.cancel(target) });
+        if (lifecycleMatch[1] === "acknowledge") return json(response, 200, { state: lifecycle.acknowledge(target, acknowledgedRunId(body)) });
+        return json(response, 202, { state: await lifecycle.setup(target, { acknowledgeUnconfirmed: acknowledgedRunId(body) }) });
+      }
 
       if (url.pathname === "/api/templates" && request.method === "GET") return json(response, 200, { templates: database.listTemplates() });
       if (url.pathname === "/api/templates" && request.method === "POST") {
@@ -1065,7 +1163,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     let disposed = false;
     shutdownPromise = (async () => {
       const shutdownErrors = [];
-      const preliminaries = await Promise.allSettled([watcher?.close(), agents.shutdown(), accounts.close()]);
+      const preliminaries = await Promise.allSettled([watcher?.close(), agents.shutdown(), accounts.close(), lifecycle.shutdown()]);
       for (const result of preliminaries) if (result.status === "rejected") shutdownErrors.push(result.reason);
       // A failed agent shutdown may be the sole owner of an exited provider's
       // result while both SQLite and its recovery sidecar are unavailable.
@@ -1102,7 +1200,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     return shutdownPromise;
   }
 
-  return { attach, handleRequest, projects, publish, eventHub, database, agents, terminals, git, shutdown, withdrawReattach,
+  return { attach, handleRequest, projects, publish, eventHub, database, agents, terminals, git, lifecycle, shutdown, withdrawReattach,
     whenShutdownComplete: () => shutdownCompletion, whenRunRecoveryComplete: () => runRecovery.cycle };
   } catch (error) {
     runRecoveryController.abort();

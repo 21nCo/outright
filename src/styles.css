@@ -664,3 +664,36 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
 }
 
 .conversation-loading-status { display: block; }
+
+/* Worktree setup and teardown */
+.lifecycle-state { height: 25px; padding: 0 8px; gap: 5px; border: 1px solid var(--line-soft); border-radius: 999px; font-size: 10px; }
+.lifecycle-state svg, .lifecycle-mark svg { width: 13px; height: 13px; }
+.lifecycle-state.running, .lifecycle-mark.running { color: var(--amber); }
+.lifecycle-state.attention, .lifecycle-mark.attention, .lifecycle-state.trust, .lifecycle-mark.trust { color: var(--destructive); }
+.lifecycle-state.ready { color: var(--green); }
+.lifecycle-mark { display: inline-flex; align-items: center; }
+.lifecycle-dialog { max-width: min(680px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow-y: auto; }
+.lifecycle-note, .lifecycle-trust, .lifecycle-summary { margin: 0; color: var(--muted-foreground); font-size: 11px; line-height: 1.55; }
+.lifecycle-trust { display: flex; align-items: flex-start; gap: 8px; color: var(--foreground); }
+.lifecycle-trust svg { flex: none; width: 16px; height: 16px; margin-top: 1px; color: var(--amber); }
+.lifecycle-trust.trusted svg { color: var(--green); }
+.lifecycle-summary { color: var(--foreground); font-weight: 600; }
+.lifecycle-summary.attention, .lifecycle-summary.trust, .lifecycle-error { color: var(--destructive); }
+.lifecycle-error { margin: 0; display: grid; gap: 8px; justify-items: start; font-size: 11px; line-height: 1.55; }
+.lifecycle-error p { margin: 0; }
+.lifecycle-steps h3 { margin: 0 0 6px; font-size: 11px; font-weight: 650; }
+.lifecycle-steps ol { margin: 0; padding-left: 18px; display: grid; gap: 6px; font-size: 11px; }
+.lifecycle-steps li { display: grid; gap: 2px; }
+.lifecycle-steps li code { overflow-wrap: anywhere; color: var(--muted-foreground); font-size: 10px; }
+.lifecycle-steps li small { color: var(--muted-foreground); font-size: 10px; font-weight: 400; }
+.lifecycle-steps li.running strong { color: var(--amber); }
+.lifecycle-steps li.failed strong, .lifecycle-steps li.cancelled strong, .lifecycle-steps li.interrupted strong { color: var(--destructive); }
+.lifecycle-output { max-height: 260px; margin: 0; padding: 10px; overflow: auto; border: 1px solid var(--line-soft); border-radius: 8px; background: var(--subtle-canvas); font-size: 10px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.lifecycle-acknowledge { display: flex; align-items: flex-start; gap: 8px; font-size: 11px; line-height: 1.5; }
+.lifecycle-choices { display: grid; gap: 6px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.lifecycle-choices legend { margin-bottom: 4px; font-size: 11px; font-weight: 600; }
+@media (max-width: 760px) {
+  .lifecycle-state span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+}
+div.lifecycle-note { display: grid; gap: 8px; justify-items: start; }
+div.lifecycle-note p { margin: 0; }

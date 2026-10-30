@@ -3663,3 +3663,113 @@ test("bootstrap omits saved terminal sessions, which clients list over /api/term
       terminalManagerFactory: (options) => createTerminalManager({ ...options, history: openTerminalHistory({ directory }) }) })();
   } finally { rmSync(historyRoot, { recursive: true, force: true }); }
 });
+
+let lifecycleAgentOptions;
+test("a created worktree waits for trusted setup, refuses agent work until ready, and tears down before removal", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const root = path.dirname(worktree.path);
+  const gate = path.join(root, "setup-gate");
+  const tornDown = path.join(root, "torn-down");
+  const step = (name, script, ...args) => ({ name, command: [process.execPath, "-e", script, ...args] });
+  writeFileSync(path.join(worktree.path, "outright.worktree.json"), JSON.stringify({ version: 1,
+    setup: [step("Wait for services", "const fs = require('fs'); const t = setInterval(() => { if (fs.existsSync(process.argv[1])) { clearInterval(t); console.log('services up'); } }, 20);", gate)],
+    teardown: [step("Stop services", "require('fs').writeFileSync(process.argv[1], 'down')", tornDown)] }));
+  spawnSync("git", ["-C", worktree.path, "add", "outright.worktree.json"]);
+  spawnSync("git", ["-C", worktree.path, "commit", "-m", "lifecycle"]);
+
+  const created = await callRuntime(runtime, "POST", "/api/worktrees", { projectId: project.id, branch: "feature/setup", name: "repo-setup" });
+  assert.equal(created.statusCode, 201, created.raw);
+  assert.equal(created.body.lifecycle.state.status, "needs-trust", "untrusted repository commands ran on creation");
+  const scanned = (await runtime.projects(true)).projects.find((item) => item.id === project.id);
+  const added = scanned.worktrees.find((item) => realpathSync.native(item.path) === realpathSync.native(created.body.path));
+  // Lifecycle targets are named by path alone.
+  const target = { projectId: project.id, worktreePath: added.path };
+  const query = `/api/worktrees/lifecycle?projectId=${encodeURIComponent(project.id)}&path=${encodeURIComponent(added.path)}`;
+  const described = await callRuntime(runtime, "GET", query);
+  assert.equal(described.statusCode, 200, described.raw);
+  assert.equal(described.body.config.trusted, false);
+  assert.deepEqual(described.body.config.setup.map((item) => item.name), ["Wait for services"]);
+  const bootstrap = await callRuntime(runtime, "GET", "/api/bootstrap");
+  assert.equal(bootstrap.body.worktreeLifecycle.find((state) => state.worktreeId === added.id)?.status, "needs-trust");
+
+  const stale = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/trust", { ...target, digest: "sha256:stale" });
+  assert.equal(stale.body.code, "LIFECYCLE_CONFIG_CHANGED");
+  assert.equal((await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/trust", { ...target, digest: described.body.config.digest })).body.config.trusted, true);
+  // Setup is refused while an agent run is queued or running in the worktree.
+  const hasWorktreeWork = runtime.agents.hasWorktreeWork;
+  runtime.agents.hasWorktreeWork = (paths) => paths.includes(added.path);
+  const beside = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/setup", target);
+  assert.equal(beside.body.code, "WORKTREE_AGENT_ACTIVE", beside.raw);
+  runtime.agents.hasWorktreeWork = hasWorktreeWork;
+  const started = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/setup", target);
+  assert.equal(started.statusCode, 202, started.raw);
+  assert.equal(started.body.state.status, "running");
+
+  const conversation = runtime.database.createConversation({ ...target, worktreeId: added.id, title: "Too early", provider: "codex" });
+  const early = await callRuntime(runtime, "POST", `/api/conversations/${conversation.id}/runs`, { prompt: "start before setup" });
+  assert.equal(early.statusCode, 409, early.raw);
+  assert.equal(early.body.code, "WORKTREE_LIFECYCLE_BUSY");
+  assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+  // Queued, recovered and resumed runs reach the same hold at launch.
+  assert.equal(lifecycleAgentOptions.worktreeHeld(added.path), true);
+  const removeEarly = await callRuntime(runtime, "DELETE", "/api/worktrees", { projectId: project.id, worktreePath: added.path, confirmation: added.path });
+  assert.equal(removeEarly.body.code, "WORKTREE_LIFECYCLE_BUSY");
+
+  writeFileSync(gate, "");
+  let ready;
+  for (const deadline = Date.now() + 15_000; ready?.state?.status !== "ready"; await new Promise((resolve) => setTimeout(resolve, 20))) {
+    if (Date.now() > deadline) assert.fail(`setup did not become ready: ${JSON.stringify(ready?.state)}`);
+    ready = (await callRuntime(runtime, "GET", query)).body;
+  }
+  assert.match(ready.state.output, /services up/);
+  assert.equal(lifecycleAgentOptions.worktreeHeld(added.path), false);
+
+  runtime.database.updateConversation(conversation.id, { archived: true });
+  const removed = await callRuntime(runtime, "DELETE", "/api/worktrees", { projectId: project.id, worktreePath: added.path, confirmation: added.path });
+  assert.equal(removed.statusCode, 200, removed.raw);
+  assert.equal(readFileSync(tornDown, "utf8"), "down", "removal skipped the trusted teardown");
+  assert.equal(existsSync(added.path), false);
+  assert.equal((await callRuntime(runtime, "GET", "/api/bootstrap")).body.worktreeLifecycle.some((state) => state.worktreeId === added.id), false);
+}, { agentManagerFactory: (options) => createAgentManager(lifecycleAgentOptions = options) }));
+
+let unconfirmedAgentOptions;
+test("unconfirmed setup processes hold agent work until acknowledged, and setup waits for an interrupted run", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  writeFileSync(path.join(worktree.path, "outright.worktree.json"), JSON.stringify({ version: 1,
+    setup: [{ name: "Serve", command: [process.execPath, "-e", "0"] }] }));
+  const target = { projectId: project.id, worktreePath: worktree.path };
+  const query = `/api/worktrees/lifecycle?projectId=${encodeURIComponent(project.id)}&path=${encodeURIComponent(worktree.path)}`;
+  const digest = (await callRuntime(runtime, "GET", query)).body.config.digest;
+  assert.equal((await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/trust", { ...target, digest })).statusCode, 200);
+
+  // Setup and teardown wait for an interrupted agent run the user has not resolved.
+  const findInterrupted = runtime.database.findUnresolvedInterruptedRunForWorktree;
+  runtime.database.findUnresolvedInterruptedRunForWorktree = () => ({ id: "run-interrupted" });
+  const refused = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/setup", target);
+  runtime.database.findUnresolvedInterruptedRunForWorktree = findInterrupted;
+  assert.equal(refused.body.code, "RUN_RECOVERY_REQUIRED", refused.raw);
+  assert.equal((await callRuntime(runtime, "GET", query)).body.state, null, "a step ran beside the interrupted run");
+
+  assert.equal((await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/setup", target)).statusCode, 202);
+  let state;
+  for (const deadline = Date.now() + 15_000; !state || state.status === "running"; await new Promise((resolve) => setTimeout(resolve, 20))) {
+    if (Date.now() > deadline) assert.fail("setup did not settle");
+    state = (await callRuntime(runtime, "GET", query)).body.state;
+  }
+  assert.deepEqual([state.status, state.outcomeUnknown], ["failed", true]);
+  // The run ended, but its processes did not provably: agent work waits.
+  assert.equal(unconfirmedAgentOptions.worktreeHeld(worktree.path), true);
+  const conversation = runtime.database.createConversation({ ...target, worktreeId: worktree.id, title: "Beside", provider: "codex" });
+  const beside = await callRuntime(runtime, "POST", `/api/conversations/${conversation.id}/runs`, { prompt: "start beside unconfirmed processes" });
+  assert.equal(beside.body.code, "WORKTREE_LIFECYCLE_UNCONFIRMED", beside.raw);
+  assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+
+  // An acknowledgement names the attempt the user was shown.
+  const stale = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/acknowledge", { ...target, acknowledgeUnconfirmed: "an-earlier-run" });
+  assert.deepEqual([stale.statusCode, stale.body.code, stale.body.runId], [409, "LIFECYCLE_ACKNOWLEDGEMENT_STALE", state.runId], stale.raw);
+  assert.equal(unconfirmedAgentOptions.worktreeHeld(worktree.path), true, "a stale acknowledgement released the hold");
+  const acknowledged = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/acknowledge", { ...target, acknowledgeUnconfirmed: state.runId });
+  assert.equal(acknowledged.statusCode, 200, acknowledged.raw);
+  assert.equal(acknowledged.body.state.outcomeUnknown, false);
+  assert.equal(unconfirmedAgentOptions.worktreeHeld(worktree.path), false);
+}, { agentManagerFactory: (options) => createAgentManager(unconfirmedAgentOptions = options),
+  lifecycleSubprocesses: { capacity: () => ({ active: 1, limit: 4, unknown: 1 }), reconcileUnknown: async () => 0, unknownOwnerStatus: () => [],
+    run: async () => { throw Object.assign(new Error("ownership unknown"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN", cause: new Error("lost") }); } } }));

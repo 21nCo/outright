@@ -232,7 +232,7 @@ export function SettingsDialog({ open, onOpenChange, settings, providers, templa
   <ProviderAccounts open={open} runtimeEvent={runtimeEvent} accountsVersion={accountsVersion} onError={onError} />
   <section className="template-settings" aria-labelledby="capacity-retention-heading">
     <header><div><h3 id="capacity-retention-heading">Capacity and retention</h3><small>Cleanup removes unpinned archived chats older than the saved age. You can also select a recent archived chat to delete now. Active and recoverable runs stay protected.</small></div></header>
-    {capacity?.limits && <p className="capacity-status">{capacity.queued} of {capacity.limits.maxQueuedRuns} queued · {capacity.activeProcesses ?? capacity.active} active · {pendingOutcomeCapacityText(capacity)}{capacity.recoverable} awaiting recovery · {capacity.utilityProcesses?.active ?? "unknown"} of {capacity.utilityProcesses?.limit ?? "unknown"} utility processes · {capacity.terminalProcesses?.active ?? "unknown"} of {capacity.terminalProcesses?.limit ?? "unknown"} terminals{terminalRecoveryText(capacity.terminalProcesses)} · {capacityUsageText(capacity)} ({(capacity.limits.reservedRetainedBytes / 1048576).toFixed(0)} MiB reserved for active runs). CPU and memory use are unknown. {allocatedDiskUsageText(capacity)}</p>}
+    {capacity?.limits && <p className="capacity-status">{capacity.queued} of {capacity.limits.maxQueuedRuns} queued · {capacity.activeProcesses ?? capacity.active} active · {pendingOutcomeCapacityText(capacity)}{capacity.recoverable} awaiting recovery · {capacity.utilityProcesses?.active ?? "unknown"} of {capacity.utilityProcesses?.limit ?? "unknown"} utility processes · {capacity.lifecycleProcesses ? `${capacity.lifecycleProcesses.active} of ${capacity.lifecycleProcesses.limit} setup and teardown steps · ` : ""}{capacity.terminalProcesses?.active ?? "unknown"} of {capacity.terminalProcesses?.limit ?? "unknown"} terminals{terminalRecoveryText(capacity.terminalProcesses)} · {capacityUsageText(capacity)} ({(capacity.limits.reservedRetainedBytes / 1048576).toFixed(0)} MiB reserved for active runs). CPU and memory use are unknown. {allocatedDiskUsageText(capacity)}</p>}
     <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">{capacityStatusAnnouncement(capacity)}</p>
     <Button ref={cleanupButtonRef} variant="outline" onClick={cleanHistory}>Clean old archived history</Button>
     {cleanupResult && <output className="capacity-status">{cleanupResult}</output>}
@@ -323,6 +323,12 @@ function processCapacityMessages(capacity) {
   else {
     if (validCapacityCount(utility.unknown) && utility.unknown) messages.push(utilityOwnershipText(utility.unknown, capacity.utilityOwners));
     if (atCapacityLimit(utility.active, utility.limit)) messages.push("Utility process capacity is full. Retry when a process finishes.");
+  }
+  // Worktree setup and teardown steps run on their own budget.
+  const lifecycle = capacity.lifecycleProcesses;
+  if (lifecycle && validCapacityCount(lifecycle.active) && validCapacityCount(lifecycle.limit)) {
+    if (validCapacityCount(lifecycle.unknown) && lifecycle.unknown) messages.push(utilityOwnershipText(lifecycle.unknown, capacity.lifecycleOwners).replace("Utility process", "Setup and teardown process"));
+    if (atCapacityLimit(lifecycle.active, lifecycle.limit)) messages.push("Setup and teardown capacity is full. New steps fail until one finishes.");
   }
   const queueFull = atCapacityLimit(capacity.queued, capacity.limits.maxQueuedRuns);
   if (!validCapacityCount(capacity.queued) || !validCapacityCount(capacity.limits.maxQueuedRuns)) messages.push("Run queue capacity is unknown.");

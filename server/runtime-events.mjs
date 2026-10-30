@@ -1,4 +1,5 @@
 const OPEN = 1;
+const UNRETAINED_EVENTS = new Set(["terminal.output", "worktree.lifecycle.output"]);
 
 export function createRuntimeEventHub(options = {}) {
   const maxEvents = positiveInteger(options.maxEvents, 1_000);
@@ -14,7 +15,9 @@ export function createRuntimeEventHub(options = {}) {
   function publish(event) {
     const record = { ...event, eventId: ++lastEventId, emittedAt: now() };
     const encoded = JSON.stringify(record);
-    if (event.type !== "terminal.output") retain(record, encoded);
+    // Streamed output is not replayed; a client that missed some reloads
+    // the retained tail from its owner.
+    if (!UNRETAINED_EVENTS.has(event.type)) retain(record, encoded);
     for (const client of clients) send(client, encoded);
     return record;
   }

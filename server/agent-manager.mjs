@@ -382,7 +382,7 @@ function unresolvedOutcomeUnavailable() {
   return unavailable;
 }
 
-export function createAgentManager({ database, publish, onProvidersChanged = () => {}, onShutdownRecovery = () => {}, onDiskRetry = () => {}, providerDiscoveryFactory = createProviderDiscovery, accounts = null, spawnProcess = spawnExecution, validateConversation = async () => {}, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory, environment = process.env }) {
+export function createAgentManager({ database, publish, onProvidersChanged = () => {}, onShutdownRecovery = () => {}, onDiskRetry = () => {}, providerDiscoveryFactory = createProviderDiscovery, accounts = null, spawnProcess = spawnExecution, validateConversation = async () => {}, worktreeHeld = () => false, terminationGraceMs = 3500, terminationTimeoutMs = 8000, escalationGraceMs = 750, checkpointMinBytes = CHECKPOINT_MIN_BYTES, checkpointIntervalMs = CHECKPOINT_INTERVAL_MS, launchCommand = defaultLaunchCommand, launchDirectory, environment = process.env }) {
   const resolvedLaunchDirectory = launchDirectory
     ?? database.launchDirectory;
   assertPrivateLaunchDirectory(resolvedLaunchDirectory);
@@ -914,6 +914,21 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     });
   }
 
+  // Worktree setup or teardown holds its worktree; a queued, recovered or
+  // resumed run there waits and is drained again when the hold ends.
+  function heldByWorktreeLifecycle(entry) {
+    const worktreePath = entry.run.worktreePath ?? entry.conversation.worktreePath;
+    return Boolean(worktreePath) && worktreeHeld(worktreePath);
+  }
+
+  // Whether any run in one of these worktree paths is queued, launching,
+  // running or awaiting its outcome.
+  function hasWorktreeWork(worktreePaths) {
+    const paths = new Set(worktreePaths);
+    return [...queue, ...active.values(), ...pendingOutcomes.values()]
+      .some((entry) => paths.has(entry.run.worktreePath ?? entry.conversation?.worktreePath));
+  }
+
   async function prepareQueuedLaunch(state, entry) {
     const fresh = database.getConversation(entry.run.conversationId);
     if (!fresh) throw new Error("Conversation no longer exists");
@@ -1093,7 +1108,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     queueReadRetryPending = false;
     if (admissible === false) { retryDeferredAdmission(); return false; }
     clearDiskRetry();
-    const index = queue.findIndex((entry) => !conflictsWithActiveRun(entry));
+    const index = queue.findIndex((entry) => !conflictsWithActiveRun(entry) && !heldByWorktreeLifecycle(entry));
     if (index < 0) return false;
     const entry = queue.splice(index, 1)[0];
     const state = { ...entry, assistantSegments: [], assistantBytes: 0, assistantTruncated: false,
@@ -1339,6 +1354,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
       drain();
     },
     stop,
+    hasWorktreeWork,
     activeRuns: () => [...active.keys(), ...pendingOutcomes.keys()],
     activeProcessCount: () => active.size,
     pendingOutcomeCount: () => pendingOutcomes.size,

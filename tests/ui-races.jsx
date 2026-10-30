@@ -9,6 +9,7 @@ import { WindowedMessages } from "../src/components/WindowedMessages.jsx";
 import { WindowedDiff, diffFindTop, diffRowsHeight } from "../src/components/WindowedDiff.jsx";
 import { CommandPalette } from "../src/components/CommandPalette.jsx";
 import { SettingsDialog } from "../src/components/SettingsDialog.jsx";
+import { TeardownChoices, WorktreeLifecycleDialog } from "../src/components/WorktreeLifecycle.jsx";
 import { ProviderAccounts } from "../src/components/ProviderAccounts.jsx";
 import { TerminalPane } from "../src/components/TerminalPane.jsx";
 import { PaneBody, PaneLayout } from "../src/components/PaneLayout.jsx";
@@ -16,6 +17,7 @@ import { computePaneRects } from "../src/lib/pane-layout.js";
 import { TooltipProvider } from "../src/components/ui/tooltip.jsx";
 import { scheduleLayoutTick } from "../src/lib/windowing.js";
 import { createTerminalCommandFence } from "../src/lib/terminal-command-fence.js";
+import { removalRequest, teardownProblem } from "../src/lib/worktree-lifecycle.js";
 import { savedOutputRows, savedPageText, savedRowPages } from "../src/lib/terminal-exit-state.js";
 import { Terminal } from "@xterm/xterm";
 import "../src/styles.css";
@@ -984,6 +986,437 @@ async function settingsMigrationCompletionRegression() {
   signalCompletion();
   await until(() => document.querySelector(".capacity-status")?.textContent.includes("available for new work"), "migration warning cleared while Settings stayed open");
   assert(reads >= 2, "capacity completion did not read authoritative state");
+}
+
+// An open setup dialog reloads on reconnect: a restarted runtime reports an
+// interrupted run without any event. An older read that answers late never
+// replaces a newer state, also across closing and reopening. Unconfirmed
+// processes are acknowledged explicitly. Teardown choices are a labelled
+// radio group, and the acknowledgement it sends is bound to its worktree.
+async function worktreeLifecycleRegression() {
+  root.render(null); await settle();
+  const project = projects[0];
+  const worktree = project.worktrees[0];
+  const config = { digest: "sha256:abc", error: null, trusted: true, teardown: [],
+    setup: [{ name: "Install", command: ["npm", "ci"], timeoutSeconds: 600 }, { name: "Seed", command: ["npm", "run", "seed"], timeoutSeconds: 600 }] };
+  const state = { worktreePath: worktree.path, discoveredPath: worktree.path, projectId: project.id, phase: "setup", configDigest: "sha256:abc", steps: ["Install", "Seed"],
+    stepIndex: 1, runId: "run-1", output: "installed\n", outputEnd: 10, outputTruncated: false, outcomeUnknown: false };
+  let detail = { file: "outright.worktree.json", worktreePath: worktree.path, config, running: "setup", state: { ...state, status: "running" } };
+  const reads = [];
+  const posts = [];
+  // A read answered by the test, in any order, instead of at once.
+  let held = null;
+  route = async (url, options) => {
+    if (url.pathname === "/api/worktrees/lifecycle") {
+      reads.push(url.searchParams.get("path"));
+      if (held) { const answer = deferred(); held.push(answer); return answer.promise; }
+      return response(detail);
+    }
+    if (options.method === "POST") posts.push({ path: url.pathname, body: JSON.parse(options.body) });
+    return response({});
+  };
+  const events = new EventTarget();
+  const errors = [];
+  const render = (open) => root.render(<TooltipProvider><WorktreeLifecycleDialog open={open} onOpenChange={() => {}} project={project} worktree={worktree} events={events} onError={(error) => errors.push(error)} /></TooltipProvider>);
+  render(true);
+  const dialog = () => document.querySelector(".lifecycle-dialog");
+  const buttons = () => [...(dialog()?.querySelectorAll("button") ?? [])].map((button) => button.textContent);
+  await until(() => buttons().includes("Cancel setup"), "running setup offers cancel");
+  assert(reads.every((path) => path === worktree.path), "the dialog named its worktree by something other than its path");
+  // The runtime restarted while the client was away.
+  const checkpoints = { setup: { configDigest: "sha256:abc", stepIndex: 1 } };
+  const running = detail;
+  const interrupted = { ...detail, running: null, state: { ...state, status: "interrupted", checkpoints, error: "Outright stopped during step 2; its effects may be partial." } };
+  detail = interrupted;
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => buttons().includes("Retry from step 2"), "reconnect did not reconcile the interrupted run");
+  assert(!buttons().includes("Cancel setup"), "an interrupted run still offered cancel");
+  const summary = dialog().querySelector('.lifecycle-summary[role="status"]');
+  assert(/Setup interrupted at step 2 of 2, Seed/.test(summary?.textContent ?? ""), "the interrupted state was not announced");
+
+  // Two reads overlap and the older one, from while setup ran, answers last.
+  const failedDetail = { ...interrupted, state: { ...interrupted.state, status: "failed", runId: "run-2", error: "\"Seed\" exited with status 1." } };
+  held = [];
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => held.length === 2, "both reads were not issued");
+  held[1].resolve(response(failedDetail));
+  await until(() => /Setup failed/.test(dialog().querySelector(".lifecycle-summary")?.textContent ?? ""), "the newer failure was not shown");
+  held[0].resolve(response(running));
+  await remainsTrue(() => /Setup failed/.test(dialog().querySelector(".lifecycle-summary")?.textContent ?? "") && !buttons().includes("Cancel setup"),
+    150, "a late older read replaced the newer failure");
+  assert(buttons().includes("Retry from step 2"), "the failure lost its retry control");
+  // A read from before the dialog closed never lands in the reopened one.
+  held = [];
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => held.length === 1, "the read before closing was not issued");
+  render(false); await settle();
+  render(true);
+  await until(() => held.length === 2, "reopening did not read again");
+  held[1].resolve(response(failedDetail));
+  await until(() => buttons().includes("Retry from step 2"), "the reopened dialog did not load");
+  held[0].resolve(response(running));
+  await remainsTrue(() => !buttons().includes("Cancel setup"), 150, "a read from before closing replaced the reopened dialog's state");
+  // A read answered after newer output of the same run keeps that output.
+  held = null;
+  detail = running;
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => buttons().includes("Cancel setup"), "the running setup did not load");
+  held = [];
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => held.length === 1, "the read was not issued");
+  const output = () => dialog().querySelector(".lifecycle-output")?.textContent ?? "";
+  events.dispatchEvent(new CustomEvent("output", { detail: { worktreePath: worktree.path, runId: "run-1", start: 10, text: "seeding\n" } }));
+  await until(() => output().includes("installed\nseeding\n"), "streamed output was not shown");
+  held[0].resolve(response(running));
+  await remainsTrue(() => output().includes("installed\nseeding\n"), 150, "a read answered late took away newer streamed output");
+  held = null;
+
+  // Unconfirmed processes hold agent work until the user acknowledges them.
+  detail = { ...interrupted, state: { ...interrupted.state, outcomeUnknown: true } };
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => buttons().includes("Acknowledge"), "unconfirmed processes offered no acknowledgement");
+  const acknowledge = [...dialog().querySelectorAll("button")].find((button) => button.textContent === "Acknowledge");
+  assert(acknowledge.disabled, "acknowledgement did not wait for the user's confirmation");
+  assert(/agent runs here wait/.test(dialog().querySelector(".lifecycle-summary")?.textContent ?? ""), "the hold on agent runs was not stated");
+  const confirm = () => dialog().querySelector('.lifecycle-acknowledge input[type="checkbox"]');
+  confirm().click();
+  await until(() => !acknowledge.disabled, "the acknowledgement stayed disabled");
+  // A newer attempt that also left processes unconfirmed is never shown as
+  // already checked: each attempt needs its own acknowledgement.
+  detail = { ...interrupted, state: { ...interrupted.state, runId: "run-3", outcomeUnknown: true } };
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => !confirm().checked && acknowledge.disabled, "a newer unconfirmed attempt kept the earlier acknowledgement");
+  confirm().click();
+  await until(() => !acknowledge.disabled, "the acknowledgement stayed disabled");
+  detail = interrupted;
+  acknowledge.click();
+  await until(() => posts.some((post) => post.path === "/api/worktrees/lifecycle/acknowledge"), "the acknowledgement was not sent");
+  const sentAcknowledgement = posts.find((post) => post.path === "/api/worktrees/lifecycle/acknowledge");
+  assert(sentAcknowledgement.body.worktreePath === worktree.path && sentAcknowledgement.body.projectId === project.id, "the acknowledgement named another worktree");
+  assert(sentAcknowledgement.body.acknowledgeUnconfirmed === "run-3", "the acknowledgement did not name the attempt shown");
+  await until(() => !buttons().includes("Acknowledge"), "the acknowledged state was not reloaded");
+  // Progress belongs to the file version that ran: after the file changes,
+  // none of its steps is marked, and the outcome says it was for the earlier file.
+  const changed = { ...config, digest: "sha256:def", setup: [...config.setup, { name: "Migrate", command: ["npm", "run", "migrate"], timeoutSeconds: 600 }] };
+  for (const status of ["ready", "failed"]) {
+    detail = { ...interrupted, config: changed, state: { ...interrupted.state, status, checkpoints: {} } };
+    events.dispatchEvent(new CustomEvent("reconnect"));
+    await until(() => dialog().querySelectorAll(".lifecycle-steps li").length === 3, `${status}: the changed file was not shown`);
+    const marked = [...dialog().querySelectorAll(".lifecycle-steps li")].filter((step) => step.className);
+    assert(marked.length === 0, `${status}: steps of the changed file were marked ${marked.map((step) => step.className).join(", ")}`);
+    assert(/earlier version of outright\.worktree\.json/.test(dialog().querySelector(".lifecycle-summary")?.textContent ?? ""), `${status}: the outcome was not tied to the earlier file`);
+  }
+  assert(buttons().includes("Run setup"), "a changed file offered to run setup again or retry");
+  // Trusting a file can leave setup unrun, so a teardown that a removal
+  // refused for review runs from its checkpoint before setup provisions.
+  detail = { ...interrupted, config: { ...config, trusted: false, teardown: [{ name: "Down", command: ["docker", "compose", "down"], timeoutSeconds: 600 }] },
+    state: { ...state, phase: "teardown", status: "needs-trust", steps: ["Down"], stepIndex: 0, checkpoints: { teardown: { configDigest: "sha256:abc", stepIndex: 0 } } } };
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => buttons().includes("Trust without running setup") && buttons().includes("Trust and run setup"), "trusting offered no choice to leave setup unrun");
+  posts.length = 0;
+  [...dialog().querySelectorAll("button")].find((button) => button.textContent === "Trust without running setup").click();
+  await until(() => posts.some((post) => post.path === "/api/worktrees/lifecycle/trust"), "trust was not sent");
+  await remainsTrue(() => !posts.some((post) => post.path === "/api/worktrees/lifecycle/setup"), 150, "trusting started setup");
+  assert(posts[0].body.digest === "sha256:abc", "trust did not name the reviewed file");
+  assert(errors.length === 0, `unexpected lifecycle errors: ${errors.map((error) => error.message).join("; ")}`);
+
+  const failure = Object.assign(new Error("Teardown did not finish"), { payload: { code: "LIFECYCLE_OUTCOME_UNKNOWN", runId: "run-3" } });
+  let problem = teardownProblem(failure, worktree.path);
+  const sent = [];
+  function Choices() {
+    const [current, setCurrent] = React.useState(problem);
+    problem = current;
+    return <div><TeardownChoices problem={current} onChoose={(choice) => setCurrent({ ...current, choice })} />
+      <button type="button" onClick={() => sent.push(removalRequest({ projectId: project.id, worktreePath: worktree.path, confirmation: worktree.path }, current))}>Remove fixture</button></div>;
+  }
+  root.render(<Choices />);
+  await until(() => host.querySelector(".lifecycle-choices legend")?.textContent === "Next attempt", "teardown choices render as a labelled group");
+  const radios = [...host.querySelectorAll('.lifecycle-choices input[type="radio"]')];
+  assert(radios.length === 2 && radios.every((radio) => !radio.checked), "unconfirmed processes preselected a choice");
+  assert(radios.every((radio) => radio.closest("label")?.textContent.length > 20), "a teardown choice has no visible label");
+  radios[0].focus();
+  radios[0].click();
+  await until(() => problem.choice === "acknowledge", "the acknowledgement was not chosen");
+  host.querySelector("button").click();
+  assert(sent.at(-1)?.acknowledgeUnconfirmed === "run-3" && sent.at(-1).skipTeardown === undefined, "the acknowledgement was not sent with the removal");
+  radios[1].click();
+  await until(() => problem.choice === "skip", "skip was not chosen");
+  host.querySelector("button").click();
+  assert(sent.at(-1)?.skipTeardown === true && sent.at(-1).acknowledgeUnconfirmed === "run-3", "skipping beside unconfirmed processes did not acknowledge them");
+  assert(/confirmed stopped/.test(radios[1].closest("label").textContent), "the skip choice did not say it acknowledges the processes");
+  // Without teardown steps the only choice is an acknowledged removal.
+  root.render(null); await settle();
+  problem = teardownProblem(Object.assign(new Error("Unconfirmed"), { payload: { code: "LIFECYCLE_OUTCOME_UNKNOWN", runId: "run-4", teardown: false } }), worktree.path);
+  root.render(<Choices />);
+  await until(() => host.querySelectorAll('.lifecycle-choices input[type="radio"]').length === 1, "a removal without teardown offered teardown choices");
+  const only = host.querySelector('.lifecycle-choices input[type="radio"]');
+  assert(/I checked them; remove the worktree/.test(only.closest("label").textContent) && !only.checked, "the removal acknowledgement was not explicit");
+  only.click();
+  await until(() => problem.choice === "acknowledge", "the removal acknowledgement was not chosen");
+  host.querySelector("button").click();
+  assert(sent.at(-1)?.acknowledgeUnconfirmed === "run-4" && sent.at(-1).skipTeardown === undefined, "the removal did not name the attempt shown");
+  root.render(null); await settle();
+  await lifecycleStatusOrder();
+}
+
+// The toolbar chip, sidebar mark and announcement show the newest state:
+// a bootstrap snapshot read before an event never replaces it, whichever
+// arrives first, and events before the first bootstrap are kept.
+async function lifecycleStatusOrder() {
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const worktree = projects[0].worktrees[0];
+  const state = (status, revision) => ({ worktreePath: worktree.path, discoveredPath: worktree.path, projectId: "A", phase: "setup",
+    status, steps: ["Install", "Seed"], stepIndex: 1, runId: "run-1", revision });
+  let held = deferred();
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return held.promise;
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    return response({});
+  };
+  const snapshot = (states, revision) => response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" },
+    providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [], worktreeLifecycle: states, worktreeLifecycleRevision: revision });
+  const send = (event) => fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify(event) }));
+  const chip = () => host.querySelector(".workspace-tools .lifecycle-state")?.textContent ?? "";
+  const mark = () => host.querySelector(".worktree-row.is-active .lifecycle-mark")?.textContent ?? "";
+  const announced = () => [...host.querySelectorAll('.workspace-tools [role="status"]')].map((node) => node.textContent).join(" ");
+  const sockets = fixtureSockets.length;
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => fixtureSockets.length > sockets, "the runtime socket did not open");
+  // An event before the first bootstrap answers is newer than its snapshot.
+  send({ type: "worktree.lifecycle", payload: state("failed", 12) });
+  held.resolve(snapshot([state("running", 10)], 11));
+  await until(() => chip() === "Setup failed", "the bootstrap snapshot replaced an earlier-delivered newer failure");
+  await remainsTrue(() => chip() === "Setup failed" && /Setup failed at step 2 of 2/.test(mark()), 150, "the sidebar did not show the newer failure");
+  // A reload is held while a newer state and then a removal arrive.
+  for (const [order, base] of [["event first", 20], ["snapshot first", 30]]) {
+    send({ type: "worktree.lifecycle", payload: state("running", base) });
+    await until(() => chip() === "Setup 2/2", `${order}: the running state was not shown`);
+    held = deferred();
+    send({ type: "runtime.connected", payload: { replay: { missed: true } } });
+    if (order === "event first") {
+      send({ type: "worktree.lifecycle", payload: state("failed", base + 2) });
+      await until(() => chip() === "Setup failed" && /Setup failed/.test(announced()), `${order}: the failure was not shown`);
+      held.resolve(snapshot([state("running", base)], base + 1));
+      await remainsTrue(() => chip() === "Setup failed" && /Setup failed/.test(mark()) && /Setup failed/.test(announced()), 150,
+        `${order}: an older snapshot replaced the newer failure (chip "${chip()}", mark "${mark()}", announced "${announced()}")`);
+      send({ type: "worktree.lifecycle", payload: { worktreePath: worktree.path, removed: true, revision: base + 3 } });
+    } else {
+      held.resolve(snapshot([state("running", base)], base + 1));
+      await settle();
+      send({ type: "worktree.lifecycle", payload: state("failed", base + 2) });
+      send({ type: "worktree.lifecycle", payload: { worktreePath: worktree.path, removed: true, revision: base + 3 } });
+      // A late copy of the failure never brings a removed state back.
+      send({ type: "worktree.lifecycle", payload: state("failed", base + 2) });
+    }
+    await until(() => !chip() && !mark(), `${order}: the removal was not shown`);
+    held = deferred();
+    send({ type: "runtime.connected", payload: { replay: { missed: true } } });
+    held.resolve(snapshot([state("failed", base + 2)], base + 2));
+    await remainsTrue(() => !chip() && !mark(), 150, `${order}: a snapshot read before the removal brought the state back`);
+  }
+  // Trusting the file from a sibling worktree runs nothing here, so this
+  // worktree's setup is still a visible prompt.
+  send({ type: "worktree.lifecycle", payload: { ...state("trusted", 40), stepIndex: 0 } });
+  await until(() => chip() === "Run setup" && /setup has not run/.test(mark()), `a trusted setup that has not run looked ready (chip "${chip()}", mark "${mark()}")`);
+  // A refresh that no longer lists the worktree decides it as of its read:
+  // a late replayed event from before then stays out, and a newer one shows.
+  held = deferred();
+  send({ type: "runtime.connected", payload: { replay: { missed: true } } });
+  held.resolve(snapshot([], 50));
+  await until(() => !chip() && !mark(), "a snapshot without the state did not clear it");
+  send({ type: "worktree.lifecycle", payload: state("failed", 48) });
+  await remainsTrue(() => !chip() && !mark(), 150, `an event older than the applied snapshot came back (chip "${chip()}")`);
+  send({ type: "worktree.lifecycle", payload: state("failed", 51) });
+  await until(() => chip() === "Setup failed", "an event newer than the snapshot was not shown");
+  root.render(null); await settle();
+  await lifecycleDialogAfterRemoval();
+  await lifecycleRemovalCancel();
+}
+
+// Watching teardown progress during a removal never leaves the setup dialog
+// open for whichever worktree is selected after the removal.
+async function lifecycleDialogAfterRemoval() {
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const linkedProjects = projects.map((item) => item.id === "A" ? { ...item, worktrees: [{ ...item.worktrees[0], isLinked: true }] } : item);
+  const removal = deferred();
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: linkedProjects, projectGroups: { groups: [], memberships: {} },
+      settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/worktrees" && options.method === "DELETE") return removal.promise;
+    if (url.pathname === "/api/worktrees/lifecycle") return response({ file: "outright.worktree.json", worktreePath: url.searchParams.get("path"), config: null, state: null, running: null });
+    if (url.pathname === "/api/conversations") return response({ conversations: [] });
+    return response({});
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('[aria-label="Worktree options"]'), "linked worktree options");
+  host.querySelector('[aria-label="Worktree options"]').click();
+  await until(() => [...document.querySelectorAll('[role="menuitem"]')].some((item) => item.textContent.includes("Remove worktree")), "remove worktree menu item");
+  [...document.querySelectorAll('[role="menuitem"]')].find((item) => item.textContent.includes("Remove worktree")).click();
+  await until(() => document.querySelector("#remove-worktree-confirmation"), "remove worktree confirmation");
+  setControlValue(document.querySelector("#remove-worktree-confirmation"), "/fixture/A");
+  [...document.querySelectorAll('[role="dialog"] button')].find((item) => item.textContent === "Remove worktree").click();
+  await until(() => [...document.querySelectorAll("button")].some((item) => item.textContent === "Show teardown progress"), "teardown progress was not offered");
+  [...document.querySelectorAll("button")].find((item) => item.textContent === "Show teardown progress").click();
+  await until(() => document.querySelector(".lifecycle-dialog"), "teardown progress did not open");
+  removal.resolve(response({ removed: true }));
+  await until(() => document.querySelector(".toast")?.textContent.includes("Worktree removed"), "the removal did not finish");
+  await remainsTrue(() => !document.querySelector(".lifecycle-dialog"), 150, "the setup dialog stayed open after the removal");
+  root.render(null); await settle();
+}
+
+// A pending removal is cancelled only by Cancel removal, for the worktree it
+// started for; closing the dialog lets it continue, and its outcome never
+// shows under another worktree.
+async function lifecycleRemovalCancel() {
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const sibling = { id: "A2", name: "A2", path: "/fixture/A2", branch: "next", changedCount: 0, isLinked: true };
+  const linkedProjects = projects.map((item) => item.id === "A" ? { ...item, worktrees: [{ ...item.worktrees[0], isLinked: true }, sibling] } : item);
+  let removal = deferred();
+  let cancelReply = () => response({ state: null });
+  const sent = [];
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects: linkedProjects, projectGroups: { groups: [], memberships: {} },
+      settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname.startsWith("/api/worktrees") && options?.method && options.method !== "GET") sent.push({ path: url.pathname, body: JSON.parse(options.body ?? "null") });
+    if (url.pathname === "/api/worktrees" && options?.method === "DELETE") return removal.promise;
+    if (url.pathname === "/api/worktrees/lifecycle/cancel") return cancelReply();
+    if (url.pathname === "/api/conversations") return response({ conversations: [] });
+    return response({});
+  };
+  const buttons = (scope = document) => [...scope.querySelectorAll("button")];
+  const dialog = () => [...document.querySelectorAll('[role="dialog"]')].find((node) => node.querySelector("#remove-worktree-confirmation"));
+  const kept = (message) => response({ error: message, code: "WORKTREE_TEARDOWN_FAILED", lifecycle: { worktreePath: "/fixture/A", phase: "teardown", status: "cancelled" } }, 409);
+  async function startRemoval(path) {
+    host.querySelector('[aria-label="Worktree options"]').click();
+    await until(() => [...document.querySelectorAll('[role="menuitem"]')].some((item) => item.textContent.includes("Remove worktree")), "remove worktree menu item");
+    [...document.querySelectorAll('[role="menuitem"]')].find((item) => item.textContent.includes("Remove worktree")).click();
+    await until(() => dialog(), "remove worktree confirmation");
+    setControlValue(document.querySelector("#remove-worktree-confirmation"), path);
+    buttons(dialog()).find((item) => item.textContent === "Remove worktree").click();
+    await until(() => buttons(dialog()).some((item) => item.textContent === "Cancel removal"), "Cancel removal was not offered while removing");
+  }
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => host.querySelector('[aria-label="Worktree options"]'), "linked worktree options");
+  // Cancel removal stops this worktree's teardown, and the worktree is kept.
+  await startRemoval("/fixture/A");
+  assert(!buttons(dialog()).some((item) => item.textContent === "Cancel") && buttons(dialog()).some((item) => item.textContent === "Close"), "dismissing a pending removal was labeled Cancel");
+  buttons(dialog()).find((item) => item.textContent === "Cancel removal").click();
+  await until(() => sent.some((item) => item.path === "/api/worktrees/lifecycle/cancel"), "Cancel removal did not cancel teardown");
+  assert(sent.at(-1).body.worktreePath === "/fixture/A" && sent.at(-1).body.projectId === "A", "the cancel did not name the worktree being removed");
+  removal.resolve(kept("Cancelled before Git removed anything, so the worktree was kept."));
+  await until(() => /worktree was kept/.test(dialog()?.querySelector('[role="alert"]')?.textContent ?? ""), "a cancelled removal did not say the worktree was kept");
+  assert(dialog().querySelectorAll('.lifecycle-choices input[type="radio"]').length > 0, "a cancelled removal offered no choices");
+  assert([...host.querySelectorAll(".worktree-row strong")].some((node) => node.textContent === "A"), "a cancelled removal hid the worktree");
+  // Once Git has started, the refused cancel is announced and nothing else is sent.
+  buttons(dialog()).find((item) => item.textContent === "Cancel").click();
+  await until(() => !dialog(), "the removal dialog did not close");
+  removal = deferred();
+  cancelReply = () => response({ error: "Git is already removing this worktree; that can no longer be cancelled", code: "WORKTREE_REMOVAL_STARTED" }, 409);
+  await startRemoval("/fixture/A");
+  const before = sent.length;
+  buttons(dialog()).find((item) => item.textContent === "Cancel removal").click();
+  await until(() => /can no longer be cancelled/.test(dialog().querySelector('[role="status"]')?.textContent ?? ""), "a cancel refused once Git started was not announced");
+  await remainsTrue(() => sent.length === before + 1, 100, "a refused cancel sent another request");
+  // Closing lets the removal continue; its refusal belongs to A, not to A2.
+  buttons(dialog()).find((item) => item.textContent === "Close").click();
+  await until(() => !dialog(), "Close did not close the pending removal dialog");
+  assert(sent.length === before + 1, "Close cancelled the removal");
+  [...host.querySelectorAll(".worktree-row")].find((row) => row.querySelector("strong")?.textContent === "A2").click();
+  await until(() => host.querySelector(".workspace-context strong")?.textContent === "A2", "worktree A2 was not selected");
+  // A2's dialog, open while A is still being removed, never takes A's outcome.
+  host.querySelector('[aria-label="Worktree options"]').click();
+  await until(() => [...document.querySelectorAll('[role="menuitem"]')].some((item) => item.textContent.includes("Remove worktree")), "remove worktree menu item for A2");
+  [...document.querySelectorAll('[role="menuitem"]')].find((item) => item.textContent.includes("Remove worktree")).click();
+  await until(() => /Another worktree is being removed/.test(dialog()?.textContent ?? ""), "A2's removal dialog did not say another removal is running");
+  assert(!buttons(dialog()).some((item) => item.textContent === "Cancel removal"), "A2's dialog offered to cancel A's removal");
+  removal.resolve(kept("Teardown did not finish, so the worktree was kept. Step Down failed."));
+  await until(() => !/Another worktree is being removed/.test(dialog()?.textContent ?? ""), "A's removal did not finish");
+  await remainsTrue(() => dialog() && !/Teardown did not finish/.test(dialog().textContent) && !dialog().querySelector(".lifecycle-choices"), 150, "A2's removal dialog showed A's refusal or choices");
+  root.render(null); await settle();
+}
+
+// The refresh that drops a removed worktree can land before its DELETE
+// answers and move the selection to the primary checkout. The remove and setup
+// dialogs stay bound to the worktree they were opened for: they never show or
+// act for the primary checkout, and a dialog opened for another worktree is
+// left alone.
+async function worktreeRemovalRetargetRegression() {
+  keys.forEach((key, index) => localStorage.setItem(key, ["A", "A-two", "chat-A"][index]));
+  const linked = (name) => ({ id: name, name, path: `/fixture/${name}`, branch: name, changedCount: 0, isLinked: true });
+  const listed = (...names) => projects.map((item) => item.id === "A" ? { ...item, worktrees: [item.worktrees[0], ...names.map(linked)] } : item);
+  let current = listed("A-two", "A-three", "A-four");
+  let removal = deferred();
+  let loads = 0;
+  route = async (url, options) => {
+    if (url.pathname === "/api/bootstrap") { loads += 1; return response({ projects: current, projectGroups: { groups: [], memberships: {} },
+      settings: { provider: "codex", approvalPolicy: "read-only" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] }); }
+    if (url.pathname === "/api/worktrees" && options?.method === "DELETE") return removal.promise;
+    if (url.pathname === "/api/worktrees/lifecycle") return response({ file: "outright.worktree.json", worktreePath: url.searchParams.get("path"), config: null, state: null, running: null });
+    if (url.pathname === "/api/conversations") return response({ conversations: [] });
+    return response({});
+  };
+  const buttons = (scope = document) => [...scope.querySelectorAll("button")];
+  const dialog = () => [...document.querySelectorAll('[role="dialog"]')].find((node) => node.querySelector("#remove-worktree-confirmation"));
+  const selected = () => host.querySelector(".workspace-context strong")?.textContent;
+  const primaryShown = () => [...document.querySelectorAll('[role="dialog"]')].some((node) => node.querySelector(".confirm-path")?.textContent === "/fixture/A")
+    || Boolean(document.querySelector(".lifecycle-dialog"));
+  async function openRemove(path, confirmation) {
+    host.querySelector('[aria-label="Worktree options"]').click();
+    await until(() => [...document.querySelectorAll('[role="menuitem"]')].some((item) => item.textContent.includes("Remove worktree")), `remove worktree menu item for ${path}`);
+    [...document.querySelectorAll('[role="menuitem"]')].find((item) => item.textContent.includes("Remove worktree")).click();
+    await until(() => dialog()?.querySelector(".confirm-path")?.textContent === path, `the remove dialog did not open for ${path}`);
+    setControlValue(document.querySelector("#remove-worktree-confirmation"), confirmation);
+  }
+  async function startRemoval(path) {
+    await openRemove(path, path);
+    buttons(dialog()).find((item) => item.textContent === "Remove worktree").click();
+    await until(() => buttons(dialog()).some((item) => item.textContent === "Cancel removal"), `the removal of ${path} did not start`);
+  }
+  // Git has removed the worktree: the server's refresh lands, then the DELETE answers.
+  async function finishAfterRefresh(removed, ...remaining) {
+    current = listed(...remaining);
+    fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "projects.changed", payload: { projects: current } }) }));
+    await until(() => ![...host.querySelectorAll(".worktree-row strong")].some((node) => node.textContent === removed), `the refresh did not drop ${removed}`);
+    await remainsTrue(() => !primaryShown(), 100, `a dialog for ${removed} was retargeted to the primary checkout before its removal answered`);
+    const before = loads;
+    removal.resolve(response({ removed: true }));
+    await until(() => loads > before, "the removal did not finish");
+    removal = deferred();
+  }
+  const choose = async (name) => {
+    [...host.querySelectorAll(".worktree-row")].find((row) => row.querySelector("strong")?.textContent === name).click();
+    await until(() => selected() === name, `worktree ${name} was not selected`);
+  };
+  root.render(<TooltipProvider><App /></TooltipProvider>);
+  await until(() => selected() === "A-two", "linked worktree A-two was not selected");
+  // The remove dialog is open when the refresh moves the selection to main.
+  await startRemoval("/fixture/A-two");
+  await finishAfterRefresh("A-two", "A-three", "A-four");
+  assert(selected() === "A", "the removal did not fall back to the primary checkout");
+  await until(() => !dialog(), "the remove dialog stayed open after its worktree was removed");
+  await remainsTrue(() => !dialog() && !primaryShown(), 150, "a dialog was retargeted to the primary checkout after the removal");
+  // A dialog opened for another worktree while one is being removed keeps its own target and confirmation.
+  await choose("A-three");
+  await startRemoval("/fixture/A-three");
+  buttons(dialog()).find((item) => item.textContent === "Close").click();
+  await until(() => !dialog(), "Close did not close the pending removal dialog");
+  await choose("A-four");
+  await openRemove("/fixture/A-four", "/fixture/A-fo");
+  await finishAfterRefresh("A-three", "A-four");
+  await remainsTrue(() => dialog()?.querySelector(".confirm-path")?.textContent === "/fixture/A-four"
+    && document.querySelector("#remove-worktree-confirmation")?.value === "/fixture/A-fo", 150, "another worktree's removal closed or cleared this remove dialog");
+  // Watching teardown progress when the refresh moves the selection to main.
+  setControlValue(document.querySelector("#remove-worktree-confirmation"), "/fixture/A-four");
+  buttons(dialog()).find((item) => item.textContent === "Remove worktree").click();
+  await until(() => buttons(dialog()).some((item) => item.textContent === "Show teardown progress"), "teardown progress was not offered");
+  buttons(dialog()).find((item) => item.textContent === "Show teardown progress").click();
+  await until(() => document.querySelector(".lifecycle-dialog"), "teardown progress did not open");
+  await finishAfterRefresh("A-four");
+  await until(() => selected() === "A" && !document.querySelector(".lifecycle-dialog"), "the setup dialog stayed open after its worktree was removed");
+  await remainsTrue(() => !dialog() && !primaryShown(), 150, "the setup dialog was retargeted to the primary checkout after the removal");
+  root.render(null); await settle();
 }
 
 async function settingsCapacityWithoutEventRegression() {
@@ -8860,6 +9293,8 @@ try {
     ["settings shared refresh order", settingsSharedRefreshOrderRegression, "a settings save preserves an in-flight template refresh without reverting the new quota"],
     ["bootstrap error ownership", bootstrapRefreshErrorOwnershipRegression, "a background bootstrap cannot dismiss an unrelated operation error"],
     ["settings migration completion", settingsMigrationCompletionRegression, "an open Settings dialog refreshes capacity when migration finishes"],
+    ["worktree removal retarget", worktreeRemovalRetargetRegression, "a refresh that drops a removed worktree never retargets its remove or setup dialog, and another worktree's dialog is left alone"],
+    ["worktree lifecycle", worktreeLifecycleRegression, "an open setup dialog reconciles an interrupted run on reconnect, and teardown choices are explicit and bound to their worktree"],
     ["settings live capacity", settingsCapacityWithoutEventRegression, "an open Settings dialog reads another client's quota changes without a capacity event"],
     ["provider accounts window aging", providerAccountsWindowAgingRegression, "an open account list drops a run that leaves the 5-hour window without any event"],
     ["provider accounts failed reload", providerAccountsFailedReloadRegression, "a failed reload marks an expired measured total out of date, and account changes reload without the runtime event"],

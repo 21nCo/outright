@@ -267,15 +267,23 @@ export function runOwned(file, args, options, onClose) {
     options.signal.addEventListener("abort", onAbort, { once: true });
     if (options.signal.aborted) onAbort();
   }
-  const capture = (stream, chunks, addBytes) => stream.on("data", (chunk) => {
+  // A streaming caller receives every chunk and bounds its own retention;
+  // nothing accumulates here, so maxBuffer does not apply.
+  const onOutput = typeof options.onOutput === "function" ? options.onOutput : null;
+  const capture = (stream, name, chunks, addBytes) => stream.on("data", (chunk) => {
+    if (onOutput) {
+      try { onOutput(name, chunk); }
+      catch (error_) { error ??= error_; stop(); }
+      return;
+    }
     const size = addBytes(chunk.length);
     if (size > maxBuffer) {
       error ??= Object.assign(new Error("Utility process output exceeded maxBuffer"), { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" });
       stop();
     } else chunks.push(chunk);
   });
-  capture(child.stdout, stdout, (size) => (stdoutBytes += size));
-  capture(child.stderr, stderr, (size) => (stderrBytes += size));
+  capture(child.stdout, "stdout", stdout, (size) => (stdoutBytes += size));
+  capture(child.stderr, "stderr", stderr, (size) => (stderrBytes += size));
   child.once("error", (failure) => { error ??= failure; });
   // Returns false for a frame outside the supervisor's control protocol.
   const readControlLine = (line) => {
@@ -750,4 +758,11 @@ export function createSubprocessBudget({ limit = 8, execute = runOwned, launch =
 
 export const utilityProcesses = createSubprocessBudget({
   unknownDirectory: path.join(process.env.OUTRIGHT_DATA_DIR ?? path.join(os.homedir(), ".outright"), "utility-unknown"),
+});
+
+// Worktree setup and teardown steps may run for an hour each. They have their
+// own budget, so they never hold the permits Git, scans and removal use.
+export const lifecycleProcesses = createSubprocessBudget({
+  limit: 4,
+  unknownDirectory: path.join(process.env.OUTRIGHT_DATA_DIR ?? path.join(os.homedir(), ".outright"), "lifecycle-unknown"),
 });
