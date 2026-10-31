@@ -9303,8 +9303,13 @@ async function worktreeCheckpointsRegression() {
   // A runtime without checkpoint routes answers like any unknown route.
   let listUnavailable = true;
   let previewGate = null;
+  // When set, answers the list reads in place of the fixture's checkpoints.
+  let listAnswer = null;
   route = async (url, options) => {
-    if (url.pathname === "/api/worktrees/checkpoints" && (options.method ?? "GET") === "GET") return listUnavailable ? response({ error: "API route not found" }, 404) : response(detail);
+    if (url.pathname === "/api/worktrees/checkpoints" && (options.method ?? "GET") === "GET") {
+      if (listAnswer) return listAnswer();
+      return listUnavailable ? response({ error: "API route not found" }, 404) : response(detail);
+    }
     if (url.pathname.endsWith("/inspect")) return response({ checkpoint, entries: [{ path: "a.txt", state: "staged", status: "M" }], truncated: false });
     if (url.pathname.endsWith("/diff")) {
       diffs.push(Object.fromEntries(url.searchParams));
@@ -9448,6 +9453,49 @@ async function worktreeCheckpointsRegression() {
   await until(() => button("Restore Before agent"), "the reopened dialog did not list the checkpoints");
   await settle();
   assert(!heading() && !dialog().querySelector(".checkpoint-preview"), "a preview answered after close was shown in the reopened dialog");
+
+  // An older read answering after a newer one failed replaces neither the
+  // failure nor, when it fails too, the newer message.
+  const alertText = () => dialog().querySelector('[role="alert"]')?.textContent ?? "";
+  for (const older of [() => response(detail), () => response({ error: "API route not found" }, 404)]) {
+    let releaseOlder;
+    const held = new Promise((resolve) => { releaseOlder = resolve; });
+    const answers = [() => held.then(older), () => response({ error: "The runtime is busy" }, 503)];
+    listAnswer = () => answers.shift()();
+    events.dispatchEvent(new CustomEvent("reconnect"));
+    await until(() => answers.length === 1, "the older list read was not issued");
+    events.dispatchEvent(new CustomEvent("reconnect"));
+    await until(() => button("Retry") && /The runtime is busy/.test(alertText()), "the newer failed read was not reported");
+    releaseOlder(); await held; await settle();
+    assert(button("Retry") && /could not be read: The runtime is busy/.test(alertText()), `an older read replaced the newer failure: ${alertText() || "no alert"}`);
+    listAnswer = null;
+    button("Retry").click();
+    await until(() => !button("Retry") && button("Restore Before agent"), "Retry did not list the checkpoints again");
+  }
+
+  // A restore answered after the dialog closed reads nothing into it.
+  button("Restore Before agent").click();
+  await until(() => box("a.txt"), "the restore preview did not open");
+  confirmTerminals();
+  let releaseRestore;
+  const restoreHeld = new Promise((resolve) => { releaseRestore = resolve; });
+  restoreAnswer = () => restoreHeld.then(() => response({ restored: 1, safetyCheckpoint: { ...checkpoint, id: "lx1abf-0123abd0", label: "Before late", reason: "before-restore" } }));
+  await until(() => restoreButton() && !restoreButton().disabled, "the preview could not be confirmed");
+  restoreButton().click();
+  await until(() => posts.at(-1)?.path.endsWith("/restore"), "the delayed restore was not requested");
+  show(false); await settle();
+  listAnswer = () => response({ error: "Read while closed" }, 500);
+  releaseRestore(); await restoreHeld; await settle(); await settle();
+  let releaseList;
+  const listHeld = new Promise((resolve) => { releaseList = resolve; });
+  listAnswer = () => listHeld.then(() => response(detail));
+  show(true);
+  await until(() => dialog(), "the dialog did not reopen");
+  await settle();
+  assert(/Reading checkpoints/.test(dialog().textContent) && !alertText() && !button("Restore Before agent"),
+    `the reopened dialog showed a read from the closed session: ${alertText() || dialog().textContent.slice(0, 160)}`);
+  releaseList(); listAnswer = null;
+  await until(() => button("Restore Before agent"), "the reopened dialog did not list the checkpoints");
   assert(!errors.length, `unexpected errors: ${errors.map((error) => error.message).join("; ")}`);
 }
 

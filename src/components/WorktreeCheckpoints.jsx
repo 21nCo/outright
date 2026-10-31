@@ -32,24 +32,28 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
   const focusNextRef = useRef(null);
   const returnFocusRef = useRef(LABEL_FIELD);
   const focusNext = (selector) => { focusNextRef.current = selector; };
-  // Reads overlap (open, events, reconnect, actions); only a response to a
-  // read issued after the one shown replaces it, and closing discards all.
+  // Reads overlap (open, events, reconnect, actions); only an answer, list or
+  // failure, to a read issued after the one shown replaces it, and closing
+  // discards every read issued before or after it in that session.
   const issuedRef = useRef(0);
   const shownRef = useRef(0);
   const target = { projectId: project.id, worktreePath: worktree.path };
   // `focus` names where focus goes once the list is shown.
   const load = useCallback(async (focus) => {
     const generation = ++issuedRef.current;
+    const session = sessionRef.current;
+    const stale = () => session !== sessionRef.current || generation <= shownRef.current;
     try {
       const next = await api(query("/api/worktrees/checkpoints", { projectId: project.id, path: worktree.path }));
-      if (generation <= shownRef.current) return;
+      if (stale()) return;
       shownRef.current = generation;
       canonicalRef.current = next.worktreePath;
       if (typeof focus === "string") focusNextRef.current = focus;
       setLoadError("");
       setDetail(next);
     } catch (error) {
-      if (generation <= shownRef.current) return;
+      if (stale()) return;
+      shownRef.current = generation;
       setLoadError(error.status === 404 && error.message === "API route not found"
         ? "Checkpoints are not available in this version of the Outright runtime." : `Checkpoints could not be read: ${error.message}`);
     }
@@ -135,7 +139,7 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
         await openPreview(live, preview.checkpoint.id, "The worktree changed after the preview. Review this updated preview before restoring.", preview.resume);
       } else throw error;
     } finally {
-      await load();
+      if (live()) await load();
       if (stopped && live()) focusNext(FINISH);
     }
   });
