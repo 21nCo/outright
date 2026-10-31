@@ -893,6 +893,34 @@ for (const [name, swapped] of [["the file", "a.txt"], ["a directory above it", "
   });
 }
 
+test("capture refuses promptly, and lets the worktree go, when a FIFO is swapped in for a file", { skip: process.platform === "win32" && "no FIFOs on Windows" }, async (t) => {
+  const { repository } = await fixture(t);
+  await writeFile(path.join(repository, "a.txt"), "edited\n");
+  const file = path.join(repository, "a.txt");
+  let armed = true;
+  // The swap lands after the capture looked at the file and before it opens it.
+  const { checkpoints } = service({ run: async (command, args, options) => {
+    if (armed && args.includes("ls-files") && args.includes("-s")) {
+      armed = false;
+      await rename(file, `${file}-moved`);
+      await execFileAsync("mkfifo", [file]);
+    }
+    return execFileAsync(command, args, options);
+  } });
+  let timer;
+  const hung = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("capture hung on the FIFO")), 5_000); });
+  try {
+    await assert.rejects(Promise.race([checkpoints.capture(target(repository)), hung]),
+      (error) => error.statusCode === 409 && error.details.code === "CHECKPOINT_CHANGED");
+  } finally { clearTimeout(timer); }
+  assert.equal(await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]), "");
+  assert.equal((await checkpoints.describe(target(repository))).busy, null);
+  await rm(file);
+  await rename(`${file}-moved`, file);
+  const checkpoint = await checkpoints.capture(target(repository));
+  assert.equal(await git(repository, ["show", `${checkpoint.commit}:a.txt`]), "edited\n");
+});
+
 test("files added with git add -N, empty or not, restore as untracked files and leave the index alone", async (t) => {
   const { repository } = await fixture(t);
   await writeFile(path.join(repository, "empty.txt"), "");

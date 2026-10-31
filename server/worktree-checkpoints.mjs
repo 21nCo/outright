@@ -1038,10 +1038,11 @@ async function removeEmptyDirectory(root, relative) {
 }
 
 // Copies, up to one byte over `limit`, the file `expected` (an lstat) found, through a
-// descriptor not reached through a link (on Linux, one at the path itself).
+// descriptor not reached through a link (on Linux, one at the path itself). O_NONBLOCK: a
+// FIFO or device swapped in must fail the type check, never hang the open.
 async function copyInside(root, relative, expected, destination, limit) {
   const file = path.join(root, relative);
-  const handle = await open(file, fsConstants.O_RDONLY | NO_LINKS)
+  const handle = await open(file, fsConstants.O_RDONLY | NO_LINKS | (fsConstants.O_NONBLOCK ?? 0))
     .catch((error) => { throw ["ENOENT", "ENOTDIR", "ELOOP", "EMLINK"].includes(error.code) ? changedError(relative) : error; });
   try {
     const info = await handle.stat();
