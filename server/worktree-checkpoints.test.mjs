@@ -859,6 +859,60 @@ test("a directory replaced by a link is recorded as the link, never through it",
   await assert.rejects(git(repository, ["cat-file", "-e", secret]), "content outside the worktree was stored");
 });
 
+for (const [name, swapped] of [["the file", "a.txt"], ["a directory above it", "dir"]]) {
+  test(`capture never stores content a link swapped in for ${name} while it ran`, { skip: process.platform === "win32" && "links need privileges on Windows" }, async (t) => {
+    const { root, repository } = await fixture(t);
+    await mkdir(path.join(repository, "dir"));
+    await writeFile(path.join(repository, "dir", "a.txt"), "inside\n");
+    await git(repository, ["add", "."]);
+    await git(repository, ["commit", "-qm", "dir"]);
+    await writeFile(path.join(repository, "dir", "a.txt"), "edited\n");
+    const outside = path.join(root, "outside");
+    await mkdir(outside);
+    await writeFile(path.join(outside, "a.txt"), "SECRET-EXTERNAL\n");
+    const secret = (await execFileAsync("git", ["hash-object", path.join(outside, "a.txt")], { encoding: "utf8" })).stdout.trim();
+    const swap = path.join(repository, "dir", ...(swapped === "dir" ? [] : [swapped]));
+    let armed = true;
+    // The swap lands after the capture looked at the file and before it reads it.
+    const { checkpoints } = service({ run: async (file, args, options) => {
+      if (armed && args.includes("ls-files") && args.includes("-s")) {
+        armed = false;
+        await rename(swap, `${swap}-moved`);
+        await symlink(swapped === "dir" ? outside : path.join(outside, "a.txt"), swap);
+      }
+      return execFileAsync(file, args, options);
+    } });
+    await assert.rejects(checkpoints.capture(target(repository)), (error) => error.statusCode === 409 && error.details.code === "CHECKPOINT_CHANGED");
+    await assert.rejects(git(repository, ["cat-file", "-e", secret]), "content outside the worktree was stored");
+    assert.equal(await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]), "");
+    // Once the path is back, a new capture records it.
+    await rm(swap);
+    await rename(`${swap}-moved`, swap);
+    const checkpoint = await checkpoints.capture(target(repository));
+    assert.equal(await git(repository, ["show", `${checkpoint.commit}:dir/a.txt`]), "edited\n");
+  });
+}
+
+test("files added with git add -N, empty or not, restore as untracked files and leave the index alone", async (t) => {
+  const { repository } = await fixture(t);
+  await writeFile(path.join(repository, "empty.txt"), "");
+  await writeFile(path.join(repository, "full.txt"), "intent\n");
+  await git(repository, ["add", "-N", "empty.txt", "full.txt"]);
+  const { checkpoints } = service();
+  const checkpoint = await checkpoints.capture(target(repository));
+  assert.equal(await git(repository, ["ls-tree", "--name-only", checkpoint.commit, "empty.txt", "full.txt"]), "empty.txt\nfull.txt\n");
+  assert.equal(await git(repository, ["ls-tree", "--name-only", `${checkpoint.commit}^1`, "empty.txt", "full.txt"]), "");
+  assert.deepEqual(checkpoint.counts, { staged: 0, unstaged: 0, untracked: 2 });
+  await rm(path.join(repository, "empty.txt"));
+  await rm(path.join(repository, "full.txt"));
+  const index = await git(repository, ["ls-files", "-s", "--debug"]);
+  const { preview } = await restoreAll(checkpoints, repository, checkpoint.id);
+  assert.deepEqual(preview.entries.map((entry) => `${entry.path}:${entry.file?.action}:${entry.index?.action ?? "-"}`), ["empty.txt:create:-", "full.txt:create:-"]);
+  assert.equal(await readFile(path.join(repository, "empty.txt"), "utf8"), "");
+  assert.equal(await readFile(path.join(repository, "full.txt"), "utf8"), "intent\n");
+  assert.equal(await git(repository, ["ls-files", "-s", "--debug"]), index, "the restore changed the live index");
+});
+
 test("a file whose name is near the length limit restores and clears the restore record", { skip: process.platform === "win32" && "Windows limits the whole path" }, async (t) => {
   const { repository } = await fixture(t);
   const name = "n".repeat(250);

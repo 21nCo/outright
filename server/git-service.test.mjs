@@ -45,10 +45,12 @@ test("optional Git history failure leaves required status usable", async () => {
     await git(repository, ["commit", "-m", "history exists"]);
     await writeFile(path.join(repository, "new file.txt"), "untracked\n");
     let failRequired = false;
+    const statusOptions = [];
     const service = createGitService({
       database: {}, getProjects: () => [{ worktrees: [{ path: repository }] }],
       getConfig: async () => ({ scanRoots: [root] }),
       subprocesses: { run: (file, args, options) => {
+        if (args[2] === "status") statusOptions.push(options);
         if (args[2] === "log") return Promise.reject(Object.assign(new Error("history timed out"), { code: "ETIMEDOUT" }));
         if (failRequired && args[2] === "status") return Promise.reject(capacityError());
         return execFileAsync(file, args, options);
@@ -57,6 +59,8 @@ test("optional Git history failure leaves required status usable", async () => {
     const status = await service.status(repository);
     assert.equal(status.files[0].path, "new file.txt");
     assert.deepEqual(status.commits, []);
+    // A status read never takes Git's optional index lock, so it cannot hold up a checkpoint restore.
+    assert.ok(statusOptions.length && statusOptions.every((options) => options.env?.GIT_OPTIONAL_LOCKS === "0"));
     failRequired = true;
     await assert.rejects(service.status(repository), (error) => error.code === "SUBPROCESS_CAPACITY");
   } finally { await rm(root, { recursive: true, force: true }); }

@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstatSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, rmdir, stat, unlink, utimes, writeFile } from "node:fs/promises";
+import { createWriteStream, constants as fsConstants, lstatSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFile, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, realpath, rename, rm, rmdir, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pipeline } from "node:stream/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { utilityBudgetUnavailable } from "./subprocess-budget.mjs";
 
@@ -46,6 +47,9 @@ const ID_PATTERN = /^[0-9a-z]{6,12}-[0-9a-f]{8}$/;
 const OID_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 const REGULAR_MODE = /^100(?:644|755)$/;
 const EMPTY_TREES = { sha1: "4b825dc642cb6eb9a060e54bf8d69288fbee4904", sha256: "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321" };
+const EMPTY_BLOBS = { sha1: "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391", sha256: "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813" };
+// macOS refuses a link anywhere in the path (O_NOFOLLOW_ANY), elsewhere only at its end.
+const NO_LINKS = process.platform === "darwin" ? 0x20000000 : fsConstants.O_NOFOLLOW ?? 0;
 const IDENTITY = { GIT_AUTHOR_NAME: "Outright", GIT_AUTHOR_EMAIL: "checkpoints@outright.invalid",
   GIT_COMMITTER_NAME: "Outright", GIT_COMMITTER_EMAIL: "checkpoints@outright.invalid" };
 const LITERAL = { GIT_LITERAL_PATHSPECS: "1" };
@@ -107,7 +111,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   async function repository(cwd) {
     const [gitDir, indexPath, format] = (await git(cwd, ["rev-parse", "--absolute-git-dir", "--git-path", "index", "--show-object-format"])).trim().split("\n");
     gitDirs.set(cwd, gitDir);
-    return { gitDir, indexPath: path.resolve(cwd, indexPath), emptyTree: EMPTY_TREES[format] ?? EMPTY_TREES.sha1 };
+    return { gitDir, indexPath: path.resolve(cwd, indexPath), emptyTree: EMPTY_TREES[format] ?? EMPTY_TREES.sha1, emptyBlob: EMPTY_BLOBS[format] ?? EMPTY_BLOBS.sha1 };
   }
 
   // The worktree's Git directory without running Git, for the synchronous
@@ -371,6 +375,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     for (const [relative, blob] of await blobs(cwd, indexTree, staged.filter((change) => change.status !== "D").map((change) => change.path))) count(relative, blob.size);
     // Large files are refused before anything is copied into the object store.
     const found = new Map();
+    const root = await realpath(cwd);
     // Nothing is read through a link or file where a directory was: its
     // tracked paths count as deleted, and Git lists the link or file itself.
     const directories = new Map();
@@ -395,13 +400,18 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
         if (info.isSymbolicLink()) {
           const link = path.join(scratch, `link-${randomUUID()}`);
           await writeFile(link, await readlink(path.join(cwd, relative), { encoding: "buffer" }));
+          if (!await unchanged(root, relative, info)) throw changedError(relative);
           hashed.push({ relative, source: link, mode: "120000", entry });
         } else if (info.isFile()) {
           // The type on disk, except where Git keeps a link as a file holding
           // its target, or does not track the executable bit.
-          const executable = settings.fileMode ? (info.mode & 0o111) !== 0 : entry?.mode === "100755";
+          // Hashed from a copy of the file the lstat above found, never one a link swapped in since.
+          const source = path.join(scratch, `file-${randomUUID()}`);
+          const copied = await copyInside(root, relative, info, source, limits.fileBytes);
+          if (copied.size !== info.size) { bytes -= info.size; count(relative, copied.size); }
+          const executable = settings.fileMode ? (copied.mode & 0o111) !== 0 : entry?.mode === "100755";
           const link = !settings.symlinks && entry?.mode === "120000";
-          hashed.push({ relative, source: relative, mode: link ? "120000" : executable ? "100755" : "100644", entry });
+          hashed.push({ relative, source, mode: link ? "120000" : executable ? "100755" : "100644", entry });
         }
       }
       const oids = [];
@@ -409,7 +419,8 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
         oids.push(...(await git(cwd, ["hash-object", "-w", "--no-filters", "--", ...sources])).trim().split("\n"));
       }
       const updates = hashed.map((item, position) => ({ ...item, oid: oids[position] }))
-        .filter((item) => OID_PATTERN.test(item.oid ?? "") && (item.entry?.mode !== item.mode || item.entry?.oid !== item.oid));
+        // A `git add -N` entry holds the empty blob but is left out of trees, so one is always replaced.
+        .filter((item) => OID_PATTERN.test(item.oid ?? "") && (item.entry?.mode !== item.mode || item.entry?.oid !== item.oid || item.oid === repo.emptyBlob));
       if (removed.length) await temporary(["update-index", "--force-remove", "--", ...removed]);
       for (const batch of batches(updates.map((item) => `${item.mode},${item.oid},${item.relative}`))) {
         await temporary(["update-index", "--add", "--replace", ...batch.flatMap((value) => ["--cacheinfo", value])]);
@@ -1025,6 +1036,29 @@ async function removeEmptyDirectory(root, relative) {
   }
   await rmdir(target);
 }
+
+// Copies, up to one byte over `limit`, the file `expected` (an lstat) found, through a
+// descriptor not reached through a link (on Linux, one at the path itself).
+async function copyInside(root, relative, expected, destination, limit) {
+  const file = path.join(root, relative);
+  const handle = await open(file, fsConstants.O_RDONLY | NO_LINKS)
+    .catch((error) => { throw ["ENOENT", "ENOTDIR", "ELOOP", "EMLINK"].includes(error.code) ? changedError(relative) : error; });
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.dev !== expected.dev || info.ino !== expected.ino
+      || (process.platform === "linux" && await readlink(`/proc/self/fd/${handle.fd}`).catch(() => null) !== file)) throw changedError(relative);
+    await pipeline(handle.createReadStream({ start: 0, end: limit, autoClose: false }), createWriteStream(destination, { flags: "wx", mode: 0o600 }));
+    if (!await unchanged(root, relative, expected)) throw changedError(relative);
+    return { size: (await stat(destination)).size, mode: info.mode };
+  } finally { await handle.close(); }
+}
+// Whether every ancestor is still a directory and the path still the same entry.
+async function unchanged(root, relative, expected) {
+  for (const ancestor of ancestors(relative)) if (!(await lstat(path.join(root, ancestor)).catch(() => null))?.isDirectory()) return false;
+  const info = await lstat(path.join(root, relative)).catch(() => null);
+  return info?.dev === expected.dev && info.ino === expected.ino;
+}
+const changedError = (relative) => checkpointError(409, `${relative} changed while the checkpoint was being taken; try again`, "CHECKPOINT_CHANGED", { path: relative });
 
 // Writes one file through a new file beside it, never through a link.
 async function writeFileAt(root, relative, content, executable) {
