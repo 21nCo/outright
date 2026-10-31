@@ -34,9 +34,7 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
   const frameRef = useRef(0);
   const returnFocusRef = useRef(LABEL_FIELD);
   const focusNext = (selector) => { focusNextRef.current = selector; };
-  // Reads overlap (open, events, reconnect, actions); only an answer, list or
-  // failure, to a read issued after the one shown replaces it, and closing
-  // discards every read issued before or after it in that session.
+  // Reads overlap (open, events, reconnect, actions): only an answer (list or failure) to a read issued after the one shown replaces it, and closing discards every read of that session.
   const issuedRef = useRef(0);
   const shownRef = useRef(0);
   const target = { projectId: project.id, worktreePath: worktree.path };
@@ -61,16 +59,14 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
   }, [project.id, worktree.path]);
 
   useLayoutEffect(() => {
-    // A target that is gone or disabled (busy, unconfirmed) falls back to an
-    // enabled control, so focus never drops out of the dialog (nor a pending action's trigger).
+    // A target that is gone or disabled (busy, unconfirmed) falls back to an enabled control, so focus never drops out of the dialog (nor a pending action's trigger).
     const popup = contentRef.current;
     const selector = focusNextRef.current ?? (popup?.contains(document.activeElement) && document.activeElement.disabled ? LABEL_FIELD : null);
     if (!open || !selector || !popup) return;
     focusNextRef.current = null;
     const element = [selector, LABEL_FIELD, VIEW_HEADING, "button"].map((item) => popup.querySelector(`${item}:not(:disabled)`)).find(Boolean);
     element?.focus();
-    // The dialog refocuses itself a frame after a focused control is removed;
-    // that must not undo a move made in between.
+    // The dialog refocuses itself a frame after a focused control is removed; that must not undo a move made in between.
     cancelAnimationFrame(frameRef.current);
     frameRef.current = requestAnimationFrame(() => { if (document.activeElement === popup && element?.isConnected && !element.disabled) element.focus(); });
   });
@@ -86,16 +82,15 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
       events.removeEventListener("checkpoints", onChanged);
       events.removeEventListener("reconnect", onReconnect);
       shownRef.current = issuedRef.current;
-      sessionRef.current += 1;
-      focusNextRef.current = null;
+      sessionRef.current += 1; focusNextRef.current = null;
     };
   }, [open, load, events, worktree.path]);
 
   // Retry repeats a failed action only while all it acted on is unchanged: `intent`, a new object whenever the label, view, delete confirmation, listed checkpoints or restore record change.
   const intent = useMemo(() => ({}), [label, view, confirmDelete, JSON.stringify([detail?.restore, detail?.checkpoints.map((item) => item.id)])]);
   useEffect(() => setFailure(null), [label, view]);
-  // `work` gets `live()`, false once the dialog closed after it started. A failure shows after the list is reread, busy until then;
-  // Retry comes only if that read showed the list, so an action whose outcome is unknown (lost answer, failed read) is not repeated.
+  // `work` gets `live()`, false once the dialog closed after it started. A failure shows after the list is reread, busy until then; Retry comes only if that read showed the list, so an action whose outcome is unknown (lost answer, failed read) is not repeated.
+  // While busy, no control that edits or abandons the pending action's intent is enabled (Keep, acknowledgment, paths, Back). A difference read, busy "read", submits nothing: those stay enabled, and its answer reaches only its own preview.
   async function act(work) {
     const session = sessionRef.current;
     const live = () => session === sessionRef.current;
@@ -107,7 +102,7 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
   const capture = () => act(async (live) => {
     const { checkpoint } = await api("/api/worktrees/checkpoints", { method: "POST", body: { ...target, label } });
     if (!live()) return;
-    setLabel("");
+    setLabel((current) => (current === label ? "" : current));
     setNotice(`Checkpoint taken: ${checkpointCountsText(checkpoint.counts)}.`);
     await load();
   });
@@ -172,7 +167,7 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
   const askDelete = (id) => { setConfirmDelete(id); focusNext('[data-checkpoint-action="keep"]'); };
   const keepCheckpoint = (id) => { setConfirmDelete(null); focusNext(`[data-checkpoint-action="delete:${id}"]`); };
   // `side` "index" shows how the staged content changes, "files" the file.
-  const showDiff = (path, side) => act(async (live) => {
+  const showDiff = (path, side) => act(async (live) => { setBusy("read");
     const { diff, tooLarge } = await api(query("/api/worktrees/checkpoints/diff", { projectId: project.id, path: worktree.path,
       id: view.preview.checkpoint.id, tree: side === "index" ? view.preview.currentIndexTree : view.preview.currentTree, file: path, side }));
     if (live()) setView((current) => current?.preview === view.preview ? { ...current, diff: { path, side, text: tooLarge ? "This difference is too large to show." : diff || "No textual difference." } } : current);
@@ -210,7 +205,7 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
           <small>{checkpoint.createdAt ? new Date(checkpoint.createdAt).toLocaleString() : ""}{checkpoint.branch ? ` · ${checkpoint.branch}` : ""}{checkpoint.head ? ` @ ${checkpoint.head.slice(0, 7)}` : ""} · {checkpointCountsText(checkpoint.counts)}</small></span>
         <span className="checkpoint-actions">
           {confirmDelete === checkpoint.id
-            ? <><Button size="xs" variant="destructive" disabled={busy} onClick={() => remove(checkpoint)}>Confirm delete</Button><Button size="xs" variant="outline" data-checkpoint-action="keep" onClick={() => keepCheckpoint(checkpoint.id)}>Keep</Button></>
+            ? <><Button size="xs" variant="destructive" disabled={busy} onClick={() => remove(checkpoint)}>Confirm delete</Button><Button size="xs" variant="outline" data-checkpoint-action="keep" disabled={busy} onClick={() => keepCheckpoint(checkpoint.id)}>Keep</Button></>
             : <>{!checkpoint.unreadable && <><Button size="xs" variant="outline" data-checkpoint-action={`inspect:${checkpoint.id}`} disabled={busy} onClick={() => inspect(checkpoint)} aria-label={`Inspect ${checkpointTitle(checkpoint)}`}>Inspect</Button>
               <Button size="xs" variant="outline" data-checkpoint-action={`restore:${checkpoint.id}`} disabled={busy || Boolean(interrupted)} onClick={() => act((live) => openPreview(live, checkpoint.id, "", false, `[data-checkpoint-action="restore:${checkpoint.id}"]`))} aria-label={`Restore ${checkpointTitle(checkpoint)}`}>Restore…</Button></>}
               <Button size="xs" variant="ghost" data-checkpoint-action={`delete:${checkpoint.id}`} disabled={busy} onClick={() => askDelete(checkpoint.id)} aria-label={`Delete ${checkpointTitle(checkpoint)}`}>Delete</Button></>}
@@ -220,7 +215,7 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
     {view?.kind === "inspect" && <InspectView view={view} />}
     {view?.kind === "preview" && <PreviewView view={view} setView={setView} busy={busy} onDiff={showDiff} />}
     <DialogFooter>
-      {view ? <Button variant="outline" onClick={closeView}>Back</Button> : <Button variant="outline" onClick={() => onOpenChange(false)}>Close</Button>}
+      {view ? <Button variant="outline" disabled={busy === true} onClick={closeView}>Back</Button> : <Button variant="outline" onClick={() => onOpenChange(false)}>Close</Button>}
       {view?.kind === "preview" && view.preview.resume && !view.preview.entries.length && <Button disabled={busy} onClick={keepFiles}>Done</Button>}
       {view?.kind === "preview" && view.preview.entries.length > 0 && <Button variant="destructive" disabled={busy || Boolean(restoreBlockedReason(view.preview, view.selected, view.acknowledged))} onClick={restore}>
         {view.preview.resume ? "Finish restoring" : "Restore"} {view.selected.size} {view.selected.size === 1 ? "path" : "paths"}</Button>}
@@ -255,16 +250,16 @@ function PreviewView({ view, setView, busy, onDiff }) {
     <p className="lifecycle-note">These are the exact changes a restore makes to this worktree. Before it changes anything, Outright takes a checkpoint of the current state, so the restore can be undone. The branch and its commits do not change.</p>
     {preview.head.moved && <p className="checkpoint-warning"><WarningCircle aria-hidden="true" /><span>HEAD has moved since this checkpoint ({preview.head.checkpoint?.slice(0, 7) ?? "no commit"} → {preview.head.current?.slice(0, 7) ?? "no commit"}). Restored index entries are staged against the current HEAD.</span></p>}
     {preview.blockers.length > 0 && <div className="lifecycle-error" role="alert"><p>Restore is not possible now:</p><ul>{preview.blockers.map((item) => <li key={item.code}>{item.message}</li>)}</ul></div>}
-    {preview.terminals.length > 0 && <label className="lifecycle-acknowledge"><input type="checkbox" checked={view.acknowledged} onChange={(event) => update(() => ({ acknowledged: event.target.checked }))} />
+    {preview.terminals.length > 0 && <label className="lifecycle-acknowledge"><input type="checkbox" disabled={busy === true} checked={view.acknowledged} onChange={(event) => update(() => ({ acknowledged: event.target.checked }))} />
       {preview.terminals.length === 1 ? "A terminal is" : `${preview.terminals.length} terminals are`} open in this worktree ({preview.terminals.map((item) => item.name).join(", ")}). Nothing running in {preview.terminals.length === 1 ? "it" : "them"} is writing files during the restore.</label>}
     {!preview.entries.length ? <p className="lifecycle-note">{preview.resume ? "Everything the restore was restoring is already in place. Choose Done to finish." : "The worktree already matches this checkpoint."}</p> : <fieldset className="checkpoint-paths">
       <legend>Paths to restore ({selected.size} of {choosable.length} chosen)</legend>
       <div className="checkpoint-actions">
-        <Button size="xs" variant="outline" onClick={() => update(() => ({ selected: initialRestoreSelection(preview.entries) }))}>Choose all</Button>
-        <Button size="xs" variant="outline" onClick={() => update(() => ({ selected: new Set() }))}>Choose none</Button>
+        <Button size="xs" variant="outline" disabled={busy === true} onClick={() => update(() => ({ selected: initialRestoreSelection(preview.entries) }))}>Choose all</Button>
+        <Button size="xs" variant="outline" disabled={busy === true} onClick={() => update(() => ({ selected: new Set() }))}>Choose none</Button>
       </div>
       <ul>{preview.entries.slice(0, shown).map((entry) => <li key={entry.path} className={entry.blocked ? "blocked" : undefined}>
-        <label><input type="checkbox" disabled={Boolean(entry.blocked)} checked={selected.has(entry.path)}
+        <label><input type="checkbox" disabled={busy === true || Boolean(entry.blocked)} checked={selected.has(entry.path)}
           onChange={(event) => update((current) => ({ selected: toggleRestorePath(preview.entries, current.selected, entry.path, event.target.checked) }))} />
           <code>{entry.path}</code><small>{restoreChangeText(entry)}{entry.blocked ? ` · Not offered: ${entry.blocked}` : ""}{restoreGroupText(entry) ? ` · ${restoreGroupText(entry)}` : ""}</small></label>
         <span className="checkpoint-actions">
