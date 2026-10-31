@@ -9610,6 +9610,71 @@ async function worktreeCheckpointsRegression() {
   assert(!retryAction(), "Retry would take the checkpoint with the label from before the user typed");
   typeLabel("");
 
+  // A failure shows, with Retry, only once a reread shows the list; until then
+  // the dialog stays busy, so an action whose answer was lost is not repeated.
+  const alerts = () => [...dialog().querySelectorAll('[role="alert"]')].map((item) => item.textContent).join(" ");
+  // The next list read answers `answer()`, here held or failed, once.
+  const nextRead = (answer) => { listAnswer = () => { listAnswer = null; return answer(); }; };
+  const lost = { ...checkpoint, id: "lx1abj-0123abd4", label: "Lost answer" };
+  let sentCaptures = 0;
+  const lostRead = held();
+  typeLabel("Lost answer");
+  await until(() => labelField().value === "Lost answer", "the label was not typed");
+  once.set("POST /api/worktrees/checkpoints", () => { sentCaptures++; detail = { ...detail, checkpoints: [lost, ...detail.checkpoints] };
+    nextRead(() => lostRead.promise.then(() => response(detail))); return response({ error: "Gateway timeout" }, 504); });
+  await press(button("Take checkpoint"));
+  await until(() => sentCaptures === 1 && !listAnswer, "the capture was not followed by a list read");
+  await settle(); await settle();
+  assert(button("Take checkpoint").disabled && !retryAction(), "a capture whose answer was lost could be repeated before the list was read again");
+  lostRead.release();
+  await until(() => button("Delete Lost answer") && /Gateway timeout/.test(alerts()) && !button("Take checkpoint").disabled, "the lost capture was not reported after the reread listed it");
+  await settle();
+  assert(!retryAction() && sentCaptures === 1, "the reread showed the capture taken, yet Retry was offered to take it again");
+  // A capture the reread shows not taken offers Retry once that read answers.
+  const unchangedRead = held();
+  typeLabel("Second try");
+  await until(() => labelField().value === "Second try" && !alerts(), "the label was not typed");
+  once.set("POST /api/worktrees/checkpoints", () => { sentCaptures++; nextRead(() => unchangedRead.promise.then(() => response(detail))); return response({ error: "The disk is full" }, 507); });
+  await press(button("Take checkpoint"));
+  await until(() => sentCaptures === 2 && !listAnswer, "the capture was not followed by a list read");
+  await settle(); await settle();
+  assert(button("Take checkpoint").disabled && !retryAction(), "a failed capture offered Retry before the list was read again");
+  unchangedRead.release();
+  await until(() => retryAction() && !retryAction().disabled && /disk is full/.test(alerts()), "a capture the reread shows not taken did not offer Retry");
+  once.set("POST /api/worktrees/checkpoints", (body) => { sentCaptures++; captured = body; return response({ checkpoint: taken }); });
+  await press(retryAction());
+  await until(() => !retryAction() && labelField().value === "", "Retry did not take the checkpoint");
+  assert(sentCaptures === 3 && captured.label === "Second try", `Retry sent ${sentCaptures - 2} captures with ${JSON.stringify(captured?.label)}`);
+  // A reread that fails leaves the outcome unknown: no Retry, now or after
+  // the list is read again.
+  typeLabel("Unknown outcome");
+  await until(() => labelField().value === "Unknown outcome", "the label was not typed");
+  once.set("POST /api/worktrees/checkpoints", () => { sentCaptures++; nextRead(() => response({ error: "The runtime is busy" }, 503)); return response({ error: "Gateway timeout" }, 504); });
+  await press(button("Take checkpoint"));
+  await until(() => /Gateway timeout/.test(alerts()) && /could not be read: The runtime is busy/.test(alerts()) && !button("Take checkpoint").disabled, "a capture whose reread failed was not reported");
+  await settle();
+  assert(!retryAction() && button("Retry"), "a capture whose outcome is unknown offered Retry, or the list read did not");
+  button("Retry").click();
+  await until(() => !/could not be read/.test(alerts()) && /Gateway timeout/.test(alerts()), "the list read Retry did not read the list");
+  await settle();
+  assert(!retryAction() && sentCaptures === 4, "a later list read revived the Retry of a capture whose outcome was unknown");
+  typeLabel("");
+  // A delete the reread shows done keeps no Retry, nor before that read.
+  const droppedRead = held();
+  let deleteSent = false;
+  button("Delete Lost answer").click();
+  await until(() => button("Confirm delete") && !alerts(), "delete did not ask for confirmation");
+  once.set("DELETE /api/worktrees/checkpoints", () => { deleteSent = true; detail = { ...detail, checkpoints: detail.checkpoints.filter((item) => item.id !== lost.id) };
+    nextRead(() => droppedRead.promise.then(() => response(detail))); return response({ error: "The answer was lost" }, 504); });
+  await press(button("Confirm delete"));
+  await until(() => deleteSent && !listAnswer, "the delete was not followed by a list read");
+  await settle(); await settle();
+  assert(button("Confirm delete").disabled && !retryAction(), "a delete whose answer was lost could be repeated before the list was read again");
+  droppedRead.release();
+  await until(() => !button("Delete Lost answer") && /answer was lost/.test(alerts()) && !button("Take checkpoint").disabled, "the lost delete was not reported after the reread");
+  await settle();
+  assert(!retryAction(), "a delete the reread shows done kept its Retry");
+
   // Inspect: focus stays in the dialog while it loads, a failure offers Retry.
   const inspectHeld = held();
   once.set("GET /api/worktrees/checkpoints/inspect", () => inspectHeld.promise.then(() => response({ checkpoint, entries: [], truncated: false })));
@@ -9693,6 +9758,16 @@ async function worktreeCheckpointsRegression() {
     events.dispatchEvent(new CustomEvent("reconnect"));
     await until(() => button(name) && !button(name).disabled, `an interrupted restore did not offer ${name}`);
   };
+  await interrupt("Keep files as they are");
+  once.set("POST /api/worktrees/checkpoints/recover", () => { nextRead(() => response({ error: "The runtime is busy" }, 503)); return response({ error: "The files could not be kept" }, 500); });
+  await press(button("Keep files as they are"));
+  await until(() => /could not be kept/.test(alerts()) && /runtime is busy/.test(alerts()) && !button("Keep files as they are").disabled, "a keep whose reread failed was not reported");
+  await settle();
+  assert(!retryAction(), "a keep whose outcome is unknown offered Retry");
+  button("Retry").click();
+  await until(() => !/could not be read/.test(alerts()) && button("Keep files as they are"), "the list read Retry did not read the list");
+  await settle();
+  assert(!retryAction(), "a later list read revived the Retry of a keep whose outcome was unknown");
   await interrupt("Keep files as they are");
   once.set("POST /api/worktrees/checkpoints/recover", () => response({ error: "The files could not be kept" }, 500));
   await press(button("Keep files as they are"));

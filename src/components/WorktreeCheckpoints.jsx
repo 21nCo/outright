@@ -40,7 +40,7 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
   const issuedRef = useRef(0);
   const shownRef = useRef(0);
   const target = { projectId: project.id, worktreePath: worktree.path };
-  // `focus` names where focus goes once the list is shown.
+  // `focus` names where focus goes once the list is shown. Resolves true only when this read's list is shown.
   const load = useCallback(async (focus) => {
     const generation = ++issuedRef.current;
     const session = sessionRef.current;
@@ -51,8 +51,7 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
       shownRef.current = generation;
       canonicalRef.current = next.worktreePath;
       if (typeof focus === "string") focusNextRef.current = focus;
-      setLoadError("");
-      setDetail(next);
+      setLoadError(""); setDetail(next); return true;
     } catch (error) {
       if (stale()) return;
       shownRef.current = generation;
@@ -95,14 +94,14 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
   // Retry repeats a failed action only while all it acted on is unchanged: `intent`, a new object whenever the label, view, delete confirmation, listed checkpoints or restore record change.
   const intent = useMemo(() => ({}), [label, view, confirmDelete, JSON.stringify([detail?.restore, detail?.checkpoints.map((item) => item.id)])]);
   useEffect(() => setFailure(null), [label, view]);
-  // `work` gets `live()`, false once the dialog closed after it started. A failure
-  // stays until an action succeeds; the list is reread so Retry starts from it.
+  // `work` gets `live()`, false once the dialog closed after it started. A failure shows after the list is reread, busy until then;
+  // Retry comes only if that read showed the list, so an action whose outcome is unknown (lost answer, failed read) is not repeated.
   async function act(work) {
     const session = sessionRef.current;
     const live = () => session === sessionRef.current;
     setBusy(true);
     try { await work(live); if (live()) setFailure(null); }
-    catch (error) { if (live()) { setFailure({ message: error.message, retry: work, intent }); void load(); } }
+    catch (error) { const reconciled = live() && await load(); if (live()) setFailure({ message: error.message, retry: reconciled ? work : null, intent }); }
     finally { if (live()) setBusy(false); }
   }
   const capture = () => act(async (live) => {
@@ -132,7 +131,6 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
   const closeView = () => { setView(null); focusNext(returnFocusRef.current); };
   const restore = () => act(async (live) => {
     const { preview, selected, acknowledged } = view;
-    let stopped = false;
     try {
       const result = await api("/api/worktrees/checkpoints/restore", { method: "POST", body: { ...target, id: preview.checkpoint.id,
         planDigest: preview.planDigest, ...restoreSelection(preview.entries, selected), ...(preview.resume ? { resume: true } : {}),
@@ -146,16 +144,14 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
       // A restore that stopped part way is finished or kept from the list,
       // and a terminal opened since the preview is listed in a new one.
       if (!live()) return;
-      if (code === "CHECKPOINT_RESTORE_INTERRUPTED") { setView(null); stopped = true; }
+      if (code === "CHECKPOINT_RESTORE_INTERRUPTED") { setView(null); return load(FINISH); }
       if (code === "CHECKPOINT_TERMINALS_UNACKNOWLEDGED") {
         await openPreview(live, preview.checkpoint.id, "A terminal was opened in this worktree after the preview. Confirm the terminals before restoring.", preview.resume);
       } else if (code === "CHECKPOINT_PLAN_CHANGED") {
         await openPreview(live, preview.checkpoint.id, "The worktree changed after the preview. Review this updated preview before restoring.", preview.resume);
-      } else if (!stopped) throw error;
-    } finally {
-      if (live()) await load();
-      if (stopped && live()) focusNext(FINISH);
+      } else throw error;
     }
+    if (live()) await load();
   });
   const keepFiles = () => act(async (live) => {
     await api("/api/worktrees/checkpoints/recover", { method: "POST", body: { ...target, action: "keep" } });
@@ -192,7 +188,7 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
     {loadError && <div className="lifecycle-error" role="alert"><p>{loadError}</p>
       <Button size="sm" variant="outline" data-checkpoint-action="retry" onClick={() => void load(LABEL_FIELD)}>Retry</Button></div>}
     {failure && <div className="lifecycle-error" role="alert"><p>{failure.message}</p>
-      {failure.intent === intent && <Button size="sm" variant="outline" data-checkpoint-action="retry-action" disabled={busy} onClick={() => void act(failure.retry)}>Retry</Button>}</div>}
+      {failure.retry && failure.intent === intent && <Button size="sm" variant="outline" data-checkpoint-action="retry-action" disabled={busy} onClick={() => void act(failure.retry)}>Retry</Button>}</div>}
     {!detail && !loadError && <p className="lifecycle-note" role="status">Reading checkpoints…</p>}
     {detail?.restore?.status === "running" && <p className="lifecycle-note" role="status">A restore is running in this worktree. Agent runs, setup and Git changes here wait until it finishes.</p>}
     {interrupted && !view && <div className="lifecycle-error" role="alert">
