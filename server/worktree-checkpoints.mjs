@@ -92,6 +92,16 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     try { return (await git(cwd, args)).trim() || null; }
     catch (error) { if (error.code === 1) return null; throw error; }
   }
+  // Restore writes files with `git restore --overlay --pathspec-from-file`,
+  // which Git 2.26 added; an older Git is refused before anything changes.
+  let restorable = null;
+  async function requireRestoreGit(cwd) {
+    restorable ??= git(cwd, ["version"]).then((output) => {
+      const [, major = 0, minor = 0] = /(\d+)\.(\d+)/.exec(output) ?? [];
+      return Number(major) > 2 || (Number(major) === 2 && Number(minor) >= 26);
+    }, (error) => { restorable = null; throw error; });
+    if (!await restorable) throw checkpointError(409, "Restoring a checkpoint needs Git 2.26 or newer; update Git and try again", "CHECKPOINT_GIT_UNSUPPORTED");
+  }
   async function repository(cwd) {
     const [gitDir, indexPath, format] = (await git(cwd, ["rev-parse", "--absolute-git-dir", "--git-path", "index", "--show-object-format"])).trim().split("\n");
     gitDirs.set(cwd, gitDir);
@@ -328,8 +338,15 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     for (const [relative, blob] of await blobs(cwd, indexTree, staged.filter((change) => change.status !== "D").map((change) => change.path))) count(relative, blob.size);
     // Large files are refused before anything is copied into the object store.
     const found = new Map();
+    // Nothing is read through a link or file where a directory was: its
+    // tracked paths count as deleted, and Git lists the link or file itself.
+    const directories = new Map();
+    const directory = (relative) => directories.get(relative) ?? directories.set(relative,
+      lstat(path.join(cwd, relative)).then((info) => info.isDirectory(), () => false)).get(relative);
     for (const relative of changedPaths) {
-      const info = await lstat(path.join(cwd, relative)).catch(() => null);
+      let readable = true;
+      for (const ancestor of ancestors(relative)) if (!(readable = await directory(ancestor))) break;
+      const info = readable ? await lstat(path.join(cwd, relative)).catch(() => null) : null;
       if (info?.isFile()) count(relative, info.size);
       found.set(relative, info);
     }
@@ -500,17 +517,22 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       // captured: restore would destroy it, so the path is not offered. The
       // file the restore deletes under another case of the same name is not
       // in the way once it is deleted, which happens first.
-      const info = await lstat(path.join(cwd, item.path)).catch(() => null);
+      // Nothing is looked at through a link or file where a directory goes;
+      // once the restore deletes it, nothing is there.
+      let through = false;
+      for (const ancestor of ancestors(item.path)) {
+        const above = await lstat(path.join(cwd, ancestor)).catch(() => null);
+        if (!above || above.isDirectory()) continue;
+        through = true;
+        if (byPath.get(ancestor)?.file?.action !== "delete") item.blocked = `An ignored file is in the way at ${ancestor}`;
+      }
+      const info = through ? null : await lstat(path.join(cwd, item.path)).catch(() => null);
       const renamed = info && !info.isDirectory() && await sameFile(cwd, info, deleted.get(folded(item.path)) ?? []);
       if (renamed) group.set(find(item.path), find(renamed));
       else if (info?.isDirectory()) {
         const left = await uncaptured(cwd, item.path, byPath);
         if (left) item.blocked = `An ignored or nested file is in the way at ${left}`;
       } else if (info) item.blocked = "An ignored file or directory is in the way";
-      for (const ancestor of ancestors(item.path)) {
-        const above = await lstat(path.join(cwd, ancestor)).catch(() => null);
-        if (above && !above.isDirectory() && byPath.get(ancestor)?.file?.action !== "delete") item.blocked = `An ignored file is in the way at ${ancestor}`;
-      }
     }
     const members = new Map();
     for (const item of entries) {
@@ -693,6 +715,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   // still different on the paths it was restoring, from the state now.
   async function preview(value, id, { resume = false } = {}) {
     const cwd = target(value);
+    await requireRestoreGit(cwd);
     return withScratch(async (scratch) => {
       const repo = await repository(cwd);
       const marker = await readMarker(repo);
@@ -720,6 +743,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     }
     const entry = claim(value, "restore");
     try {
+      await requireRestoreGit(cwd);
       return await withScratch(async (scratch) => {
         const repo = await repository(cwd);
         const resumed = admitMarker(value, await readMarker(repo), id, resume === true);
@@ -978,7 +1002,8 @@ async function writeFileAt(root, relative, content, executable) {
   }
   const target = path.join(root, relative);
   await mkdir(path.dirname(target), { recursive: true });
-  const temporary = path.join(path.dirname(target), `.${path.basename(target)}.outright-${randomUUID().slice(0, 8)}`);
+  // A fixed-length name, so a name near the length limit still has one.
+  const temporary = path.join(path.dirname(target), `.outright-${randomUUID()}.tmp`);
   try {
     await writeFile(temporary, content, { mode: executable ? 0o777 : 0o666, flag: "wx" });
     await rename(temporary, target);

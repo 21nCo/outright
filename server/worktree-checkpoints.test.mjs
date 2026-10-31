@@ -773,3 +773,64 @@ test("every Git command a capture runs fits a Windows command line, with SHA-256
   assert.ok(longest < 32_767, `a command line was ${longest} characters`);
   assert.equal(batches(["a"]).length, 1);
 });
+
+test("a directory replaced by a link is recorded as the link, never through it", { skip: process.platform === "win32" && "directory links need privileges on Windows" }, async (t) => {
+  const { root, repository } = await fixture(t);
+  await mkdir(path.join(repository, "dir"));
+  await writeFile(path.join(repository, "dir", "file.txt"), "inside\n");
+  await git(repository, ["add", "."]);
+  await git(repository, ["commit", "-qm", "dir"]);
+  const outside = path.join(root, "outside");
+  await mkdir(outside);
+  await writeFile(path.join(outside, "file.txt"), "SECRET-EXTERNAL\n");
+  const secret = (await execFileAsync("git", ["hash-object", path.join(outside, "file.txt")], { encoding: "utf8" })).stdout.trim();
+  const { checkpoints } = service();
+  await writeFile(path.join(repository, "dir", "file.txt"), "edited\n");
+  const real = await checkpoints.capture(target(repository));
+  await rm(path.join(repository, "dir"), { recursive: true });
+  await symlink(outside, path.join(repository, "dir"), "dir");
+
+  const linked = await checkpoints.capture(target(repository));
+  assert.equal(await git(repository, ["ls-tree", "-r", "--format=%(objectmode) %(path)", linked.commit, "dir"]), "120000 dir\n");
+  assert.equal(await git(repository, ["show", `${linked.commit}:dir`]), outside);
+  // The checkpoint taken before a restore records the same, and the restore
+  // replaces the link without deleting anything outside the worktree.
+  const { result } = await restoreAll(checkpoints, repository, real.id);
+  assert.equal(await git(repository, ["ls-tree", "--format=%(objectmode)", result.safetyCheckpoint.commit, "dir"]), "120000\n");
+  assert.equal((await lstat(path.join(repository, "dir"))).isDirectory(), true);
+  assert.equal(await readFile(path.join(repository, "dir", "file.txt"), "utf8"), "edited\n");
+  await restoreAll(checkpoints, repository, linked.id);
+  assert.equal(await readlink(path.join(repository, "dir")), outside);
+  assert.equal(await readFile(path.join(outside, "file.txt"), "utf8"), "SECRET-EXTERNAL\n");
+  await assert.rejects(git(repository, ["cat-file", "-e", secret]), "content outside the worktree was stored");
+});
+
+test("a file whose name is near the length limit restores and clears the restore record", { skip: process.platform === "win32" && "Windows limits the whole path" }, async (t) => {
+  const { repository } = await fixture(t);
+  const name = "n".repeat(250);
+  await writeFile(path.join(repository, name), "long name\n");
+  const { checkpoints } = service();
+  const checkpoint = await checkpoints.capture(target(repository));
+  await rm(path.join(repository, name));
+  await restoreAll(checkpoints, repository, checkpoint.id);
+  assert.equal(await readFile(path.join(repository, name), "utf8"), "long name\n");
+  await assert.rejects(readFile(path.join(repository, ".git", RESTORE_MARKER)), { code: "ENOENT" });
+  assert.equal((await readdir(repository)).filter((entry) => entry.startsWith(".outright-")).length, 0);
+  assert.equal((await checkpoints.describe(target(repository))).restore, null);
+});
+
+test("preview and restore refuse a Git without overlay restore before changing anything", async (t) => {
+  const { repository } = await fixture(t);
+  await writeFile(path.join(repository, "a.txt"), "edited\n");
+  const { checkpoints } = service({ run: (file, args, options) => args.at(-1) === "version"
+    ? Promise.resolve({ stdout: "git version 2.25.4\n", stderr: "" }) : execFileAsync(file, args, options) });
+  const checkpoint = await checkpoints.capture(target(repository));
+  await writeFile(path.join(repository, "a.txt"), "later\n");
+  const before = await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]);
+  await assert.rejects(checkpoints.preview(target(repository), checkpoint.id), (error) => error.details?.code === "CHECKPOINT_GIT_UNSUPPORTED");
+  await assert.rejects(checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: "0".repeat(64), paths: ["a.txt"] }),
+    (error) => error.details?.code === "CHECKPOINT_GIT_UNSUPPORTED");
+  assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "later\n");
+  assert.equal(await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]), before, "a safety checkpoint was taken");
+  await assert.rejects(readFile(path.join(repository, ".git", RESTORE_MARKER)), { code: "ENOENT" });
+});
