@@ -72,10 +72,16 @@ test("unknown native utility ownership preserves Git mutation admission for insp
       getProjects: () => [{ worktrees: [{ path: repository }] }],
       getConfig: async () => ({ scanRoots: [repository] }),
       subprocesses: { run: async () => { throw Object.assign(new Error("owner proof missing"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN" }); } },
+      // The admission is ended with the failure, so a checkpoint restore
+      // keeps the worktree held until the process is proven gone.
+      admitWriter: () => (error) => released.push(error?.cause?.code ?? null),
     });
+    const released = [];
     await assert.rejects(service.stage(repository, ["tracked.txt"]), (error) =>
       error.statusCode === 503 && error.details?.outcomeUnknown === true);
     assert.deepEqual(actions, ["git.stage.requested"], "an uncertain native outcome was recorded as a failed mutation");
+    await assert.rejects(service.commit(repository, "uncertain"), (error) => error.details?.outcomeUnknown === true);
+    assert.deepEqual(released, ["SUBPROCESS_OWNERSHIP_UNKNOWN", "SUBPROCESS_OWNERSHIP_UNKNOWN"]);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

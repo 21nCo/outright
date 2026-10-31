@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { lstat, open, stat } from "node:fs/promises";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { holdMessage } from "./worktree-checkpoints.mjs";
 
 // Repository setup and teardown for worktrees. A repository describes its
 // commands in one JSON file at the worktree root; nothing in it runs until
@@ -358,10 +359,13 @@ function stepFailure(error, step, signal, capacity, mask) {
 
 // `agentWork(paths)` reports whether an agent run is queued, launching or
 // running in a worktree, and `interruptedRun(paths)` an interrupted run there
-// whose outcome the user has not resolved; `onRelease` is called when a
-// worktree is no longer held, so runs that waited for it can launch.
+// whose outcome the user has not resolved; `restoreHold(paths)` the code of
+// a checkpoint restore that is running or did not finish there, or of a Git
+// write there that lost track of its process, or null;
+// `onRelease` is called when a worktree is no longer held, so runs that
+// waited for it can launch.
 export function createWorktreeLifecycle({ database, subprocesses, publish = () => {}, readConfig = readLifecycleConfig,
-  identify = worktreeInstance, agentWork = () => false, interruptedRun = () => null, onRelease = () => {},
+  identify = worktreeInstance, agentWork = () => false, interruptedRun = () => null, restoreHold = () => null, onRelease = () => {},
   now = () => new Date().toISOString(), limits = LIFECYCLE_LIMITS, onPersistError = () => {} }) {
   // worktree path -> latest state; path -> claim of the running operation;
   // path -> live output of the latest run.
@@ -487,6 +491,8 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     if (agentWork([...paths])) {
       throw apiError(409, `An agent run is queued or running in this worktree; ${phase} waits until it finishes`, { code: "WORKTREE_AGENT_ACTIVE", phase });
     }
+    const restoring = restoreHold([...paths]);
+    if (restoring) throw apiError(409, holdMessage(restoring, `start ${phase}`), { code: restoring, phase });
     // An interrupted run's processes are as unconfirmed as a step's.
     const interrupted = interruptedRun([...paths]);
     if (interrupted) {
