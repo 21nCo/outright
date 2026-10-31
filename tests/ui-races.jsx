@@ -10,6 +10,7 @@ import { WindowedDiff, diffFindTop, diffRowsHeight } from "../src/components/Win
 import { CommandPalette } from "../src/components/CommandPalette.jsx";
 import { SettingsDialog } from "../src/components/SettingsDialog.jsx";
 import { TeardownChoices, WorktreeLifecycleDialog } from "../src/components/WorktreeLifecycle.jsx";
+import { WorktreeCheckpointsDialog } from "../src/components/WorktreeCheckpoints.jsx";
 import { ProviderAccounts } from "../src/components/ProviderAccounts.jsx";
 import { TerminalPane } from "../src/components/TerminalPane.jsx";
 import { PaneBody, PaneLayout } from "../src/components/PaneLayout.jsx";
@@ -9273,6 +9274,609 @@ async function pendingRunWithQueuedSiblingRegression() {
   await until(() => !host.querySelector(".recovery-notice") && host.querySelector(".run-state")?.textContent.includes("queued"), "durable snapshot clears only the older pending result");
 }
 
+// A restore is sent only against the exact preview shown, with the paths
+// chosen (a file/directory swap together) and only once open terminals are
+// confirmed. A worktree that changed, or a terminal opened, after the
+// preview gets a new preview instead of a restore, and an interrupted
+// restore offers finish or keep. Each step that removes the focused control
+// moves focus to a defined place.
+async function worktreeCheckpointsRegression() {
+  root.render(null); await settle();
+  const project = projects[0];
+  const worktree = project.worktrees[0];
+  const checkpoint = { id: "lx1abc-0123abcd", commit: "c".repeat(40), label: "Before agent", reason: "manual", createdAt: "2026-10-31T00:00:00.000Z",
+    head: "a".repeat(40), branch: "main", counts: { staged: 1, unstaged: 0, untracked: 2 } };
+  let detail = { worktreePath: worktree.path, checkpoints: [checkpoint], restore: null, busy: null, limits: { perWorktree: 20 } };
+  const entries = [
+    { path: "a.txt", index: { action: "update", mode: "100644", oid: "b".repeat(40) }, file: { action: "update" } },
+    { path: "cache", index: null, file: { action: "create" }, blocked: "An ignored file or directory is in the way" },
+    { path: "dir", index: null, file: { action: "delete" }, group: "dir", groupSize: 2 },
+    { path: "dir/inner.txt", index: null, file: { action: "create" }, group: "dir", groupSize: 2 },
+  ];
+  let previews = 0;
+  const preview = (resume = false) => ({ checkpoint, planDigest: String(++previews).padStart(64, "0"), currentTree: "d".repeat(40), currentIndexTree: "e".repeat(40),
+    head: { current: checkpoint.head, checkpoint: checkpoint.head, moved: false }, entries: resume ? entries.slice(0, 1) : entries, blockers: [],
+    terminals: [{ id: "t1", name: "zsh" }], resume });
+  const posts = [];
+  const diffs = [];
+  let restoreAnswer = null;
+  // A runtime without checkpoint routes answers like any unknown route.
+  let listUnavailable = true;
+  let previewGate = null;
+  // When set, answers the list reads in place of the fixture's checkpoints.
+  let listAnswer = null;
+  let diffGate = null;
+  // "METHOD /path" -> an answer used once, before the fixture's own.
+  const once = new Map();
+  route = async (url, options) => {
+    const request = `${options.method ?? "GET"} ${url.pathname}`;
+    if (once.has(request)) { const answer = once.get(request); once.delete(request); return answer(options.body ? JSON.parse(options.body) : null); }
+    if (url.pathname === "/api/worktrees/checkpoints" && (options.method ?? "GET") === "GET") {
+      if (listAnswer) return listAnswer();
+      return listUnavailable ? response({ error: "API route not found" }, 404) : response(detail);
+    }
+    if (url.pathname.endsWith("/inspect")) return response({ checkpoint, entries: [{ path: "a.txt", state: "staged", status: "M" }], truncated: false });
+    if (url.pathname.endsWith("/diff")) {
+      diffs.push(Object.fromEntries(url.searchParams));
+      if (diffGate) await diffGate;
+      return response({ diff: `diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-now ${url.searchParams.get("side")}\n+then ${url.searchParams.get("side")}\n` });
+    }
+    posts.push({ path: url.pathname, body: options.body ? JSON.parse(options.body) : null });
+    if (url.pathname.endsWith("/preview") && previewGate) await previewGate;
+    if (url.pathname.endsWith("/preview")) return response(preview(JSON.parse(options.body).resume === true));
+    if (url.pathname.endsWith("/restore")) return restoreAnswer();
+    if (url.pathname.endsWith("/recover")) { detail = { ...detail, restore: null }; return response({ restored: 3 }); }
+    return response({});
+  };
+  const events = new EventTarget();
+  const errors = [];
+  const show = (open) => root.render(<TooltipProvider><WorktreeCheckpointsDialog open={open} onOpenChange={() => {}} project={project} worktree={worktree} events={events} onError={(error) => errors.push(error)} /></TooltipProvider>);
+  show(true);
+  const dialog = () => document.querySelector(".checkpoint-dialog");
+  const button = (name) => [...(dialog()?.querySelectorAll("button") ?? [])].find((item) => item.textContent.trim() === name || item.getAttribute("aria-label") === name);
+  const restoreButton = () => [...dialog().querySelectorAll("button")].find((item) => /^(?:Restore|Finish restoring) \d/.test(item.textContent));
+  const box = (path) => [...(dialog()?.querySelectorAll(".checkpoint-paths li") ?? [])].find((item) => item.querySelector("code")?.textContent === path)?.querySelector('input[type="checkbox"]');
+  const confirmTerminals = () => dialog().querySelector(".checkpoint-preview .lifecycle-acknowledge input").click();
+  await until(() => button("Retry"), "a list read the runtime does not serve did not offer Retry");
+  assert(/not available in this version/.test(dialog().querySelector('[role="alert"]')?.textContent ?? ""), "an unavailable runtime was not reported in an alert");
+  assert(!/Reading checkpoints/.test(dialog().textContent) && !errors.length, "a failed list read kept reading or was reported elsewhere");
+  listUnavailable = false;
+  button("Retry").focus();
+  button("Retry").click();
+  await until(() => button("Restore Before agent"), "the checkpoint was not listed with a restore control");
+  await until(() => !button("Retry") && document.activeElement === dialog().querySelector(".checkpoint-create input"), "a successful retry did not clear the alert and focus the label field");
+  assert(/1 staged · 2 untracked/.test(dialog().textContent), "the checkpoint did not say what it holds");
+  const focused = (control, label) => assert(document.activeElement === control, `focus was not on ${label} but on ${document.activeElement?.outerHTML.slice(0, 120)}`);
+  const heading = () => dialog().querySelector(".checkpoint-view-heading");
+  button("Inspect Before agent").focus();
+  button("Inspect Before agent").click();
+  await until(() => heading(), "inspect did not open");
+  focused(heading(), "the inspected checkpoint's heading");
+  button("Back").click();
+  await until(() => button("Inspect Before agent"), "Back did not return to the list");
+  focused(button("Inspect Before agent"), "the Inspect control that opened the view");
+  button("Delete Before agent").click();
+  await until(() => button("Keep"), "delete did not ask for confirmation");
+  focused(button("Keep"), "the Keep choice of a pending delete");
+  button("Keep").click();
+  await until(() => button("Delete Before agent"), "Keep did not cancel the delete");
+  focused(button("Delete Before agent"), "the Delete control");
+  button("Restore Before agent").click();
+  await until(() => box("a.txt"), "the restore preview did not open");
+  focused(heading(), "the preview's heading");
+  assert(box("cache").disabled && !box("cache").checked, "a blocked path was offered");
+  // A path whose index entry changes offers its staged difference apart from its file's.
+  button("Show staged difference for a.txt").click();
+  await until(() => /then index/.test(dialog().querySelector(".checkpoint-diff")?.textContent ?? ""), "the staged difference was not shown");
+  assert(diffs.at(-1).side === "index" && diffs.at(-1).tree === "e".repeat(40), "the staged difference did not compare the previewed index");
+  assert(!button("Show staged difference for dir"), "a path whose index does not change offered a staged difference");
+  button("Show file difference for a.txt").click();
+  await until(() => /then files/.test(dialog().querySelector(".checkpoint-diff")?.textContent ?? ""), "the file difference was not shown");
+  assert(diffs.at(-1).side === "files" && diffs.at(-1).tree === "d".repeat(40), "the file difference did not compare the previewed files");
+  assert(restoreButton().disabled, "restore was possible before the open terminal was confirmed");
+  box("dir/inner.txt").click();
+  await until(() => !box("dir").checked && !box("dir/inner.txt").checked, "a file/directory swap was not cleared together");
+  confirmTerminals();
+  await until(() => !restoreButton().disabled, "confirming the terminal did not enable restore");
+  assert(restoreButton().textContent === "Restore 1 path", `the restore named ${restoreButton().textContent}`);
+
+  restoreAnswer = () => response({ error: "The worktree changed after the preview", code: "CHECKPOINT_PLAN_CHANGED" }, 409);
+  restoreButton().click();
+  await until(() => previews === 2 && /changed after the preview/.test(dialog().querySelector(".lifecycle-summary")?.textContent ?? ""), "a changed worktree did not replace the preview");
+  assert(JSON.stringify(posts.find((post) => post.path.endsWith("/restore")).body) === JSON.stringify({ projectId: project.id, worktreePath: worktree.path,
+    id: checkpoint.id, planDigest: "1".padStart(64, "0"), paths: ["a.txt"], acknowledgeTerminals: ["t1"] }), "the restore did not confirm the preview shown");
+  await until(() => box("dir")?.checked, "the new preview did not load");
+  assert(restoreButton().disabled, "the new preview kept the old terminal confirmation");
+  confirmTerminals();
+  // A terminal opened after the preview is listed in a new one to confirm.
+  restoreAnswer = () => response({ error: "Confirm the terminals open in this worktree before restoring", code: "CHECKPOINT_TERMINALS_UNACKNOWLEDGED" }, 409);
+  await until(() => !restoreButton().disabled, "the new preview could not be confirmed");
+  restoreButton().click();
+  await until(() => previews === 3 && /terminal was opened/.test(dialog().querySelector(".lifecycle-summary")?.textContent ?? ""), "a terminal refusal did not reopen the preview");
+  focused(heading(), "the reopened preview's heading");
+  assert(restoreButton().disabled, "the reopened preview kept the old terminal confirmation");
+  confirmTerminals();
+  restoreAnswer = () => response({ restored: 3, safetyCheckpoint: { ...checkpoint, id: "lx1abd-0123abce", label: "Before restoring Before agent", reason: "before-restore" } });
+  await until(() => !restoreButton().disabled, "the reopened preview could not be confirmed");
+  restoreButton().click();
+  await until(() => /Restored 3 paths/.test(dialog().querySelector(".lifecycle-summary")?.textContent ?? ""), "the restore outcome was not announced");
+  focused(dialog().querySelector(".checkpoint-create input"), "the label field after the restore");
+  const sent = posts.findLast((post) => post.path.endsWith("/restore")).body;
+  assert(sent.planDigest === "3".padStart(64, "0") && [...sent.paths].sort((a, b) => a.localeCompare(b)).join() === "a.txt,dir,dir/inner.txt", "the restore did not confirm the new preview");
+
+  // A restarted runtime reports an interrupted restore without an event.
+  detail = { ...detail, restore: { status: "interrupted", checkpointId: checkpoint.id, safetyCheckpointId: "lx1abd-0123abce", paths: 3 } };
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => button("Finish restore…") && button("Keep files as they are"), "an interrupted restore did not offer finish and keep");
+  assert(button("Restore Before agent").disabled, "a new restore was offered over an interrupted one");
+  // Finishing is previewed and confirmed like any restore, against the state now.
+  button("Finish restore…").click();
+  await until(() => box("a.txt") && /Finish restoring/.test(dialog().querySelector(".checkpoint-preview h3")?.textContent ?? ""), "finishing the restore did not open its preview");
+  assert(posts.at(-1).path.endsWith("/preview") && posts.at(-1).body.resume === true, "the finish preview did not ask for the unfinished restore");
+  // A finish that stops part way again leaves the preview for finish or keep.
+  confirmTerminals();
+  restoreAnswer = () => response({ error: "Restore stopped before finishing", code: "CHECKPOINT_RESTORE_INTERRUPTED" }, 409);
+  await until(() => restoreButton() && !restoreButton().disabled, "the finish preview could not be confirmed");
+  restoreButton().click();
+  await until(() => !heading() && button("Finish restore…"), "an interrupted restore kept its stale preview over finish and keep");
+  await until(() => document.activeElement === button("Finish restore…"), "focus did not move to Finish restore…");
+  assert(!dialog().querySelector('[data-checkpoint-action="retry-action"]'), "an interrupted restore offered to repeat itself besides finish and keep");
+  errors.length = 0;
+  button("Finish restore…").click();
+  await until(() => box("a.txt"), "finishing did not open its preview again");
+  confirmTerminals();
+  restoreAnswer = () => { detail = { ...detail, restore: null }; return response({ restored: 1, safetyCheckpoint: { ...checkpoint, id: "lx1abe-0123abcf", label: "Before finishing", reason: "before-restore" } }); };
+  await until(() => restoreButton() && !restoreButton().disabled, "the finish preview could not be confirmed");
+  restoreButton().click();
+  await until(() => /Finished the restore of 1 path/.test(dialog().querySelector(".lifecycle-summary")?.textContent ?? "") && !button("Finish restore…"), "finishing the restore left it reported as interrupted");
+  const finished = posts.at(-1);
+  assert(finished.path.endsWith("/restore") && finished.body.resume === true && finished.body.planDigest === String(previews).padStart(64, "0")
+    && finished.body.paths.join() === "a.txt", "finishing did not confirm its own preview");
+  detail = { ...detail, restore: { status: "interrupted", checkpointId: checkpoint.id, safetyCheckpointId: "lx1abd-0123abce", paths: 1 } };
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => button("Keep files as they are"), "an interrupted restore did not offer keep");
+  button("Keep files as they are").click();
+  await until(() => !button("Keep files as they are") && document.activeElement === dialog().querySelector(".checkpoint-create input"), "keeping the files did not move focus to the label field");
+
+  // Git processes the restore lost track of keep both choices closed.
+  detail = { ...detail, restore: { status: "interrupted", checkpointId: checkpoint.id, safetyCheckpointId: "lx1abd-0123abce", paths: 1, ownerUnconfirmed: true } };
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => button("Finish restore…")?.disabled && button("Keep files as they are")?.disabled, "unconfirmed Git processes left finish or keep open");
+  assert(/not confirmed stopped/.test(dialog().textContent), "the dialog did not say why the restore cannot be finished");
+
+  // A preview answered after the dialog closed does not reach it when reopened.
+  detail = { ...detail, restore: null };
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => button("Restore Before agent") && !button("Restore Before agent").disabled, "the restore control did not return");
+  let releasePreview;
+  previewGate = new Promise((resolve) => { releasePreview = resolve; });
+  const asked = previews;
+  button("Restore Before agent").click();
+  await until(() => posts.at(-1)?.path.endsWith("/preview"), "the delayed preview was not requested");
+  show(false); await settle();
+  previewGate = null; releasePreview(); await until(() => previews === asked + 1, "the delayed preview did not answer");
+  await settle();
+  show(true);
+  await until(() => button("Restore Before agent"), "the reopened dialog did not list the checkpoints");
+  await settle();
+  assert(!heading() && !dialog().querySelector(".checkpoint-preview"), "a preview answered after close was shown in the reopened dialog");
+
+  // An older read answering after a newer one failed replaces neither the
+  // failure nor, when it fails too, the newer message.
+  const alertText = () => dialog().querySelector('[role="alert"]')?.textContent ?? "";
+  for (const older of [() => response(detail), () => response({ error: "API route not found" }, 404)]) {
+    let releaseOlder;
+    const held = new Promise((resolve) => { releaseOlder = resolve; });
+    const answers = [() => held.then(older), () => response({ error: "The runtime is busy" }, 503)];
+    listAnswer = () => answers.shift()();
+    events.dispatchEvent(new CustomEvent("reconnect"));
+    await until(() => answers.length === 1, "the older list read was not issued");
+    events.dispatchEvent(new CustomEvent("reconnect"));
+    await until(() => button("Retry") && /The runtime is busy/.test(alertText()), "the newer failed read was not reported");
+    releaseOlder(); await held; await settle();
+    assert(button("Retry") && /could not be read: The runtime is busy/.test(alertText()), `an older read replaced the newer failure: ${alertText() || "no alert"}`);
+    listAnswer = null;
+    button("Retry").click();
+    await until(() => !button("Retry") && button("Restore Before agent"), "Retry did not list the checkpoints again");
+  }
+
+  // A restore answered after the dialog closed reads nothing into it.
+  button("Restore Before agent").click();
+  await until(() => box("a.txt"), "the restore preview did not open");
+  confirmTerminals();
+  let releaseRestore;
+  const restoreHeld = new Promise((resolve) => { releaseRestore = resolve; });
+  restoreAnswer = () => restoreHeld.then(() => response({ restored: 1, safetyCheckpoint: { ...checkpoint, id: "lx1abf-0123abd0", label: "Before late", reason: "before-restore" } }));
+  await until(() => restoreButton() && !restoreButton().disabled, "the preview could not be confirmed");
+  restoreButton().click();
+  await until(() => posts.at(-1)?.path.endsWith("/restore"), "the delayed restore was not requested");
+  show(false); await settle();
+  listAnswer = () => response({ error: "Read while closed" }, 500);
+  releaseRestore(); await restoreHeld; await settle(); await settle();
+  let releaseList;
+  const listHeld = new Promise((resolve) => { releaseList = resolve; });
+  listAnswer = () => listHeld.then(() => response(detail));
+  show(true);
+  await until(() => dialog(), "the dialog did not reopen");
+  await settle();
+  assert(/Reading checkpoints/.test(dialog().textContent) && !alertText() && !button("Restore Before agent"),
+    `the reopened dialog showed a read from the closed session: ${alertText() || dialog().textContent.slice(0, 160)}`);
+  releaseList(); listAnswer = null;
+  await until(() => button("Restore Before agent"), "the reopened dialog did not list the checkpoints");
+
+  // Focus a step asks for never lands on a disabled control: Finish restore
+  // while Git processes are unconfirmed, or a list control while busy.
+  const labelField = () => dialog().querySelector(".checkpoint-create input");
+  button("Restore Before agent").click();
+  await until(() => box("a.txt"), "the restore preview did not open");
+  confirmTerminals();
+  // A native key gives the page input focus, so removing the focused preview
+  // makes the dialog refocus itself, again a frame later, as for a user. The
+  // reload answers when it first does, before that frame.
+  let answerReload = null;
+  restoreAnswer = () => { detail = { ...detail, restore: { status: "interrupted", checkpointId: checkpoint.id, safetyCheckpointId: "lx1abd-0123abce", paths: 1, ownerUnconfirmed: true } };
+    if (window.__fixtureSendKey) listAnswer = () => new Promise((resolve) => { answerReload = () => resolve(response(detail)); });
+    return response({ error: "Restore stopped before finishing", code: "CHECKPOINT_RESTORE_INTERRUPTED" }, 409); };
+  const onPopupFocus = (event) => { if (event.target === dialog()) answerReload?.(); };
+  document.addEventListener("focusin", onPopupFocus);
+  await until(() => restoreButton() && !restoreButton().disabled, "the preview could not be confirmed");
+  if (window.__fixtureSendKey) await window.__fixtureSendKey("Tab");
+  assert(dialog().querySelector(".checkpoint-preview").contains(document.activeElement), "focus was not in the preview before the restore");
+  restoreButton().click();
+  await until(() => !heading() && button("Finish restore…")?.disabled, "an interrupted restore with unconfirmed Git processes left finish open, or its reload was not answered");
+  document.removeEventListener("focusin", onPopupFocus);
+  listAnswer = null;
+  await settle();
+  focused(labelField(), "the label field when Finish restore… was disabled");
+  errors.length = 0;
+  detail = { ...detail, restore: null };
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => button("Restore Before agent") && !button("Restore Before agent").disabled, "the restore control did not return");
+  button("Restore Before agent").click();
+  await until(() => box("a.txt"), "the restore preview did not open");
+  let releaseDiff;
+  diffGate = new Promise((resolve) => { releaseDiff = resolve; });
+  button("Show file difference for a.txt").click();
+  await until(() => button("Show file difference for a.txt")?.disabled, "the difference did not start loading");
+  button("Back").click();
+  await until(() => button("Restore Before agent")?.disabled, "Back did not return to the list while a difference loaded");
+  await settle();
+  focused(labelField(), "the label field when the Restore control was busy");
+  diffGate = null; releaseDiff();
+  await until(() => !button("Restore Before agent").disabled, "the difference did not finish loading");
+  focused(labelField(), "the label field after the difference loaded");
+
+  // An action that disables the focused trigger keeps keyboard focus on an
+  // enabled control in the dialog while pending and after its outcome.
+  const press = async (control) => { await until(() => !control.disabled, "the control to press stayed disabled"); control.focus(); if (window.__fixtureSendKey) await window.__fixtureSendKey("Enter"); else control.click(); };
+  const held = () => { let release; const promise = new Promise((resolve) => { release = resolve; }); return { promise, release }; };
+  const typeLabel = (text) => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(labelField(), text);
+    labelField().dispatchEvent(new Event("input", { bubbles: true }));
+  };
+  const retryAction = () => dialog().querySelector('[data-checkpoint-action="retry-action"]');
+  const notice = () => dialog().querySelector(".lifecycle-summary")?.textContent ?? "";
+  const taken = { ...checkpoint, id: "lx1abg-0123abd1", label: "Typed" };
+  const capture = held();
+  let captured = null;
+  once.set("POST /api/worktrees/checkpoints", (body) => { captured = body; return capture.promise.then(() => response({ checkpoint: taken })); });
+  typeLabel("Typed");
+  await until(() => labelField().value === "Typed", "the label was not typed");
+  await press(button("Take checkpoint"));
+  await until(() => button("Take checkpoint").disabled, "the capture did not start");
+  await settle();
+  focused(labelField(), "the label field while a capture started from Take checkpoint was pending");
+  capture.release();
+  await until(() => /Checkpoint taken/.test(notice()), "the capture was not announced");
+  await settle();
+  focused(labelField(), "the label field after a capture");
+  assert(captured?.label === "Typed", "the capture did not send the typed label");
+  // A failed capture stays in the dialog with the label kept, rereads the
+  // list, and Retry takes it with that label.
+  typeLabel("Keep this label");
+  await until(() => labelField().value === "Keep this label", "the label was not typed");
+  once.set("POST /api/worktrees/checkpoints", () => response({ error: "The disk is full" }, 507));
+  let reads = 0;
+  listAnswer = () => { reads++; return response(detail); };
+  await press(button("Take checkpoint"));
+  await until(() => retryAction() && /The disk is full/.test(alertText()), "a failed capture was not reported in the dialog with Retry");
+  await settle();
+  focused(labelField(), "the label field after a failed capture");
+  assert(labelField().value === "Keep this label", "a failed capture lost the label");
+  await until(() => reads > 0, "a failed capture did not read the list again");
+  listAnswer = null;
+  once.set("POST /api/worktrees/checkpoints", (body) => { captured = body; return response({ checkpoint: taken }); });
+  await press(retryAction());
+  await until(() => !retryAction() && /Checkpoint taken/.test(notice()), "Retry did not take the checkpoint");
+  assert(captured?.label === "Keep this label", `Retry took the checkpoint with ${JSON.stringify(captured?.label)}`);
+  focused(labelField(), "the label field after Retry");
+  // A new label is a new intent, so the failure and its Retry go.
+  once.set("POST /api/worktrees/checkpoints", () => response({ error: "The disk is full" }, 507));
+  await press(button("Take checkpoint"));
+  await until(() => retryAction(), "a failed capture did not offer Retry");
+  typeLabel("Another");
+  await until(() => !retryAction(), "a changed label kept the old capture's Retry");
+  typeLabel("");
+  // So is a label typed while the capture is pending: its failure has no Retry.
+  const pendingCapture = held();
+  once.set("POST /api/worktrees/checkpoints", () => pendingCapture.promise.then(() => response({ error: "The disk is full" }, 507)));
+  await press(button("Take checkpoint"));
+  await until(() => button("Take checkpoint").disabled, "the capture did not start");
+  typeLabel("Typed while pending");
+  await until(() => labelField().value === "Typed while pending", "the label was not typed");
+  pendingCapture.release();
+  await until(() => /The disk is full/.test(alertText()) && !button("Take checkpoint").disabled, "a failed capture was not reported in the dialog");
+  await settle();
+  assert(!retryAction(), "Retry would take the checkpoint with the label from before the user typed");
+  typeLabel("");
+
+  // A failure shows, with Retry, only once a reread shows the list; until then
+  // the dialog stays busy, so an action whose answer was lost is not repeated.
+  const alerts = () => [...dialog().querySelectorAll('[role="alert"]')].map((item) => item.textContent).join(" ");
+  // The next list read answers `answer()`, here held or failed, once.
+  const nextRead = (answer) => { listAnswer = () => { listAnswer = null; return answer(); }; };
+  const lost = { ...checkpoint, id: "lx1abj-0123abd4", label: "Lost answer" };
+  let sentCaptures = 0;
+  const lostRead = held();
+  typeLabel("Lost answer");
+  await until(() => labelField().value === "Lost answer", "the label was not typed");
+  once.set("POST /api/worktrees/checkpoints", () => { sentCaptures++; detail = { ...detail, checkpoints: [lost, ...detail.checkpoints] };
+    nextRead(() => lostRead.promise.then(() => response(detail))); return response({ error: "Gateway timeout" }, 504); });
+  await press(button("Take checkpoint"));
+  await until(() => sentCaptures === 1 && !listAnswer, "the capture was not followed by a list read");
+  await settle(); await settle();
+  assert(button("Take checkpoint").disabled && !retryAction(), "a capture whose answer was lost could be repeated before the list was read again");
+  lostRead.release();
+  await until(() => button("Delete Lost answer") && /Gateway timeout/.test(alerts()) && !button("Take checkpoint").disabled, "the lost capture was not reported after the reread listed it");
+  await settle();
+  assert(!retryAction() && sentCaptures === 1, "the reread showed the capture taken, yet Retry was offered to take it again");
+  // A capture the reread shows not taken offers Retry once that read answers.
+  const unchangedRead = held();
+  typeLabel("Second try");
+  await until(() => labelField().value === "Second try" && !alerts(), "the label was not typed");
+  once.set("POST /api/worktrees/checkpoints", () => { sentCaptures++; nextRead(() => unchangedRead.promise.then(() => response(detail))); return response({ error: "The disk is full" }, 507); });
+  await press(button("Take checkpoint"));
+  await until(() => sentCaptures === 2 && !listAnswer, "the capture was not followed by a list read");
+  await settle(); await settle();
+  assert(button("Take checkpoint").disabled && !retryAction(), "a failed capture offered Retry before the list was read again");
+  unchangedRead.release();
+  await until(() => retryAction() && !retryAction().disabled && /disk is full/.test(alerts()), "a capture the reread shows not taken did not offer Retry");
+  once.set("POST /api/worktrees/checkpoints", (body) => { sentCaptures++; captured = body; return response({ checkpoint: taken }); });
+  await press(retryAction());
+  await until(() => !retryAction() && labelField().value === "", "Retry did not take the checkpoint");
+  assert(sentCaptures === 3 && captured.label === "Second try", `Retry sent ${sentCaptures - 2} captures with ${JSON.stringify(captured?.label)}`);
+  // A reread that fails leaves the outcome unknown: no Retry, now or after
+  // the list is read again.
+  typeLabel("Unknown outcome");
+  await until(() => labelField().value === "Unknown outcome", "the label was not typed");
+  once.set("POST /api/worktrees/checkpoints", () => { sentCaptures++; nextRead(() => response({ error: "The runtime is busy" }, 503)); return response({ error: "Gateway timeout" }, 504); });
+  await press(button("Take checkpoint"));
+  await until(() => /Gateway timeout/.test(alerts()) && /could not be read: The runtime is busy/.test(alerts()) && !button("Take checkpoint").disabled, "a capture whose reread failed was not reported");
+  await settle();
+  assert(!retryAction() && button("Retry"), "a capture whose outcome is unknown offered Retry, or the list read did not");
+  button("Retry").click();
+  await until(() => !/could not be read/.test(alerts()) && /Gateway timeout/.test(alerts()), "the list read Retry did not read the list");
+  await settle();
+  assert(!retryAction() && sentCaptures === 4, "a later list read revived the Retry of a capture whose outcome was unknown");
+  typeLabel("");
+  // A delete the reread shows done keeps no Retry, nor before that read.
+  const droppedRead = held();
+  let deleteSent = false;
+  button("Delete Lost answer").click();
+  await until(() => button("Confirm delete") && !alerts(), "delete did not ask for confirmation");
+  once.set("DELETE /api/worktrees/checkpoints", () => { deleteSent = true; detail = { ...detail, checkpoints: detail.checkpoints.filter((item) => item.id !== lost.id) };
+    nextRead(() => droppedRead.promise.then(() => response(detail))); return response({ error: "The answer was lost" }, 504); });
+  await press(button("Confirm delete"));
+  await until(() => deleteSent && !listAnswer, "the delete was not followed by a list read");
+  await settle(); await settle();
+  assert(button("Confirm delete").disabled && !retryAction(), "a delete whose answer was lost could be repeated before the list was read again");
+  droppedRead.release();
+  await until(() => !button("Delete Lost answer") && /answer was lost/.test(alerts()) && !button("Take checkpoint").disabled, "the lost delete was not reported after the reread");
+  await settle();
+  assert(!retryAction(), "a delete the reread shows done kept its Retry");
+
+  // Inspect: focus stays in the dialog while it loads, a failure offers Retry.
+  const inspectHeld = held();
+  once.set("GET /api/worktrees/checkpoints/inspect", () => inspectHeld.promise.then(() => response({ checkpoint, entries: [], truncated: false })));
+  await press(button("Inspect Before agent"));
+  await until(() => button("Inspect Before agent")?.disabled, "inspect did not start");
+  await settle();
+  focused(labelField(), "the label field while Inspect was pending");
+  inspectHeld.release();
+  await until(() => heading(), "inspect did not open");
+  focused(heading(), "the inspected checkpoint's heading");
+  button("Back").click();
+  await until(() => button("Inspect Before agent") && !button("Inspect Before agent").disabled, "Back did not return to the list");
+  once.set("GET /api/worktrees/checkpoints/inspect", () => response({ error: "The checkpoint could not be read" }, 500));
+  await press(button("Inspect Before agent"));
+  await until(() => retryAction() && /could not be read/.test(alertText()), "a failed inspect was not reported in the dialog with Retry");
+  await settle();
+  focused(labelField(), "the label field after a failed inspect");
+  await press(retryAction());
+  await until(() => heading() && !retryAction(), "Retry did not inspect the checkpoint");
+  button("Back").click();
+  await until(() => button("Delete Before agent"), "Back did not return to the list");
+
+  // Delete: a failure keeps the confirmation, and Retry deletes.
+  button("Delete Before agent").click();
+  await until(() => button("Confirm delete"), "delete did not ask for confirmation");
+  once.set("DELETE /api/worktrees/checkpoints", () => response({ error: "The checkpoint is in use" }, 409));
+  await press(button("Confirm delete"));
+  await until(() => retryAction() && /in use/.test(alertText()), "a failed delete was not reported in the dialog with Retry");
+  await settle();
+  focused(labelField(), "the label field after a failed delete");
+  assert(button("Confirm delete") && !button("Confirm delete").disabled, "a failed delete dropped its confirmation");
+  await press(retryAction());
+  await until(() => /Deleted/.test(notice()) && !retryAction(), "Retry did not delete the checkpoint");
+  // DELETEs the fixture answered itself, by checkpoint id.
+  const deleted = () => posts.filter((post) => post.path === "/api/worktrees/checkpoints" && !("label" in post.body)).map((post) => post.body.id);
+  assert(deleted().at(-1) === checkpoint.id, "Retry did not delete the checkpoint whose deletion was confirmed");
+  // Retry repeats only the current intent: Keep, or asking to delete another
+  // checkpoint, cancels a failed delete, and no Retry deletes without it.
+  const other = { ...checkpoint, id: "lx1abi-0123abd3", label: "Other" };
+  detail = { ...detail, checkpoints: [checkpoint, other] };
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => button("Delete Other"), "the second checkpoint was not listed");
+  const deletes = deleted().length;
+  const failDelete = async () => {
+    button("Delete Before agent").click();
+    await until(() => button("Confirm delete"), "delete did not ask for confirmation");
+    once.set("DELETE /api/worktrees/checkpoints", () => response({ error: "The checkpoint is in use" }, 409));
+    await press(button("Confirm delete"));
+    await until(() => retryAction() && /in use/.test(alertText()), "a failed delete was not reported in the dialog with Retry");
+  };
+  await failDelete();
+  button("Keep").click();
+  await until(() => !button("Confirm delete") && button("Delete Before agent"), "Keep did not cancel the failed delete");
+  await settle();
+  assert(!retryAction(), "Keep left a Retry that deletes the checkpoint without its confirmation");
+  button("Delete Before agent").click();
+  await until(() => button("Confirm delete"), "delete did not ask for confirmation");
+  await settle();
+  assert(!retryAction(), "asking to delete again brought back the cancelled delete's Retry");
+  button("Keep").click();
+  await until(() => !button("Confirm delete"), "Keep did not cancel the delete");
+  await failDelete();
+  button("Delete Other").click();
+  await until(() => button("Confirm delete") && !button("Delete Other"), "delete did not ask to confirm the other checkpoint");
+  await settle();
+  assert(!retryAction(), "asking to delete another checkpoint left a Retry that deletes the first");
+  assert(deleted().length === deletes, `a checkpoint was deleted without its confirmation: ${deleted().slice(deletes).join()}`);
+  button("Keep").click();
+  await until(() => !button("Confirm delete") && button("Inspect Other") && !button("Inspect Other").disabled, "Keep did not cancel the delete");
+  // Nor does Retry inspect a checkpoint the reread no longer lists.
+  once.set("GET /api/worktrees/checkpoints/inspect", () => { detail = { ...detail, checkpoints: [checkpoint] }; return response({ error: "The checkpoint is gone" }, 404); });
+  await press(button("Inspect Other"));
+  await until(() => /is gone/.test(alertText()) && !button("Delete Other") && !button("Take checkpoint").disabled, "a failed inspect was not reported");
+  await settle();
+  assert(!retryAction(), "a checkpoint no longer listed kept its inspect Retry");
+
+  // Keep files and Finish restore… retry only the same interrupted restore:
+  // a reread that clears its record leaves the failure without Retry.
+  const interrupt = async (name) => {
+    detail = { ...detail, restore: { status: "interrupted", checkpointId: checkpoint.id, safetyCheckpointId: "lx1abd-0123abce", paths: 1 } };
+    events.dispatchEvent(new CustomEvent("reconnect"));
+    await until(() => button(name) && !button(name).disabled, `an interrupted restore did not offer ${name}`);
+  };
+  await interrupt("Keep files as they are");
+  once.set("POST /api/worktrees/checkpoints/recover", () => { nextRead(() => response({ error: "The runtime is busy" }, 503)); return response({ error: "The files could not be kept" }, 500); });
+  await press(button("Keep files as they are"));
+  await until(() => /could not be kept/.test(alerts()) && /runtime is busy/.test(alerts()) && !button("Keep files as they are").disabled, "a keep whose reread failed was not reported");
+  await settle();
+  assert(!retryAction(), "a keep whose outcome is unknown offered Retry");
+  button("Retry").click();
+  await until(() => !/could not be read/.test(alerts()) && button("Keep files as they are"), "the list read Retry did not read the list");
+  await settle();
+  assert(!retryAction(), "a later list read revived the Retry of a keep whose outcome was unknown");
+  await interrupt("Keep files as they are");
+  once.set("POST /api/worktrees/checkpoints/recover", () => response({ error: "The files could not be kept" }, 500));
+  await press(button("Keep files as they are"));
+  await until(() => retryAction() && /could not be kept/.test(alertText()), "a failed keep was not reported in the dialog with Retry");
+  await press(retryAction());
+  await until(() => /files were kept/.test(notice()) && !retryAction() && !button("Keep files as they are"), "Retry did not keep the files");
+  await interrupt("Keep files as they are");
+  once.set("POST /api/worktrees/checkpoints/recover", () => { detail = { ...detail, restore: null }; return response({ error: "The files could not be kept" }, 500); });
+  await press(button("Keep files as they are"));
+  await until(() => /could not be kept/.test(alertText()) && !button("Keep files as they are") && !button("Take checkpoint").disabled, "a failed keep was not reported");
+  await settle();
+  assert(!retryAction(), "a keep whose interrupted restore is gone kept its Retry");
+  await interrupt("Finish restore…");
+  once.set("POST /api/worktrees/checkpoints/preview", () => { detail = { ...detail, restore: null }; return response({ error: "The restore record changed" }, 500); });
+  await press(button("Finish restore…"));
+  await until(() => /record changed/.test(alertText()) && !button("Finish restore…") && !button("Take checkpoint").disabled, "a failed finish was not reported");
+  await settle();
+  assert(!retryAction(), "a finish whose interrupted restore is gone kept its Retry");
+
+  // Preview: a failed difference keeps the chosen paths, a failed restore
+  // keeps the preview and its confirmation; Retry repeats each.
+  button("Restore Before agent").click();
+  await until(() => box("a.txt"), "the restore preview did not open");
+  box("dir").click();
+  await until(() => !box("dir").checked, "a path was not cleared");
+  once.set("GET /api/worktrees/checkpoints/diff", () => response({ error: "The difference could not be read" }, 500));
+  await press(button("Show file difference for a.txt"));
+  await until(() => retryAction() && /difference could not be read/.test(alertText()), "a failed difference was not reported in the dialog with Retry");
+  await settle();
+  assert(dialog().contains(document.activeElement) && document.activeElement !== dialog() && !document.activeElement.disabled,
+    `focus left the controls after a failed difference: ${document.activeElement?.outerHTML.slice(0, 120)}`);
+  assert(!box("dir").checked && box("a.txt").checked, "a failed difference changed the chosen paths");
+  await press(retryAction());
+  await until(() => /then files/.test(dialog().querySelector(".checkpoint-diff")?.textContent ?? "") && !retryAction(), "Retry did not show the difference");
+  confirmTerminals();
+  await until(() => restoreButton() && !restoreButton().disabled, "the preview could not be confirmed");
+  once.set("POST /api/worktrees/checkpoints/restore", () => response({ error: "A file could not be written" }, 500));
+  await press(restoreButton());
+  await until(() => retryAction() && /could not be written/.test(alertText()), "a failed restore was not reported in the dialog with Retry");
+  await settle();
+  focused(heading(), "the preview's heading after a failed restore");
+  assert(!box("dir").checked && box("a.txt").checked && !restoreButton().disabled, "a failed restore lost the chosen paths or the terminal confirmation");
+  const sentBefore = posts.length;
+  restoreAnswer = () => response({ restored: 1, safetyCheckpoint: { ...checkpoint, id: "lx1abh-0123abd2", label: "Before retry", reason: "before-restore" } });
+  await press(retryAction());
+  await until(() => /Restored 1 path/.test(notice()) && !retryAction(), "Retry did not restore");
+  const retried = posts.slice(sentBefore).find((post) => post.path.endsWith("/restore"));
+  assert(retried && !retried.body.paths?.includes("dir") && retried.body.acknowledgeTerminals.join() === "t1", "Retry did not restore the chosen paths");
+
+  // A request left over from a closed dialog neither disables the reopened
+  // one nor reaches it: not its busy state, not a later preview.
+  await press(button("Restore Before agent"));
+  await until(() => box("a.txt"), "the restore preview did not open");
+  const oldDiff = held();
+  diffGate = oldDiff.promise;
+  button("Show file difference for a.txt").click();
+  await until(() => button("Show file difference for a.txt")?.disabled, "the difference did not start loading");
+  show(false); await settle();
+  diffGate = null;
+  show(true);
+  await until(() => button("Restore Before agent") && !button("Restore Before agent").disabled && !button("Take checkpoint").disabled,
+    "the reopened dialog stayed busy with a request from the closed one");
+  button("Restore Before agent").click();
+  await until(() => box("a.txt") && !button("Show staged difference for a.txt").disabled, "the restore preview did not open");
+  const newDiff = held();
+  diffGate = newDiff.promise;
+  button("Show staged difference for a.txt").click();
+  await until(() => button("Show file difference for a.txt")?.disabled, "the new difference did not start loading");
+  oldDiff.release(); await settle(); await settle();
+  assert(button("Show file difference for a.txt").disabled, "a request from the closed dialog ended the busy state of a newer one");
+  assert(!dialog().querySelector(".checkpoint-diff"), "a difference from the closed dialog reached a later preview");
+  diffGate = null; newDiff.release();
+  await until(() => /then index/.test(dialog().querySelector(".checkpoint-diff")?.textContent ?? "") && !button("Show file difference for a.txt").disabled, "the newer difference was not shown");
+  button("Back").click();
+  await until(() => button("Restore Before agent") && !button("Restore Before agent").disabled, "Back did not return to the list");
+
+  // An unbroken label wraps at 390px in the list, both headings and the notice.
+  if (window.__fixtureSetViewport) {
+    const fits = (element, label) => assert(element && element.scrollWidth <= element.clientWidth + 1 && element.getBoundingClientRect().right <= dialog().getBoundingClientRect().right + 1,
+      `${label} overflowed the dialog: ${element?.scrollWidth} > ${element?.clientWidth}, right ${element?.getBoundingClientRect().right} > ${dialog().getBoundingClientRect().right}`);
+    const action = (name) => dialog().querySelector(`[data-checkpoint-action="${name}:${checkpoint.id}"]`);
+    try {
+      await window.__fixtureSetViewport(390);
+      await until(() => window.innerWidth === 390, "real 390px layout");
+      checkpoint.label = "x".repeat(120);
+      events.dispatchEvent(new CustomEvent("reconnect"));
+      await until(() => dialog().querySelector(".checkpoint-copy strong")?.textContent === checkpoint.label, "the long label was not listed");
+      await settle();
+      fits(dialog().querySelector(".checkpoint-copy strong"), "the listed label");
+      action("inspect").click();
+      await until(() => heading(), "inspect did not open");
+      fits(heading(), "the inspect heading");
+      button("Back").click();
+      await until(() => action("restore") && !action("restore").disabled, "Back did not return to the list");
+      action("restore").click();
+      await until(() => box("a.txt"), "the restore preview did not open");
+      fits(heading(), "the preview heading");
+      button("Back").click();
+      await until(() => action("delete") && !action("delete").disabled, "Back did not return to the list");
+      action("delete").click();
+      await until(() => button("Confirm delete"), "delete did not ask for confirmation");
+      button("Confirm delete").click();
+      await until(() => /Deleted/.test(dialog().querySelector(".lifecycle-summary")?.textContent ?? ""), "the delete was not announced");
+      fits(dialog().querySelector(".lifecycle-summary"), "the notice");
+    } finally { await window.__fixtureSetViewport(1280); }
+  }
+  assert(!errors.length, `unexpected errors: ${errors.map((error) => error.message).join("; ")}`);
+}
+
 const MOTION_STEPS = ["diff Find ownership", "diff scrollbar feedback", "diff Find resize", "split pane layout", "pane notices at minimum", "responsive focus"];
 
 try {
@@ -9294,7 +9898,9 @@ try {
     ["bootstrap error ownership", bootstrapRefreshErrorOwnershipRegression, "a background bootstrap cannot dismiss an unrelated operation error"],
     ["settings migration completion", settingsMigrationCompletionRegression, "an open Settings dialog refreshes capacity when migration finishes"],
     ["worktree removal retarget", worktreeRemovalRetargetRegression, "a refresh that drops a removed worktree never retargets its remove or setup dialog, and another worktree's dialog is left alone"],
-    ["worktree lifecycle", worktreeLifecycleRegression, "an open setup dialog reconciles an interrupted run on reconnect, and teardown choices are explicit and bound to their worktree"],
+    // Checkpoints run within the lifecycle step until the expected step count
+    // in tests/ui-races.test.mjs moves with the checkpoint runtime.
+    ["worktree lifecycle", async () => { await worktreeLifecycleRegression(); await worktreeCheckpointsRegression(); }, "an open setup dialog reconciles an interrupted run on reconnect, and teardown choices are explicit and bound to their worktree; a checkpoint restore is confirmed against the exact preview shown, with chosen paths and open terminals, and an interrupted one can be finished"],
     ["settings live capacity", settingsCapacityWithoutEventRegression, "an open Settings dialog reads another client's quota changes without a capacity event"],
     ["provider accounts window aging", providerAccountsWindowAgingRegression, "an open account list drops a run that leaves the 5-hour window without any event"],
     ["provider accounts failed reload", providerAccountsFailedReloadRegression, "a failed reload marks an expired measured total out of date, and account changes reload without the runtime event"],
