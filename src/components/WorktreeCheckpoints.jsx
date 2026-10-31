@@ -30,6 +30,7 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
   // a selector in the dialog (one selector, no commas).
   const contentRef = useRef(null);
   const focusNextRef = useRef(null);
+  const frameRef = useRef(0);
   const returnFocusRef = useRef(LABEL_FIELD);
   const focusNext = (selector) => { focusNextRef.current = selector; };
   // Reads overlap (open, events, reconnect, actions); only an answer, list or
@@ -65,7 +66,13 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
     focusNextRef.current = null;
     // A target that is gone or disabled (busy, unconfirmed) falls back to an
     // enabled control, so focus never drops out of the dialog.
-    [selector, LABEL_FIELD, VIEW_HEADING, "button"].map((item) => contentRef.current.querySelector(`${item}:not(:disabled)`)).find(Boolean)?.focus();
+    const popup = contentRef.current;
+    const element = [selector, LABEL_FIELD, VIEW_HEADING, "button"].map((item) => popup.querySelector(`${item}:not(:disabled)`)).find(Boolean);
+    element?.focus();
+    // The dialog refocuses itself a frame after a focused control is removed;
+    // that must not undo a move made in between.
+    cancelAnimationFrame(frameRef.current);
+    frameRef.current = requestAnimationFrame(() => { if (document.activeElement === popup && element?.isConnected && !element.disabled) element.focus(); });
   });
 
   useEffect(() => {

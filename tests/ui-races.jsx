@@ -9505,11 +9505,22 @@ async function worktreeCheckpointsRegression() {
   button("Restore Before agent").click();
   await until(() => box("a.txt"), "the restore preview did not open");
   confirmTerminals();
+  // A native key gives the page input focus, so removing the focused preview
+  // makes the dialog refocus itself, again a frame later, as for a user. The
+  // reload answers when it first does, before that frame.
+  let answerReload = null;
   restoreAnswer = () => { detail = { ...detail, restore: { status: "interrupted", checkpointId: checkpoint.id, safetyCheckpointId: "lx1abd-0123abce", paths: 1, ownerUnconfirmed: true } };
+    if (window.__fixtureSendKey) listAnswer = () => new Promise((resolve) => { answerReload = () => resolve(response(detail)); });
     return response({ error: "Restore stopped before finishing", code: "CHECKPOINT_RESTORE_INTERRUPTED" }, 409); };
+  const onPopupFocus = (event) => { if (event.target === dialog()) answerReload?.(); };
+  document.addEventListener("focusin", onPopupFocus);
   await until(() => restoreButton() && !restoreButton().disabled, "the preview could not be confirmed");
+  if (window.__fixtureSendKey) await window.__fixtureSendKey("Tab");
+  assert(dialog().querySelector(".checkpoint-preview").contains(document.activeElement), "focus was not in the preview before the restore");
   restoreButton().click();
-  await until(() => !heading() && button("Finish restore…")?.disabled, "an interrupted restore with unconfirmed Git processes left finish open");
+  await until(() => !heading() && button("Finish restore…")?.disabled, "an interrupted restore with unconfirmed Git processes left finish open, or its reload was not answered");
+  document.removeEventListener("focusin", onPopupFocus);
+  listAnswer = null;
   await settle();
   focused(labelField(), "the label field when Finish restore… was disabled");
   errors.length = 0;
