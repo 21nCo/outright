@@ -22,6 +22,9 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
   // null, { kind: "inspect", ... } or { kind: "preview", ... }
   const [view, setView] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
+  const [loadError, setLoadError] = useState("");
+  // Advanced on close: an action finishing after it changes nothing.
+  const sessionRef = useRef(0);
   const canonicalRef = useRef(null);
   // A step that unmounts the focused control names where focus goes next:
   // a selector in the dialog, or the label field when that is gone too.
@@ -34,16 +37,23 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
   const issuedRef = useRef(0);
   const shownRef = useRef(0);
   const target = { projectId: project.id, worktreePath: worktree.path };
-  const load = useCallback(async () => {
+  // `focus` names where focus goes once the list is shown.
+  const load = useCallback(async (focus) => {
     const generation = ++issuedRef.current;
     try {
       const next = await api(query("/api/worktrees/checkpoints", { projectId: project.id, path: worktree.path }));
       if (generation <= shownRef.current) return;
       shownRef.current = generation;
       canonicalRef.current = next.worktreePath;
+      if (typeof focus === "string") focusNextRef.current = focus;
+      setLoadError("");
       setDetail(next);
-    } catch (error) { if (generation > shownRef.current) onError(error); }
-  }, [project.id, worktree.path, onError]);
+    } catch (error) {
+      if (generation <= shownRef.current) return;
+      setLoadError(error.status === 404 && error.message === "API route not found"
+        ? "Checkpoints are not available in this version of the Outright runtime." : `Checkpoints could not be read: ${error.message}`);
+    }
+  }, [project.id, worktree.path]);
 
   useLayoutEffect(() => {
     const selector = focusNextRef.current;
@@ -53,7 +63,7 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
   });
 
   useEffect(() => {
-    if (!open) { setDetail(null); setView(null); setNotice(""); setConfirmDelete(null); return undefined; }
+    if (!open) { setDetail(null); setView(null); setNotice(""); setConfirmDelete(null); setLoadError(""); return undefined; }
     void load();
     const onChanged = (event) => { if ([worktree.path, canonicalRef.current].includes(event.detail?.worktreePath)) void load(); };
     const onReconnect = () => void load();
@@ -63,44 +73,53 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
       events.removeEventListener("checkpoints", onChanged);
       events.removeEventListener("reconnect", onReconnect);
       shownRef.current = issuedRef.current;
+      sessionRef.current += 1;
+      focusNextRef.current = null;
     };
   }, [open, load, events, worktree.path]);
 
+  // `work` gets `live()`, false once the dialog closed after it started.
   async function act(work) {
+    const session = sessionRef.current;
+    const live = () => session === sessionRef.current;
     setBusy(true);
-    try { await work(); }
-    catch (error) { onError(error); }
+    try { await work(live); }
+    catch (error) { if (live()) onError(error); }
     finally { setBusy(false); }
   }
-  const capture = () => act(async () => {
+  const capture = () => act(async (live) => {
     const { checkpoint } = await api("/api/worktrees/checkpoints", { method: "POST", body: { ...target, label } });
+    if (!live()) return;
     setLabel("");
     setNotice(`Checkpoint taken: ${checkpointCountsText(checkpoint.counts)}.`);
     await load();
   });
   // Back returns focus to the control (`from`, a selector) that opened a view.
-  const inspect = (checkpoint) => act(async () => {
+  const inspect = (checkpoint) => act(async (live) => {
     const contents = await api(query("/api/worktrees/checkpoints/inspect", { projectId: project.id, path: worktree.path, id: checkpoint.id }));
+    if (!live()) return;
     returnFocusRef.current = `[data-checkpoint-action="inspect:${checkpoint.id}"]`;
     setView({ kind: "inspect", ...contents });
     focusNext(VIEW_HEADING);
   });
   // `resume` previews finishing a restore that did not finish.
-  async function openPreview(id, message = "", resume = false, from = null) {
+  async function openPreview(live, id, message = "", resume = false, from = null) {
     const preview = await api("/api/worktrees/checkpoints/preview", { method: "POST", body: { ...target, id, ...(resume ? { resume } : {}) } });
+    if (!live()) return;
     if (from) returnFocusRef.current = from;
     setView({ kind: "preview", preview, selected: initialRestoreSelection(preview.entries), acknowledged: false, shown: RESTORE_PAGE_SIZE, diff: null });
     setNotice(message);
     focusNext(VIEW_HEADING);
   }
   const closeView = () => { setView(null); focusNext(returnFocusRef.current); };
-  const restore = () => act(async () => {
+  const restore = () => act(async (live) => {
     const { preview, selected, acknowledged } = view;
     let stopped = false;
     try {
       const result = await api("/api/worktrees/checkpoints/restore", { method: "POST", body: { ...target, id: preview.checkpoint.id,
         planDigest: preview.planDigest, ...restoreSelection(preview.entries, selected), ...(preview.resume ? { resume: true } : {}),
         acknowledgeTerminals: acknowledged ? preview.terminals.map((item) => item.id) : [] } });
+      if (!live()) return;
       setView(null);
       setNotice(`${preview.resume ? "Finished the restore of" : "Restored"} ${result.restored} ${result.restored === 1 ? "path" : "paths"}. “${checkpointTitle(result.safetyCheckpoint)}” holds what was there before.`);
       focusNext(LABEL_FIELD);
@@ -108,26 +127,29 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
       const code = error.payload?.code;
       // A restore that stopped part way is finished or kept from the list,
       // and a terminal opened since the preview is listed in a new one.
+      if (!live()) return;
       if (code === "CHECKPOINT_RESTORE_INTERRUPTED") { setView(null); stopped = true; }
       if (code === "CHECKPOINT_TERMINALS_UNACKNOWLEDGED") {
-        await openPreview(preview.checkpoint.id, "A terminal was opened in this worktree after the preview. Confirm the terminals before restoring.", preview.resume);
+        await openPreview(live, preview.checkpoint.id, "A terminal was opened in this worktree after the preview. Confirm the terminals before restoring.", preview.resume);
       } else if (code === "CHECKPOINT_PLAN_CHANGED") {
-        await openPreview(preview.checkpoint.id, "The worktree changed after the preview. Review this updated preview before restoring.", preview.resume);
+        await openPreview(live, preview.checkpoint.id, "The worktree changed after the preview. Review this updated preview before restoring.", preview.resume);
       } else throw error;
     } finally {
       await load();
-      if (stopped) focusNext(FINISH);
+      if (stopped && live()) focusNext(FINISH);
     }
   });
-  const keepFiles = () => act(async () => {
+  const keepFiles = () => act(async (live) => {
     await api("/api/worktrees/checkpoints/recover", { method: "POST", body: { ...target, action: "keep" } });
+    if (!live()) return;
     setView(null);
     setNotice("The files were kept as they are.");
     await load();
     focusNext(LABEL_FIELD);
   });
-  const remove = (checkpoint) => act(async () => {
+  const remove = (checkpoint) => act(async (live) => {
     await api("/api/worktrees/checkpoints", { method: "DELETE", body: { ...target, id: checkpoint.id } });
+    if (!live()) return;
     setConfirmDelete(null);
     setNotice(`Deleted “${checkpointTitle(checkpoint)}”.`);
     await load();
@@ -149,13 +171,15 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
   return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent ref={contentRef} className="lifecycle-dialog checkpoint-dialog">
     <DialogHeader><DialogTitle>Checkpoints</DialogTitle><DialogDescription>{project.name} / {worktree.name}</DialogDescription></DialogHeader>
     <p className={notice ? "lifecycle-summary" : "lifecycle-summary sr-only"} role="status" aria-live="polite">{notice}</p>
-    {!detail && <p className="lifecycle-note" role="status">Reading checkpoints…</p>}
+    {loadError && <div className="lifecycle-error" role="alert"><p>{loadError}</p>
+      <Button size="sm" variant="outline" data-checkpoint-action="retry" onClick={() => void load(LABEL_FIELD)}>Retry</Button></div>}
+    {!detail && !loadError && <p className="lifecycle-note" role="status">Reading checkpoints…</p>}
     {detail?.restore?.status === "running" && <p className="lifecycle-note" role="status">A restore is running in this worktree. Agent runs, setup and Git changes here wait until it finishes.</p>}
     {interrupted && !view && <div className="lifecycle-error" role="alert">
       <p>{interrupted.unreadable ? "A restore did not finish, and its record cannot be read." : `Restoring ${named(interrupted.checkpointId)} did not finish; some of its ${interrupted.paths} paths may already be restored.`} {capitalized(named(interrupted.safetyCheckpointId))} holds what was there before. Agent runs, setup and Git changes in this worktree wait until you finish the restore or keep the files.</p>
       {interrupted.ownerUnconfirmed && <p>Git processes the restore started are not confirmed stopped yet. Finishing or keeping becomes possible once they are.</p>}
       <div className="checkpoint-actions">
-        {!interrupted.unreadable && <Button size="sm" data-checkpoint-action="finish" disabled={busy || interrupted.ownerUnconfirmed} onClick={() => act(() => openPreview(interrupted.checkpointId, "", true, FINISH))}>Finish restore…</Button>}
+        {!interrupted.unreadable && <Button size="sm" data-checkpoint-action="finish" disabled={busy || interrupted.ownerUnconfirmed} onClick={() => act((live) => openPreview(live, interrupted.checkpointId, "", true, FINISH))}>Finish restore…</Button>}
         <Button size="sm" variant="outline" disabled={busy || interrupted.ownerUnconfirmed} onClick={keepFiles}>Keep files as they are</Button>
       </div>
     </div>}
@@ -172,7 +196,7 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
           {confirmDelete === checkpoint.id
             ? <><Button size="xs" variant="destructive" disabled={busy} onClick={() => remove(checkpoint)}>Confirm delete</Button><Button size="xs" variant="outline" data-checkpoint-action="keep" onClick={() => keepCheckpoint(checkpoint.id)}>Keep</Button></>
             : <>{!checkpoint.unreadable && <><Button size="xs" variant="outline" data-checkpoint-action={`inspect:${checkpoint.id}`} disabled={busy} onClick={() => inspect(checkpoint)} aria-label={`Inspect ${checkpointTitle(checkpoint)}`}>Inspect</Button>
-              <Button size="xs" variant="outline" data-checkpoint-action={`restore:${checkpoint.id}`} disabled={busy || Boolean(interrupted)} onClick={() => act(() => openPreview(checkpoint.id, "", false, `[data-checkpoint-action="restore:${checkpoint.id}"]`))} aria-label={`Restore ${checkpointTitle(checkpoint)}`}>Restore…</Button></>}
+              <Button size="xs" variant="outline" data-checkpoint-action={`restore:${checkpoint.id}`} disabled={busy || Boolean(interrupted)} onClick={() => act((live) => openPreview(live, checkpoint.id, "", false, `[data-checkpoint-action="restore:${checkpoint.id}"]`))} aria-label={`Restore ${checkpointTitle(checkpoint)}`}>Restore…</Button></>}
               <Button size="xs" variant="ghost" data-checkpoint-action={`delete:${checkpoint.id}`} disabled={busy} onClick={() => askDelete(checkpoint.id)} aria-label={`Delete ${checkpointTitle(checkpoint)}`}>Delete</Button></>}
         </span>
       </li>)}</ul> : <p className="lifecycle-note">No checkpoints yet.</p>}

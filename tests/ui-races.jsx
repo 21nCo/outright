@@ -9300,14 +9300,18 @@ async function worktreeCheckpointsRegression() {
   const posts = [];
   const diffs = [];
   let restoreAnswer = null;
+  // A runtime without checkpoint routes answers like any unknown route.
+  let listUnavailable = true;
+  let previewGate = null;
   route = async (url, options) => {
-    if (url.pathname === "/api/worktrees/checkpoints" && (options.method ?? "GET") === "GET") return response(detail);
+    if (url.pathname === "/api/worktrees/checkpoints" && (options.method ?? "GET") === "GET") return listUnavailable ? response({ error: "API route not found" }, 404) : response(detail);
     if (url.pathname.endsWith("/inspect")) return response({ checkpoint, entries: [{ path: "a.txt", state: "staged", status: "M" }], truncated: false });
     if (url.pathname.endsWith("/diff")) {
       diffs.push(Object.fromEntries(url.searchParams));
       return response({ diff: `diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-now ${url.searchParams.get("side")}\n+then ${url.searchParams.get("side")}\n` });
     }
     posts.push({ path: url.pathname, body: options.body ? JSON.parse(options.body) : null });
+    if (url.pathname.endsWith("/preview") && previewGate) await previewGate;
     if (url.pathname.endsWith("/preview")) return response(preview(JSON.parse(options.body).resume === true));
     if (url.pathname.endsWith("/restore")) return restoreAnswer();
     if (url.pathname.endsWith("/recover")) { detail = { ...detail, restore: null }; return response({ restored: 3 }); }
@@ -9315,13 +9319,21 @@ async function worktreeCheckpointsRegression() {
   };
   const events = new EventTarget();
   const errors = [];
-  root.render(<TooltipProvider><WorktreeCheckpointsDialog open onOpenChange={() => {}} project={project} worktree={worktree} events={events} onError={(error) => errors.push(error)} /></TooltipProvider>);
+  const show = (open) => root.render(<TooltipProvider><WorktreeCheckpointsDialog open={open} onOpenChange={() => {}} project={project} worktree={worktree} events={events} onError={(error) => errors.push(error)} /></TooltipProvider>);
+  show(true);
   const dialog = () => document.querySelector(".checkpoint-dialog");
   const button = (name) => [...(dialog()?.querySelectorAll("button") ?? [])].find((item) => item.textContent.trim() === name || item.getAttribute("aria-label") === name);
   const restoreButton = () => [...dialog().querySelectorAll("button")].find((item) => /^(?:Restore|Finish restoring) \d/.test(item.textContent));
   const box = (path) => [...(dialog()?.querySelectorAll(".checkpoint-paths li") ?? [])].find((item) => item.querySelector("code")?.textContent === path)?.querySelector('input[type="checkbox"]');
   const confirmTerminals = () => dialog().querySelector(".checkpoint-preview .lifecycle-acknowledge input").click();
+  await until(() => button("Retry"), "a list read the runtime does not serve did not offer Retry");
+  assert(/not available in this version/.test(dialog().querySelector('[role="alert"]')?.textContent ?? ""), "an unavailable runtime was not reported in an alert");
+  assert(!/Reading checkpoints/.test(dialog().textContent) && !errors.length, "a failed list read kept reading or was reported elsewhere");
+  listUnavailable = false;
+  button("Retry").focus();
+  button("Retry").click();
   await until(() => button("Restore Before agent"), "the checkpoint was not listed with a restore control");
+  await until(() => !button("Retry") && document.activeElement === dialog().querySelector(".checkpoint-create input"), "a successful retry did not clear the alert and focus the label field");
   assert(/1 staged · 2 untracked/.test(dialog().textContent), "the checkpoint did not say what it holds");
   const focused = (control, label) => assert(document.activeElement === control, `focus was not on ${label} but on ${document.activeElement?.outerHTML.slice(0, 120)}`);
   const heading = () => dialog().querySelector(".checkpoint-view-heading");
@@ -9419,6 +9431,23 @@ async function worktreeCheckpointsRegression() {
   events.dispatchEvent(new CustomEvent("reconnect"));
   await until(() => button("Finish restore…")?.disabled && button("Keep files as they are")?.disabled, "unconfirmed Git processes left finish or keep open");
   assert(/not confirmed stopped/.test(dialog().textContent), "the dialog did not say why the restore cannot be finished");
+
+  // A preview answered after the dialog closed does not reach it when reopened.
+  detail = { ...detail, restore: null };
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => button("Restore Before agent") && !button("Restore Before agent").disabled, "the restore control did not return");
+  let releasePreview;
+  previewGate = new Promise((resolve) => { releasePreview = resolve; });
+  const asked = previews;
+  button("Restore Before agent").click();
+  await until(() => posts.at(-1)?.path.endsWith("/preview"), "the delayed preview was not requested");
+  show(false); await settle();
+  previewGate = null; releasePreview(); await until(() => previews === asked + 1, "the delayed preview did not answer");
+  await settle();
+  show(true);
+  await until(() => button("Restore Before agent"), "the reopened dialog did not list the checkpoints");
+  await settle();
+  assert(!heading() && !dialog().querySelector(".checkpoint-preview"), "a preview answered after close was shown in the reopened dialog");
   assert(!errors.length, `unexpected errors: ${errors.map((error) => error.message).join("; ")}`);
 }
 
