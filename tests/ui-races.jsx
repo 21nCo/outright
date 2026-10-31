@@ -9305,6 +9305,7 @@ async function worktreeCheckpointsRegression() {
   let previewGate = null;
   // When set, answers the list reads in place of the fixture's checkpoints.
   let listAnswer = null;
+  let diffGate = null;
   route = async (url, options) => {
     if (url.pathname === "/api/worktrees/checkpoints" && (options.method ?? "GET") === "GET") {
       if (listAnswer) return listAnswer();
@@ -9313,6 +9314,7 @@ async function worktreeCheckpointsRegression() {
     if (url.pathname.endsWith("/inspect")) return response({ checkpoint, entries: [{ path: "a.txt", state: "staged", status: "M" }], truncated: false });
     if (url.pathname.endsWith("/diff")) {
       diffs.push(Object.fromEntries(url.searchParams));
+      if (diffGate) await diffGate;
       return response({ diff: `diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-now ${url.searchParams.get("side")}\n+then ${url.searchParams.get("side")}\n` });
     }
     posts.push({ path: url.pathname, body: options.body ? JSON.parse(options.body) : null });
@@ -9496,6 +9498,68 @@ async function worktreeCheckpointsRegression() {
     `the reopened dialog showed a read from the closed session: ${alertText() || dialog().textContent.slice(0, 160)}`);
   releaseList(); listAnswer = null;
   await until(() => button("Restore Before agent"), "the reopened dialog did not list the checkpoints");
+
+  // Focus a step asks for never lands on a disabled control: Finish restore
+  // while Git processes are unconfirmed, or a list control while busy.
+  const labelField = () => dialog().querySelector(".checkpoint-create input");
+  button("Restore Before agent").click();
+  await until(() => box("a.txt"), "the restore preview did not open");
+  confirmTerminals();
+  restoreAnswer = () => { detail = { ...detail, restore: { status: "interrupted", checkpointId: checkpoint.id, safetyCheckpointId: "lx1abd-0123abce", paths: 1, ownerUnconfirmed: true } };
+    return response({ error: "Restore stopped before finishing", code: "CHECKPOINT_RESTORE_INTERRUPTED" }, 409); };
+  await until(() => restoreButton() && !restoreButton().disabled, "the preview could not be confirmed");
+  restoreButton().click();
+  await until(() => !heading() && button("Finish restore…")?.disabled, "an interrupted restore with unconfirmed Git processes left finish open");
+  await settle();
+  focused(labelField(), "the label field when Finish restore… was disabled");
+  errors.length = 0;
+  detail = { ...detail, restore: null };
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => button("Restore Before agent") && !button("Restore Before agent").disabled, "the restore control did not return");
+  button("Restore Before agent").click();
+  await until(() => box("a.txt"), "the restore preview did not open");
+  let releaseDiff;
+  diffGate = new Promise((resolve) => { releaseDiff = resolve; });
+  button("Show file difference for a.txt").click();
+  await until(() => button("Show file difference for a.txt")?.disabled, "the difference did not start loading");
+  button("Back").click();
+  await until(() => button("Restore Before agent")?.disabled, "Back did not return to the list while a difference loaded");
+  await settle();
+  focused(labelField(), "the label field when the Restore control was busy");
+  diffGate = null; releaseDiff();
+  await until(() => !button("Restore Before agent").disabled, "the difference did not finish loading");
+  focused(labelField(), "the label field after the difference loaded");
+
+  // An unbroken label wraps at 390px in the list, both headings and the notice.
+  if (window.__fixtureSetViewport) {
+    const fits = (element, label) => assert(element && element.scrollWidth <= element.clientWidth + 1 && element.getBoundingClientRect().right <= dialog().getBoundingClientRect().right + 1,
+      `${label} overflowed the dialog: ${element?.scrollWidth} > ${element?.clientWidth}, right ${element?.getBoundingClientRect().right} > ${dialog().getBoundingClientRect().right}`);
+    const action = (name) => dialog().querySelector(`[data-checkpoint-action="${name}:${checkpoint.id}"]`);
+    try {
+      await window.__fixtureSetViewport(390);
+      await until(() => window.innerWidth === 390, "real 390px layout");
+      checkpoint.label = "x".repeat(120);
+      events.dispatchEvent(new CustomEvent("reconnect"));
+      await until(() => dialog().querySelector(".checkpoint-copy strong")?.textContent === checkpoint.label, "the long label was not listed");
+      await settle();
+      fits(dialog().querySelector(".checkpoint-copy strong"), "the listed label");
+      action("inspect").click();
+      await until(() => heading(), "inspect did not open");
+      fits(heading(), "the inspect heading");
+      button("Back").click();
+      await until(() => action("restore") && !action("restore").disabled, "Back did not return to the list");
+      action("restore").click();
+      await until(() => box("a.txt"), "the restore preview did not open");
+      fits(heading(), "the preview heading");
+      button("Back").click();
+      await until(() => action("delete") && !action("delete").disabled, "Back did not return to the list");
+      action("delete").click();
+      await until(() => button("Confirm delete"), "delete did not ask for confirmation");
+      button("Confirm delete").click();
+      await until(() => /Deleted/.test(dialog().querySelector(".lifecycle-summary")?.textContent ?? ""), "the delete was not announced");
+      fits(dialog().querySelector(".lifecycle-summary"), "the notice");
+    } finally { await window.__fixtureSetViewport(1280); }
+  }
   assert(!errors.length, `unexpected errors: ${errors.map((error) => error.message).join("; ")}`);
 }
 

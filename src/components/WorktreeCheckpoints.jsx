@@ -27,7 +27,7 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
   const sessionRef = useRef(0);
   const canonicalRef = useRef(null);
   // A step that unmounts the focused control names where focus goes next:
-  // a selector in the dialog, or the label field when that is gone too.
+  // a selector in the dialog (one selector, no commas).
   const contentRef = useRef(null);
   const focusNextRef = useRef(null);
   const returnFocusRef = useRef(LABEL_FIELD);
@@ -63,7 +63,9 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
     const selector = focusNextRef.current;
     if (!open || !selector || !contentRef.current) return;
     focusNextRef.current = null;
-    (contentRef.current.querySelector(selector) ?? contentRef.current.querySelector(LABEL_FIELD))?.focus();
+    // A target that is gone or disabled (busy, unconfirmed) falls back to an
+    // enabled control, so focus never drops out of the dialog.
+    [selector, LABEL_FIELD, VIEW_HEADING, "button"].map((item) => contentRef.current.querySelector(`${item}:not(:disabled)`)).find(Boolean)?.focus();
   });
 
   useEffect(() => {

@@ -706,6 +706,7 @@ div.lifecycle-note p { margin: 0; }
 .checkpoint-copy { display: grid; gap: 2px; min-width: 0; font-size: 12px; }
 .checkpoint-copy small, .checkpoint-paths small, .checkpoint-inspect small { color: var(--muted-foreground); font-size: 10px; overflow-wrap: anywhere; }
 .checkpoint-inspect, .checkpoint-preview { display: grid; gap: 10px; min-width: 0; }
+.checkpoint-copy strong, .checkpoint-view-heading, .checkpoint-dialog .lifecycle-summary, .checkpoint-dialog .lifecycle-note, .checkpoint-dialog .lifecycle-error p { overflow-wrap: anywhere; }
 .checkpoint-inspect h3, .checkpoint-preview h3 { margin: 0; font-size: 12px; font-weight: 650; }
 .checkpoint-inspect h4 { margin: 0 0 4px; font-size: 11px; font-weight: 600; }
 .checkpoint-inspect li { display: flex; gap: 8px; align-items: baseline; font-size: 11px; }
