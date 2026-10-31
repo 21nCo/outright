@@ -30,15 +30,24 @@ export function initialRestoreSelection(entries) {
   return new Set(entries.filter((entry) => !entry.blocked).map((entry) => entry.path));
 }
 
-// Paths whose file and directory forms both change are chosen together.
+// Coupled paths (one `group`) are chosen together.
 export function toggleRestorePath(entries, selected, path, checked) {
   const entry = entries.find((item) => item.path === path);
   if (!entry || entry.blocked) return selected;
   const next = new Set(selected);
-  for (const value of [path, ...(entry.coupled ?? [])]) {
+  const together = entry.group === undefined ? [entry] : entries.filter((item) => item.group === entry.group);
+  for (const { path: value } of together) {
     if (checked) next.add(value); else next.delete(value);
   }
   return next;
+}
+
+// How a coupled path is restored, in words, or "".
+export function restoreGroupText(entry) {
+  if (!(entry.groupSize > 1)) return "";
+  const others = entry.groupSize - 1;
+  return entry.group === entry.path ? `Restored together with ${others} other ${others === 1 ? "path" : "paths"}`
+    : `Restored together with ${entry.group}${others > 1 ? ` and ${others - 1} other ${others === 2 ? "path" : "paths"}` : ""}`;
 }
 
 // The chosen paths as a restore names them: listed, or, for a large

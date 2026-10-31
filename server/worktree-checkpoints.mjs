@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
-import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, rmdir, stat, unlink, utimes, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, rmdir, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { utilityBudgetUnavailable } from "./subprocess-budget.mjs";
 
 // Checkpoints are Git objects in the worktree's own repository. Each one is a
@@ -16,13 +17,15 @@ export const CHECKPOINT_LIMITS = Object.freeze({
   // Recorded content kept per worktree, newest first; older checkpoints are
   // removed and Git reclaims their objects in its next garbage collection.
   retainedBytes: 1024 * 1024 * 1024,
-  // Staged content and changed or untracked files, counted per path.
+  // Staged content and changed or untracked files, counted per path, and
+  // paths that differ from HEAD, deletions included.
   fileBytes: 64 * 1024 * 1024,
   totalBytes: 256 * 1024 * 1024,
   files: 10_000,
-  // A restore can change every path the checkpoint and the current state
-  // hold between them, so this is at least twice `files`: any checkpoint
-  // that was taken can be restored.
+  // A restore changes the paths the checkpoint and the current state differ
+  // from HEAD by, so this is at least twice `files`: a restore onto the
+  // commit the checkpoint was taken on is never too large. (A restore first
+  // checkpoints the current state, so that must be within the limits too.)
   planEntries: 20_000,
   labelCharacters: 120,
   gitTimeoutMs: 120_000,
@@ -48,6 +51,11 @@ const BATCH_CHARACTERS = 12_000;
 const BATCH_PATHS = 256;
 const RUNNING = "CHECKPOINT_RESTORE_RUNNING";
 const UNFINISHED = "CHECKPOINT_RESTORE_INTERRUPTED";
+const STRAY = "GIT_WRITE_UNCONFIRMED";
+// Another Git command may hold the index lock for a moment; a restore's
+// index writes wait for it this long.
+const INDEX_LOCK_RETRIES = 20;
+const INDEX_LOCK_WAIT_MS = 250;
 
 // `writers(paths)` lists agent runs, setup or teardown steps and other work
 // that may write in the worktree now, as { code, message }; restore refuses
@@ -60,8 +68,10 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   const active = new Map();
   // Git stages, unstages and commits admitted through `admitWriter`.
   const admitted = new Set();
-  // Worktrees whose restore lost track of a Git process it started.
+  // Worktrees whose restore lost track of a Git process it started, and
+  // those whose stage, unstage or commit did.
   const unconfirmed = new Set();
+  const strays = new Set();
   const gitDirs = new Map();
   let stopping = false;
 
@@ -100,30 +110,46 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     catch (error) { return !["ENOENT", "ENOTDIR"].includes(error.code); }
   }
 
+  // Whether a Git process that lost its owner may still write in `paths`
+  // (listed in `set`, or `always`): the utility budget keeps such owners,
+  // across restarts too, until it proves them gone.
+  function unproven(set, paths, always = false) {
+    if (!always && ![...paths].some((value) => set.has(value))) return false;
+    if ((subprocesses.capacity?.().unknown ?? 0) > 0) return true;
+    // Runs that waited for a worktree this held can launch now.
+    if (paths.map((value) => set.delete(value)).some(Boolean)) queueMicrotask(onRelease);
+    return false;
+  }
+
   // Why another writer may not start in a worktree now, or null: a restore
   // is running, or one did not finish (its marker is in the Git directory,
-  // which survives a restart, or a Git process it started is unconfirmed).
+  // which survives a restart, or a Git process it started is unconfirmed),
+  // or a stage, unstage or commit there lost track of its Git process.
   function holding(worktreePath) {
     if ([...active.values()].some((entry) => entry.kind === "restore" && entry.paths.has(worktreePath))) return RUNNING;
-    return unconfirmed.has(worktreePath) || markerPresent(worktreePath) ? UNFINISHED : null;
+    if (unconfirmed.has(worktreePath) || markerPresent(worktreePath)) return UNFINISHED;
+    return unproven(strays, [worktreePath]) ? STRAY : null;
   }
 
   // Admits an application-owned Git write (stage, unstage, commit) unless a
   // restore holds the worktree; a restore is refused while one is admitted.
-  // Synchronous, as `claim` is. Returns the release.
+  // Synchronous, as `claim` is. Returns the release, which takes the write's
+  // failure: one that lost track of its Git process keeps the worktree held.
   function admitWriter(paths) {
     const code = paths.map(holding).find(Boolean);
-    if (code) {
-      throw checkpointError(409, code === RUNNING ? "A checkpoint restore is running in this worktree; try again when it finishes"
-        : "A checkpoint restore in this worktree did not finish; finish it or keep the files in Checkpoints first", code);
-    }
+    if (code) throw checkpointError(409, holdMessage(code, "try again"), code);
     const token = { paths: new Set(paths) };
     admitted.add(token);
-    return () => { admitted.delete(token); };
+    return (error) => {
+      admitted.delete(token);
+      if (ownershipUnknown(error)) for (const value of paths) strays.add(value);
+    };
   }
   function gitWriters(paths) {
-    const busy = [...admitted].some((token) => [...paths].some((value) => token.paths.has(value)));
-    return busy ? [{ code: "GIT_WRITE_ACTIVE", message: "a Git stage, unstage or commit is running in this worktree" }] : [];
+    if ([...admitted].some((token) => [...paths].some((value) => token.paths.has(value)))) {
+      return [{ code: "GIT_WRITE_ACTIVE", message: "a Git stage, unstage or commit is running in this worktree" }];
+    }
+    return unproven(strays, [...paths]) ? [{ code: STRAY, message: "a Git stage, unstage or commit here is not confirmed stopped" }] : [];
   }
 
   // One checkpoint operation per worktree. Restore also holds the worktree
@@ -150,16 +176,11 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     return entry;
   }
 
-  // Git processes a restore started and lost track of may still write; the
-  // interrupted restore cannot be finished or dismissed until the utility
-  // budget has proven every such process gone.
-  function ownerPending(target, marker) {
-    const flagged = Boolean(marker?.ownerUnconfirmed) || [...pathsOf(target)].some((value) => unconfirmed.has(value));
-    if (!flagged) return false;
-    if ((subprocesses.capacity?.().unknown ?? 0) > 0) return true;
-    for (const value of pathsOf(target)) unconfirmed.delete(value);
-    return false;
-  }
+  // Git processes a restore started and lost track of may still write, and
+  // after a crash nothing says whether it did: an interrupted restore cannot
+  // be finished or dismissed until the utility budget has proven every
+  // process whose owner was lost gone.
+  function ownerPending(target, marker) { return unproven(unconfirmed, [...pathsOf(target)], Boolean(marker)); }
 
   async function audited(action, details, mutate) {
     const evidence = { ...details, operationId: details.operationId ?? randomUUID() };
@@ -192,70 +213,45 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     return found;
   }
 
-  // Everything a checkpoint stores beyond HEAD counts against its budget:
-  // staged content (even when the file on disk matches it) and changed or
-  // untracked files. Large files are refused before Git copies them into
-  // the object store. Returns the recorded bytes and the files on disk.
-  async function enforceBudget(cwd, env, base, indexTree) {
-    const staged = (await diffTrees(cwd, base, indexTree)).filter((change) => change.status !== "D" && !nested(change));
-    let listed;
-    try { listed = await git(cwd, ["ls-files", "-z", "--modified", "--others", "--exclude-standard"], { env, maxBuffer: 32 * 1024 * 1024 }); }
-    catch (error) {
-      if (error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") throw checkpointError(413, `This worktree has more than ${limits.files} changed, staged or untracked files`, "CHECKPOINT_TOO_LARGE");
-      throw error;
+  // Content filters configured for this repository, switched off for Git's
+  // own content comparisons (a command that writes an index compares the
+  // entries as new as it), so no clean filter runs and a failing required
+  // one cannot stop a capture or restore; and whether Git tracks the
+  // executable bit.
+  async function captureSettings(cwd) {
+    let listed = "";
+    try { listed = await git(cwd, ["config", "-z", "--get-regexp", "^(filter\\..+\\.(clean|process|required)|core\\.filemode)$"]); }
+    catch (error) { if (error.code !== 1) throw error; }
+    const names = new Set();
+    let fileMode = true;
+    for (const record of listed.split("\0")) {
+      const key = record.split("\n", 1)[0];
+      const filter = /^filter\.(.+)\.(?:clean|process|required)$/.exec(key);
+      if (filter) names.add(filter[1]);
+      else if (key === "core.filemode") fileMode = !/^(?:false|no|off|0)$/i.test(record.slice(key.length + 1).trim());
     }
-    // A trailing slash marks a nested repository, which is not captured.
-    const changedPaths = [...new Set(listed.split("\0").filter((value) => value && !value.endsWith("/")))];
-    if (new Set([...staged.map((change) => change.path), ...changedPaths]).size > limits.files) {
-      throw checkpointError(413, `This worktree has more than ${limits.files} changed, staged or untracked files`, "CHECKPOINT_TOO_LARGE");
-    }
-    let total = 0;
-    const count = (relative, size) => {
-      if (size > limits.fileBytes) throw checkpointError(413, `${relative} is larger than ${mebibytes(limits.fileBytes)}; ignore, unstage or move it before taking a checkpoint`, "CHECKPOINT_TOO_LARGE", { path: relative });
-      total += size;
-      if (total > limits.totalBytes) throw checkpointError(413, `Staged, changed and untracked files exceed ${mebibytes(limits.totalBytes)}; ignore, unstage or move large files before taking a checkpoint`, "CHECKPOINT_TOO_LARGE");
-    };
-    for (const [relative, blob] of await blobs(cwd, indexTree, staged.map((change) => change.path))) count(relative, blob.size);
-    const files = [];
-    for (const relative of changedPaths) {
-      const info = await lstat(path.join(cwd, relative)).catch(() => null);
-      if (!info?.isFile()) continue;
-      count(relative, info.size);
-      files.push(relative);
-    }
-    return { bytes: total, files };
+    return { fileMode, unfiltered: [...names].flatMap((name) => ["-c", `filter.${name}.clean=`, "-c", `filter.${name}.process=`, "-c", `filter.${name}.required=false`]) };
   }
 
-  // Changed and untracked files are recorded byte for byte: no clean filter,
-  // line-ending conversion or encoding applies, so a restore writes back
-  // exactly what was on disk. A tracked file Git reports unchanged keeps its
-  // index entry and is checked out by Git when restored.
-  async function recordRawContent(cwd, env, files) {
-    for (const batch of batches(files)) {
-      const [entries, hashed] = await Promise.all([
-        git(cwd, ["ls-files", "-s", "-z", "--", ...batch], { env: { ...env, ...LITERAL } }),
-        git(cwd, ["hash-object", "-w", "--no-filters", "--", ...batch]),
-      ]);
-      const recorded = new Map();
-      for (const record of entries.split("\0")) {
-        const tab = record.indexOf("\t");
-        if (tab < 0) continue;
-        const [mode, oid] = record.slice(0, tab).split(" ");
-        recorded.set(record.slice(tab + 1), { mode, oid });
-      }
-      const oids = hashed.trim().split("\n");
-      const updates = [];
-      batch.forEach((relative, index) => {
-        const entry = recorded.get(relative);
-        if (entry && REGULAR_MODE.test(entry.mode) && OID_PATTERN.test(oids[index] ?? "") && entry.oid !== oids[index]) updates.push(`${entry.mode},${oids[index]},${relative}`);
-      });
-      if (updates.length) await git(cwd, ["update-index", "--add", ...updates.flatMap((value) => ["--cacheinfo", value])], { env });
+  // Index entries ({ mode, oid }) at exact paths.
+  async function indexEntries(cwd, env, paths) {
+    const found = new Map();
+    for (const record of (await git(cwd, ["ls-files", "-s", "-z", "--", ...paths], { env: { ...env, ...LITERAL } })).split("\0")) {
+      const tab = record.indexOf("\t");
+      if (tab >= 0) { const [mode, oid] = record.slice(0, tab).split(" "); found.set(record.slice(tab + 1), { mode, oid }); }
     }
+    return found;
   }
 
   // The index and the files on disk as trees, through a copy of the index:
-  // the worktree, its index and its refs are not changed.
-  async function snapshot(cwd, repo, scratch) {
+  // the worktree, its index and its refs are not changed. Files are recorded
+  // byte for byte: no clean filter, line-ending conversion or encoding
+  // applies, so a restore writes back exactly what was on disk. Nested
+  // repositories and their contents are left out. Everything stored beyond
+  // HEAD counts against the budget, which `when` names in its refusal:
+  // staged content (even when the file on disk matches it), changed and
+  // untracked files, and every staged or unstaged deletion.
+  async function snapshot(cwd, repo, scratch, when = "before taking a checkpoint") {
     const index = path.join(scratch, `index-${randomUUID()}`);
     try {
       // Git trusts an entry's stat data unless the entry is as new as the
@@ -267,18 +263,64 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       await utimes(index, atime, mtime);
     } catch (error) { if (error.code !== "ENOENT") throw error; }
     const env = { GIT_INDEX_FILE: index };
+    const settings = await captureSettings(cwd);
+    const temporary = (args, options) => git(cwd, [...settings.unfiltered, ...args], { ...options, env });
     let indexTree;
-    try { indexTree = (await git(cwd, ["write-tree"], { env })).trim(); }
+    try { indexTree = (await temporary(["write-tree"])).trim(); }
     catch (error) {
       if (error.code !== 128) throw error;
       throw checkpointError(409, "Git could not record the index; resolve merge conflicts in this worktree first", "CHECKPOINT_UNMERGED");
     }
     const [head, branch] = await Promise.all([optional(cwd, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]),
       optional(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"])]);
-    const { bytes, files } = await enforceBudget(cwd, env, head ? `${head}^{tree}` : repo.emptyTree, indexTree);
-    await git(cwd, ["add", "-A"], { env });
-    await recordRawContent(cwd, env, files);
-    const filesTree = (await git(cwd, ["write-tree"], { env })).trim();
+    const tooMany = () => checkpointError(413, `This worktree has more than ${limits.files} changed, staged, deleted or untracked files; ignore, commit or remove some ${when}`, "CHECKPOINT_TOO_LARGE");
+    const staged = (await diffTrees(cwd, head ? `${head}^{tree}` : repo.emptyTree, indexTree)).filter((change) => !nested(change));
+    let listed;
+    try { listed = await temporary(["ls-files", "-z", "--modified", "--others", "--exclude-standard"], { maxBuffer: 32 * 1024 * 1024 }); }
+    catch (error) { throw error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" ? tooMany() : error; }
+    // A trailing slash marks a nested repository, which is not captured.
+    const changedPaths = [...new Set(listed.split("\0").filter((value) => value && !value.endsWith("/")))];
+    if (new Set([...staged.map((change) => change.path), ...changedPaths]).size > limits.files) throw tooMany();
+    let bytes = 0;
+    const count = (relative, size) => {
+      if (size > limits.fileBytes) throw checkpointError(413, `${relative} is larger than ${mebibytes(limits.fileBytes)}; ignore, unstage or move it ${when}`, "CHECKPOINT_TOO_LARGE", { path: relative });
+      bytes += size;
+      if (bytes > limits.totalBytes) throw checkpointError(413, `Staged, changed and untracked files exceed ${mebibytes(limits.totalBytes)}; ignore, unstage or move large files ${when}`, "CHECKPOINT_TOO_LARGE");
+    };
+    for (const [relative, blob] of await blobs(cwd, indexTree, staged.filter((change) => change.status !== "D").map((change) => change.path))) count(relative, blob.size);
+    // Large files are refused before anything is copied into the object store.
+    const found = new Map();
+    for (const relative of changedPaths) {
+      const info = await lstat(path.join(cwd, relative)).catch(() => null);
+      if (info?.isFile()) count(relative, info.size);
+      found.set(relative, info);
+    }
+    for (const batch of batches(changedPaths)) {
+      const entries = await indexEntries(cwd, env, batch);
+      const removed = [];
+      const hashed = [];
+      for (const relative of batch) {
+        const info = found.get(relative);
+        const entry = entries.get(relative);
+        if (entry?.mode === "160000") continue;
+        if (!info || info.isDirectory()) { if (entry) removed.push(relative); continue; }
+        if (info.isSymbolicLink()) {
+          const link = path.join(scratch, `link-${randomUUID()}`);
+          await writeFile(link, await readlink(path.join(cwd, relative), { encoding: "buffer" }));
+          hashed.push({ relative, source: link, mode: "120000", entry });
+        } else if (info.isFile()) {
+          // Without symbolic links or the executable bit, Git keeps the mode.
+          const executable = settings.fileMode ? (info.mode & 0o111) !== 0 : entry?.mode === "100755";
+          hashed.push({ relative, source: relative, mode: entry?.mode === "120000" ? "120000" : executable ? "100755" : "100644", entry });
+        }
+      }
+      const oids = hashed.length ? (await git(cwd, ["hash-object", "-w", "--no-filters", "--", ...hashed.map((item) => item.source)])).trim().split("\n") : [];
+      const updates = hashed.map((item, position) => ({ ...item, oid: oids[position] }))
+        .filter((item) => OID_PATTERN.test(item.oid ?? "") && (item.entry?.mode !== item.mode || item.entry?.oid !== item.oid));
+      if (removed.length) await temporary(["update-index", "--force-remove", "--", ...removed]);
+      if (updates.length) await temporary(["update-index", "--add", "--replace", ...updates.flatMap((item) => ["--cacheinfo", `${item.mode},${item.oid},${item.relative}`])]);
+    }
+    const filesTree = (await temporary(["write-tree"])).trim();
     return { indexTree, filesTree, head, branch, bytes };
   }
 
@@ -369,14 +411,17 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   }
 
   // What restoring each path changes, from the current index and files to
-  // the checkpoint's. A path whose directory and file forms both change is
-  // coupled with the others, and they are restored together or not at all.
-  // Finishing an interrupted restore (`resumed`, its marker) offers only the
-  // paths it was restoring.
+  // the checkpoint's. A path whose directory and file forms both change, or
+  // a file whose name changes only by case or Unicode form on a filesystem
+  // that does not tell them apart, is coupled with the others: they share a
+  // `group` of `groupSize` paths, restored together or not at all. Finishing
+  // an interrupted restore (`resumed`, its marker) offers only the paths it
+  // was restoring.
   async function plan(target, id, repo, scratch, resumed = null) {
     const cwd = target.worktreePath;
     const checkpoint = await load(cwd, id);
-    const current = await snapshot(cwd, repo, scratch);
+    // The restore checkpoints the current state first, within the same limits.
+    const current = await snapshot(cwd, repo, scratch, "before restoring: the restore first takes a checkpoint of the worktree as it is");
     const [indexChanges, fileChanges, recordedRaw] = await Promise.all([
       diffTrees(cwd, current.indexTree, checkpoint.indexTree),
       diffTrees(cwd, current.filesTree, checkpoint.filesTree),
@@ -401,13 +446,19 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     for (const item of entries) {
       for (const ancestor of ancestors(item.path)) if (group.has(ancestor)) group.set(find(item.path), find(ancestor));
     }
+    const deleted = new Map();
+    for (const item of entries) if (item.file?.action === "delete") deleted.set(folded(item.path), [...deleted.get(folded(item.path)) ?? [], item.path]);
     for (const item of entries) {
       if (item.file?.action !== "create") continue;
       // Anything still at a created path after the restore's deletions, or a
       // file where it needs a directory, is ignored or nested and was not
-      // captured: restore would destroy it, so the path is not offered.
+      // captured: restore would destroy it, so the path is not offered. The
+      // file the restore deletes under another case of the same name is not
+      // in the way once it is deleted, which happens first.
       const info = await lstat(path.join(cwd, item.path)).catch(() => null);
-      if (info?.isDirectory()) {
+      const renamed = info && !info.isDirectory() && await sameFile(cwd, info, deleted.get(folded(item.path)) ?? []);
+      if (renamed) group.set(find(item.path), find(renamed));
+      else if (info?.isDirectory()) {
         const left = await uncaptured(cwd, item.path, byPath);
         if (left) item.blocked = `An ignored or nested file is in the way at ${left}`;
       } else if (info) item.blocked = "An ignored file or directory is in the way";
@@ -417,24 +468,22 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       }
     }
     const members = new Map();
-    for (const item of entries) members.set(find(item.path), [...members.get(find(item.path)) ?? [], item]);
-    for (const list of members.values()) {
+    for (const item of entries) {
+      const list = members.get(find(item.path)) ?? members.set(find(item.path), []).get(find(item.path));
+      list.push(item);
+    }
+    const only = resumed && new Set(resumed.paths);
+    for (const [root, list] of members) {
       if (list.length < 2) continue;
       const blocked = list.find((item) => item.blocked);
+      const outside = only && list.find((item) => !only.has(item.path));
       for (const item of list) {
-        item.coupled = list.filter((other) => other !== item).map((other) => other.path);
+        Object.assign(item, { group: root, groupSize: list.length });
         if (blocked && !item.blocked) item.blocked = `Restored together with ${blocked.path}, which is blocked`;
+        else if (outside && !item.blocked) item.blocked = `Restored together with ${outside.path}, which this restore did not include`;
       }
     }
-    let shown = entries;
-    if (resumed) {
-      const only = new Set(resumed.paths);
-      shown = entries.filter((item) => only.has(item.path));
-      for (const item of shown) {
-        const outside = (item.coupled ?? []).find((other) => !only.has(other));
-        if (outside && !item.blocked) item.blocked = `Restored together with ${outside}, which this restore did not include`;
-      }
-    }
+    const shown = only ? entries.filter((item) => only.has(item.path)) : entries;
     const head = { current: current.head, checkpoint: checkpoint.head ?? null };
     const planDigest = createHash("sha256").update(JSON.stringify({ commit: checkpoint.commit, indexTree: current.indexTree,
       filesTree: current.filesTree, head: current.head, resumes: resumed?.operationId ?? null, entries: shown })).digest("hex");
@@ -475,9 +524,22 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     return marker;
   }
 
+  // A Git command that writes the real index, waiting a bounded time while
+  // another one (an editor's or a shell's status) holds its lock.
+  async function indexWrite(cwd, args, options) {
+    for (let attempt = 1; ; attempt += 1) {
+      try { return await git(cwd, args, options); }
+      catch (error) {
+        if (attempt >= INDEX_LOCK_RETRIES || error.code !== 128 || !/index\.lock/.test(`${error.stderr ?? ""}${error.message}`)) throw error;
+        await delay(INDEX_LOCK_WAIT_MS);
+      }
+    }
+  }
+
   // Deletions, then file contents, then index entries.
   async function apply(cwd, ops, commit, scratch) {
     const root = await realpath(cwd);
+    const { unfiltered } = await captureSettings(cwd);
     for (const op of ops) if (op.file === "delete") await removeFile(root, op.path);
     const writes = ops.filter((op) => op.file === "write");
     // A directory where a file goes held only paths the deletions removed.
@@ -487,15 +549,15 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       const list = path.join(scratch, `paths-${randomUUID()}`);
       await writeFile(list, `${checkedOut.join("\0")}\0`, { mode: 0o600 });
       // Overlay mode writes only the listed files and removes nothing.
-      await git(cwd, ["restore", "--overlay", `--source=${commit}`, "--worktree", `--pathspec-from-file=${list}`, "--pathspec-file-nul"], { env: LITERAL });
+      await indexWrite(cwd, ["restore", "--overlay", `--source=${commit}`, "--worktree", `--pathspec-from-file=${list}`, "--pathspec-file-nul"], { env: LITERAL });
     }
     await writeRecorded(cwd, root, commit, writes.filter((op) => op.raw));
     // Exact paths, never pathspecs: a pathspec for `a` also matches `a/b`.
     for (const batch of batches(ops.filter((op) => op.index === "remove").map((op) => op.path))) {
-      await git(cwd, ["update-index", "--force-remove", "--", ...batch]);
+      await indexWrite(cwd, [...unfiltered, "update-index", "--force-remove", "--", ...batch]);
     }
     for (const batch of batches(ops.filter((op) => op.index && op.index !== "remove").map((op) => `${op.index.mode},${op.index.oid},${op.path}`))) {
-      await git(cwd, ["update-index", "--add", ...batch.flatMap((value) => ["--cacheinfo", value])]);
+      await indexWrite(cwd, [...unfiltered, "update-index", "--add", ...batch.flatMap((value) => ["--cacheinfo", value])]);
     }
   }
 
@@ -749,12 +811,15 @@ export function chosenPaths(entries, { paths, except }) {
 export function selectedOps(entries, paths) {
   const byPath = new Map(entries.map((entry) => [entry.path, entry]));
   const chosen = new Set(paths);
+  const groups = new Map();
   for (const relative of chosen) {
     const entry = byPath.get(relative);
     if (!entry) throw checkpointError(409, `${relative} is not part of this restore`, "CHECKPOINT_SELECTION_INVALID");
     if (entry.blocked) throw checkpointError(409, `${relative} cannot be restored: ${entry.blocked}`, "CHECKPOINT_SELECTION_INVALID");
-    const missing = (entry.coupled ?? []).find((other) => !chosen.has(other));
-    if (missing) throw checkpointError(409, `${relative} must be restored together with ${missing}`, "CHECKPOINT_SELECTION_INVALID");
+    if (entry.group !== undefined) groups.set(entry.group, { size: entry.groupSize, count: (groups.get(entry.group)?.count ?? 0) + 1 });
+  }
+  for (const [group, { size, count }] of groups) {
+    if (count < size) throw checkpointError(409, `The ${size} paths restored together with ${group} must all be chosen`, "CHECKPOINT_SELECTION_INVALID");
   }
   return [...chosen].sort().map((relative) => {
     const { file, index } = byPath.get(relative);
@@ -765,6 +830,27 @@ export function selectedOps(entries, paths) {
 
 function validPath(value) {
   return typeof value === "string" && Boolean(value) && !value.includes("\0") && !path.isAbsolute(value) && !value.split(/[\\/]/).includes("..");
+}
+
+// What a writer that `holding` refuses is told; `action` is what it may do
+// once the worktree is free, as "start setup".
+export function holdMessage(code, action) {
+  if (code === RUNNING) return `A checkpoint restore is running in this worktree; ${action} when it finishes`;
+  if (code === UNFINISHED) return "A checkpoint restore in this worktree did not finish; finish it or keep the files in Checkpoints first";
+  return `A Git stage, unstage or commit in this worktree lost track of its process; ${action} once Outright confirms it stopped`;
+}
+
+// A path as a filesystem that ignores case and Unicode form may see it.
+function folded(relative) { return relative.normalize("NFC").toLowerCase(); }
+
+// The first of `candidates` (paths the restore deletes) that is the file
+// `info` describes, under another name.
+async function sameFile(cwd, info, candidates) {
+  for (const candidate of candidates) {
+    const other = await lstat(path.join(cwd, candidate)).catch(() => null);
+    if (other && other.ino === info.ino && other.dev === info.dev) return candidate;
+  }
+  return null;
 }
 
 function pathsOf(target) { return new Set([target.worktreePath, target.worktree?.path].filter(Boolean)); }

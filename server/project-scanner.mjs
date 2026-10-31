@@ -212,8 +212,11 @@ export function parseStatus(output) {
     })) };
 }
 
+// The scan only reads; without optional locks its status never holds the
+// index lock that a checkpoint restore or another Git command needs.
 async function runGit(subprocesses, directory, args) {
   const { stdout } = await subprocesses.run("git", ["-C", directory, ...args], {
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
     encoding: "utf8",
     maxBuffer: 4 * 1024 * 1024,
     timeout: 5000,

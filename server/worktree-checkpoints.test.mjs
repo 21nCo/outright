@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, realpath, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -244,9 +244,9 @@ test("a selective restore changes only the chosen paths and keeps file/directory
   await writeFile(path.join(repository, "a.txt"), "keep this\n");
 
   const preview = await checkpoints.preview(target(repository), checkpoint.id);
-  assert.deepEqual(preview.entries.find((entry) => entry.path === "dir").coupled, ["dir/inner.txt"]);
+  assert.deepEqual(preview.entries.filter((entry) => entry.group === "dir").map((entry) => [entry.path, entry.groupSize]), [["dir", 2], ["dir/inner.txt", 2]]);
   await assert.rejects(checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: ["dir/inner.txt"] }),
-    (error) => /together with dir$/.test(error.message));
+    (error) => /2 paths restored together with dir must all be chosen$/.test(error.message));
   await checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: ["dir", "dir/inner.txt"] });
   assert.equal(await readFile(path.join(repository, "dir", "inner.txt"), "utf8"), "inside\n");
   assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "keep this\n");
@@ -259,7 +259,8 @@ test("an interrupted restore holds the worktree across a restart and finishes on
   await writeFile(path.join(repository, "new.txt"), "untracked\n");
   await writeFile(path.join(repository, "other.txt"), "untracked too\n");
   const first = service({
-    run: (file, args, options) => args.includes("update-index") && args.includes("--add")
+    // The real index, not a capture's copy of it.
+    run: (file, args, options) => args.includes("update-index") && args.includes("--add") && !options.env?.GIT_INDEX_FILE
       ? Promise.reject(Object.assign(new Error("killed"), { killed: true, signal: "SIGKILL" }))
       : execFileAsync(file, args, options),
   });
@@ -501,7 +502,20 @@ test("staged content counts against the budget, and every checkpoint that is tak
   // Every path offered except those named.
   await checkpoints.restore(target(repository), { id: full.id, planDigest: preview.planDigest, except: ["v3"] });
   assert.deepEqual((await status(repository)).split("\n").filter(Boolean).sort(), ["?? u1", "?? u2", "?? u3", "?? v3"]);
-  await assert.rejects(checkpoints.capture(target(repository)), (error) => error.statusCode === 413);
+  await assert.rejects(checkpoints.capture(target(repository)), (error) => error.statusCode === 413 && /before taking a checkpoint$/.test(error.message));
+  // A restore first checkpoints the worktree as it is, and says so.
+  await assert.rejects(checkpoints.preview(target(repository), full.id), (error) => error.statusCode === 413
+    && /before restoring: the restore first takes a checkpoint/.test(error.message));
+  for (const name of ["u1", "u2", "u3", "v3"]) await rm(path.join(repository, name));
+
+  // Deletions count as paths too, so a checkpoint never holds more than a
+  // restore can change.
+  const small = service({ limits: { ...CHECKPOINT_LIMITS, files: 2, planEntries: 4 } }).checkpoints;
+  await git(repository, ["rm", "-q", "a.txt", "old.txt", ".gitignore"]);
+  await assert.rejects(small.capture(target(repository)), (error) => error.statusCode === 413 && /deleted/.test(error.message));
+  await git(repository, ["reset", "-q", "--hard"]);
+  for (const name of ["a.txt", "old.txt", ".gitignore"]) await rm(path.join(repository, name));
+  await assert.rejects(small.capture(target(repository)), (error) => error.statusCode === 413);
 });
 
 test("the preview shows how a path's staged content changes, apart from its file", async (t) => {
@@ -521,4 +535,152 @@ test("the preview shows how a path's staged content changes, apart from its file
   assert.equal((await checkpoints.fileDiff(target(repository), { id: checkpoint.id, tree: preview.currentTree, file: "a.txt" })).diff, "");
   await assert.rejects(checkpoints.fileDiff(target(repository), { id: checkpoint.id, tree: preview.currentTree, file: "a.txt", side: "head" }),
     (error) => error.statusCode === 400);
+});
+
+test("an interrupted restore stays held until no Git process with a lost owner is left, however it stopped", async (t) => {
+  const { repository } = await fixture(t);
+  let unknown = 0;
+  let released = 0;
+  const { checkpoints } = service({ capacity: () => ({ active: 0, limit: 8, unknown }), onRelease: () => { released += 1; } });
+  await writeFile(path.join(repository, "a.txt"), "checkpointed\n");
+  const checkpoint = await checkpoints.capture(target(repository));
+  // The marker as a restore writes it before changing anything: a crash
+  // leaves nothing else, while the budget still holds the crashed run's
+  // unknown owners.
+  await writeFile(path.join(repository, ".git", RESTORE_MARKER), JSON.stringify({ version: 2, operationId: "op", checkpointId: checkpoint.id,
+    commit: checkpoint.commit, safetyCheckpointId: checkpoint.id, startedAt: new Date().toISOString(), paths: ["a.txt"] }));
+  unknown = 1;
+  assert.equal((await checkpoints.describe(target(repository))).restore.ownerUnconfirmed, true);
+  await assert.rejects(checkpoints.recover(target(repository), "keep"), (error) => error.details.code === "CHECKPOINT_OWNER_UNCONFIRMED");
+  await assert.rejects(checkpoints.preview(target(repository), checkpoint.id, { resume: true }), (error) => error.details.code === "CHECKPOINT_OWNER_UNCONFIRMED");
+  unknown = 0;
+  assert.equal((await checkpoints.preview(target(repository), checkpoint.id, { resume: true })).resume, true);
+  await checkpoints.recover(target(repository), "keep");
+  assert.equal(checkpoints.holding(repository), null);
+  assert.ok(released > 0);
+});
+
+test("a stage, unstage or commit that loses track of its Git process holds the worktree until it is proven gone", async (t) => {
+  const { repository } = await fixture(t);
+  let unknown = 0;
+  let released = 0;
+  const { checkpoints } = service({ capacity: () => ({ active: 0, limit: 8, unknown }), onRelease: () => { released += 1; } });
+  const checkpoint = await checkpoints.capture(target(repository));
+  await writeFile(path.join(repository, "a.txt"), "current\n");
+  const preview = await checkpoints.preview(target(repository), checkpoint.id);
+  const request = { id: checkpoint.id, planDigest: preview.planDigest, paths: ["a.txt"] };
+
+  // A failure that is not about ownership releases the worktree at once.
+  checkpoints.admitWriter([repository])(Object.assign(new Error("hook failed"), { code: 1 }));
+  assert.equal(checkpoints.holding(repository), null);
+  unknown = 1;
+  checkpoints.admitWriter([repository])(Object.assign(new Error("Utility descendant ownership is unknown"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN" }));
+  assert.equal(checkpoints.holding(repository), "GIT_WRITE_UNCONFIRMED");
+  assert.throws(() => checkpoints.admitWriter([repository]), (error) => error.details.code === "GIT_WRITE_UNCONFIRMED");
+  assert.deepEqual((await checkpoints.preview(target(repository), checkpoint.id)).blockers.map((item) => item.code), ["GIT_WRITE_UNCONFIRMED"]);
+  await assert.rejects(checkpoints.restore(target(repository), request), (error) => error.details.blockers?.[0].code === "GIT_WRITE_UNCONFIRMED");
+  assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "current\n");
+
+  unknown = 0;
+  assert.equal(checkpoints.holding(repository), null);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(released, 1, "runs that waited for the worktree were not released");
+  await checkpoints.restore(target(repository), request);
+  assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "committed\n");
+});
+
+test("capture never runs a content filter, and leaves nested repositories alone", async (t) => {
+  const { root, repository } = await fixture(t);
+  const sentinel = path.join(root, "filter-ran");
+  await git(repository, ["config", "filter.fail.clean", "false"]);
+  await git(repository, ["config", "filter.fail.required", "true"]);
+  await git(repository, ["config", "filter.mark.clean", `sh -c 'touch "$0"; cat' ${JSON.stringify(sentinel)}`]);
+  await writeFile(path.join(repository, ".gitattributes"), "*.fail filter=fail\n*.mark filter=mark\n");
+  await git(repository, ["add", ".gitattributes"]);
+  await git(repository, ["commit", "-qm", "filters"]);
+  // A tracked file whose entry is as new as the index is compared by content.
+  await writeFile(path.join(repository, "tracked.mark"), "tracked\n");
+  await git(repository, ["-c", "filter.mark.clean=cat", "add", "tracked.mark"]);
+  const files = { "new.fail": "never cleaned\r\n", "new.mark": "not marked\n" };
+  for (const [name, content] of Object.entries(files)) await writeFile(path.join(repository, name), content);
+  // An untracked repository with no commit yet.
+  await git(repository, ["init", "-q", "inner"]);
+  await writeFile(path.join(repository, "inner", "own.txt"), "its own\n");
+
+  const { checkpoints } = service();
+  const checkpoint = await checkpoints.capture(target(repository));
+  assert.deepEqual(checkpoint.counts, { staged: 1, unstaged: 0, untracked: 2 });
+  assert.equal(await git(repository, ["ls-tree", "-r", "--name-only", checkpoint.commit, "--", "inner"]), "");
+  await assert.rejects(readFile(sentinel), { code: "ENOENT" }, "a clean filter ran during capture");
+  for (const name of Object.keys(files)) await rm(path.join(repository, name));
+  const { preview } = await restoreAll(checkpoints, repository, checkpoint.id);
+  assert.deepEqual(preview.entries.map((entry) => entry.path), ["new.fail", "new.mark"]);
+  for (const [name, content] of Object.entries(files)) assert.equal(await readFile(path.join(repository, name), "utf8"), content);
+  assert.equal(await readFile(path.join(repository, "inner", "own.txt"), "utf8"), "its own\n");
+  await assert.rejects(readFile(sentinel), { code: "ENOENT" }, "a clean filter ran");
+});
+
+test("a restore waits for another Git command's index lock instead of stopping part way", async (t) => {
+  const { repository } = await fixture(t);
+  let held = false;
+  const lock = path.join(repository, ".git", "index.lock");
+  const { checkpoints } = service({
+    run: async (file, args, options) => {
+      // Something like an editor's `git status` takes the lock as the
+      // restore starts writing the index.
+      if (!held && args.includes("update-index") && !options.env?.GIT_INDEX_FILE) {
+        held = true;
+        await writeFile(lock, "");
+        setTimeout(() => { void rm(lock, { force: true }); }, 600);
+      }
+      return execFileAsync(file, args, options);
+    },
+  });
+  await writeFile(path.join(repository, "a.txt"), "staged\n");
+  await git(repository, ["add", "a.txt"]);
+  const checkpoint = await checkpoints.capture(target(repository));
+  await git(repository, ["reset", "-q", "--hard"]);
+  await restoreAll(checkpoints, repository, checkpoint.id);
+  assert.ok(held);
+  assert.equal(await git(repository, ["show", ":a.txt"]), "staged\n");
+  assert.equal(checkpoints.holding(repository), null);
+});
+
+test("a preview of a directory with thousands of paths swapped for a file stays linear in size", async (t) => {
+  const { repository } = await fixture(t);
+  const count = 3000;
+  await mkdir(path.join(repository, "many"));
+  await Promise.all(Array.from({ length: count }, (_, index) => writeFile(path.join(repository, "many", `f${index}`), `${index}\n`)));
+  const { checkpoints } = service();
+  const checkpoint = await checkpoints.capture(target(repository));
+  await rm(path.join(repository, "many"), { recursive: true });
+  await writeFile(path.join(repository, "many"), "a file now\n");
+
+  const preview = await checkpoints.preview(target(repository), checkpoint.id);
+  assert.equal(preview.entries.length, count + 1);
+  assert.ok(preview.entries.every((entry) => entry.group === "many" && entry.groupSize === count + 1));
+  assert.ok(JSON.stringify(preview).length < count * 300, `the preview took ${JSON.stringify(preview).length} bytes`);
+  await assert.rejects(checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, except: ["many/f7"] }),
+    (error) => error.details.code === "CHECKPOINT_SELECTION_INVALID");
+  await checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, except: [] });
+  assert.equal(await readFile(path.join(repository, "many", "f2999"), "utf8"), "2999\n");
+});
+
+test("a name that changes only by case restores on a filesystem that ignores case", async (t) => {
+  const { root, repository } = await fixture(t);
+  await writeFile(path.join(root, "CaseProbe"), "");
+  const insensitive = await readFile(path.join(root, "caseprobe")).then(() => true, () => false);
+  if (!insensitive) { t.skip("this filesystem tells case apart"); return; }
+  await writeFile(path.join(repository, "Note.txt"), "untracked\n");
+  const { checkpoints } = service();
+  const checkpoint = await checkpoints.capture(target(repository));
+  await git(repository, ["mv", "old.txt", "OLD.txt"]);
+  await rename(path.join(repository, "Note.txt"), path.join(repository, "note.txt"));
+
+  const { preview } = await restoreAll(checkpoints, repository, checkpoint.id);
+  assert.deepEqual(preview.entries.map((entry) => [entry.path, entry.file?.action ?? null, entry.blocked ?? null, entry.groupSize ?? 1]),
+    [["note.txt", "delete", null, 2], ["Note.txt", "create", null, 2], ["old.txt", "create", null, 2], ["OLD.txt", "delete", null, 2]]);
+  assert.deepEqual((await readdir(repository)).filter((name) => /^(?:note|old)\.txt$/i.test(name)).sort(), ["Note.txt", "old.txt"]);
+  assert.equal(await readFile(path.join(repository, "Note.txt"), "utf8"), "untracked\n");
+  assert.equal(await status(repository), "?? Note.txt\n");
 });

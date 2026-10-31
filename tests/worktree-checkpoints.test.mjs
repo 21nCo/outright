@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { EXPLICIT_PATHS, checkpointCountsText, groupCheckpointEntries, initialRestoreSelection, restoreBlockedReason, restoreChangeText, restoreSelection,
-  toggleRestorePath } from "../src/lib/worktree-checkpoints.js";
+import { EXPLICIT_PATHS, checkpointCountsText, groupCheckpointEntries, initialRestoreSelection, restoreBlockedReason, restoreChangeText, restoreGroupText,
+  restoreSelection, toggleRestorePath } from "../src/lib/worktree-checkpoints.js";
 
 const entries = [
   { path: "a.txt", index: { action: "update" }, file: { action: "update" } },
   { path: "cache", index: null, file: { action: "create" }, blocked: "An ignored file or directory is in the way" },
-  { path: "dir", index: null, file: { action: "delete" }, coupled: ["dir/inner.txt"] },
-  { path: "dir/inner.txt", index: null, file: { action: "create" }, coupled: ["dir"] },
+  { path: "dir", index: null, file: { action: "delete" }, group: "dir", groupSize: 2 },
+  { path: "dir/inner.txt", index: null, file: { action: "create" }, group: "dir", groupSize: 2 },
 ];
 
 test("a restore starts with every offered path chosen and never a blocked one", () => {
@@ -20,6 +20,10 @@ test("file/directory swaps are chosen and cleared together", () => {
   const none = new Set();
   assert.deepEqual([...toggleRestorePath(entries, none, "dir/inner.txt", true)].sort(), ["dir", "dir/inner.txt"]);
   assert.deepEqual([...toggleRestorePath(entries, initialRestoreSelection(entries), "dir", false)], ["a.txt"]);
+  assert.equal(restoreGroupText(entries[2]), "Restored together with 1 other path");
+  assert.equal(restoreGroupText(entries[3]), "Restored together with dir");
+  assert.equal(restoreGroupText({ ...entries[3], groupSize: 4 }), "Restored together with dir and 2 other paths");
+  assert.equal(restoreGroupText(entries[0]), "");
 });
 
 test("restore stays disabled while a writer is active, nothing is chosen or open terminals are unconfirmed", () => {

@@ -5,7 +5,9 @@ import { utilityBudgetUnavailable, utilityProcesses } from "./subprocess-budget.
 
 // `admitWriter(cwd)` admits a stage, unstage or commit in a worktree, or
 // throws while a checkpoint restore holds it; it returns the release that
-// ends the admission. Check and admission are synchronous.
+// ends the admission, given the failure if there was one (a Git process
+// whose ownership was lost keeps the worktree held). Check and admission
+// are synchronous.
 export function createGitService({ database, getProjects, getConfig, subprocesses = utilityProcesses, admitWriter = () => () => {} }) {
   const git = (cwd, args, overrides = {}) => runGit(subprocesses, cwd, args, overrides);
   const safeGit = async (cwd, args, overrides = {}) => {
@@ -71,7 +73,8 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
     const [branch, porcelain, recent] = await Promise.all([
       git(cwd, ["branch", "--show-current"]),
       // NUL-delimited output keeps filenames with spaces or quotes intact.
-      git(cwd, ["status", "--porcelain=v1", "--branch", "-z"]),
+      // Read-only: no optional index lock for a restore or commit to meet.
+      git(cwd, ["status", "--porcelain=v1", "--branch", "-z"], { env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } }),
       optionalGit(cwd, ["log", "-8", "--pretty=format:%h%x09%an%x09%ar%x09%s"]),
     ]);
     const { header, files } = parsePorcelain(porcelain);
@@ -109,7 +112,8 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
     try {
       await auditedMutation("git.stage.requested", "git.stage", { target: cwd, files: validated },
         () => git(cwd, ["add", "--", ...validated]));
-    } finally { release(); }
+    } catch (error) { release(error); throw error; }
+    release();
     return statusAfterMutation(cwd);
   }
 
@@ -120,7 +124,8 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
     try {
       await auditedMutation("git.unstage.requested", "git.unstage", { target: cwd, files: validated },
         () => unstagePaths(cwd, validated));
-    } finally { release(); }
+    } catch (error) { release(error); throw error; }
+    release();
     return statusAfterMutation(cwd);
   }
 
@@ -132,7 +137,8 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
     try {
       output = await auditedMutation("git.commit.requested", "git.commit", { target: cwd, message: message.trim() },
         () => git(cwd, ["commit", "-m", message.trim()], { maxBuffer: 8 * 1024 * 1024 }));
-    } finally { release(); }
+    } catch (error) { release(error); throw error; }
+    release();
     const refreshed = await statusAfterMutation(cwd);
     return { output, status: refreshed.refreshDeferred ? null : refreshed, refreshDeferred: refreshed.refreshDeferred ?? false };
   }

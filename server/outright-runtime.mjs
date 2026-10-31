@@ -12,7 +12,7 @@ import { createTerminalManager } from "./terminal-manager.mjs";
 import { accountPin, createProviderAccounts } from "./provider-accounts.mjs";
 import { createGitService } from "./git-service.mjs";
 import { createWorktreeLifecycle } from "./worktree-lifecycle.mjs";
-import { createWorktreeCheckpoints } from "./worktree-checkpoints.mjs";
+import { createWorktreeCheckpoints, holdMessage } from "./worktree-checkpoints.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { lifecycleProcesses, utilityProcesses } from "./subprocess-budget.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
@@ -814,8 +814,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (lifecycleHold === "WORKTREE_LIFECYCLE_BUSY") throw apiError(409, "Worktree setup or teardown is running; start work when it finishes", { code: lifecycleHold });
         if (lifecycleHold) throw apiError(409, "Setup or teardown processes in this worktree are not confirmed stopped; acknowledge them in Worktree setup first", { code: lifecycleHold });
         const restoring = checkpoints.holding(target.worktreePath) ?? checkpoints.holding(conversation.worktreePath);
-        if (restoring === "CHECKPOINT_RESTORE_RUNNING") throw apiError(409, "A checkpoint restore is running in this worktree; start work when it finishes", { code: restoring });
-        if (restoring) throw apiError(409, "A checkpoint restore in this worktree did not finish; finish it or keep the files in Checkpoints first", { code: restoring });
+        if (restoring) throw apiError(409, holdMessage(restoring, "start work"), { code: restoring });
         const { run, message: userMessage } = database.submitRun({ conversationId: conversation.id, worktreePath: conversation.worktreePath, ...runConfig, prompt }, prompt);
         publish({ type: "message.created", conversationId: conversation.id, payload: userMessage });
         return json(response, 202, await agents.schedule({ conversation: database.getConversation(conversation.id), run }));
