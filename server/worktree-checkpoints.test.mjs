@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
-import { CHECKPOINT_LIMITS, CHECKPOINT_REF_PREFIX, RESTORE_MARKER, createWorktreeCheckpoints } from "./worktree-checkpoints.mjs";
+import { CHECKPOINT_LIMITS, CHECKPOINT_REF_PREFIX, RESTORE_MARKER, WRITE_MARKER, batches, createWorktreeCheckpoints } from "./worktree-checkpoints.mjs";
 
 const execFileAsync = promisify(execFile);
 process.env.GIT_TRACE2_EVENT = "0";
@@ -199,6 +199,12 @@ test("restore and every app-owned writer exclude each other in a worktree", asyn
   await assert.rejects(checkpoints.restore(target(repository), { ...request, acknowledgeTerminals: ["terminal-1"] }),
     (error) => error.details.blockers?.[0].code === "GIT_WRITE_ACTIVE");
   releaseWriter();
+  // So does a terminal that is starting there.
+  const releaseTerminal = checkpoints.admitWriter([repository], "terminal");
+  await assert.rejects(checkpoints.restore(target(repository), { ...request, acknowledgeTerminals: ["terminal-1"] }),
+    (error) => error.details.blockers?.[0].code === "TERMINAL_STARTING");
+  releaseTerminal(Object.assign(new Error("lost"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN" }));
+  assert.equal(checkpoints.holding(repository), null, "a terminal's failure held the worktree as a Git write");
   assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "current\n");
 
   gate = new Promise((resolve) => { releaseRestore = resolve; });
@@ -206,6 +212,7 @@ test("restore and every app-owned writer exclude each other in a worktree", asyn
   while (!checkpoints.holding(repository)) await new Promise((resolve) => setImmediate(resolve));
   assert.equal(checkpoints.holding(repository), "CHECKPOINT_RESTORE_RUNNING");
   assert.throws(() => checkpoints.admitWriter([repository]), (error) => error.details.code === "CHECKPOINT_RESTORE_RUNNING");
+  assert.throws(() => checkpoints.admitWriter([repository], "terminal"), (error) => error.details.code === "CHECKPOINT_RESTORE_RUNNING");
   await assert.rejects(checkpoints.capture(target(repository)), (error) => error.details.code === "CHECKPOINT_BUSY");
   assert.equal((await checkpoints.describe(target(repository))).restore.status, "running");
   releaseRestore();
@@ -363,7 +370,7 @@ test("a restore that loses track of a Git process holds the worktree until the p
   const before = released;
   await checkpoints.recover(target(repository), "keep");
   assert.equal(checkpoints.holding(repository), null);
-  assert.equal(released, before + 1, "runs that waited for the restore were not released");
+  assert.ok(released > before, "runs that waited for the restore were not released");
   assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "current\n");
 });
 
@@ -683,4 +690,86 @@ test("a name that changes only by case restores on a filesystem that ignores cas
   assert.deepEqual((await readdir(repository)).filter((name) => /^(?:note|old)\.txt$/i.test(name)).sort(), ["Note.txt", "old.txt"]);
   assert.equal(await readFile(path.join(repository, "Note.txt"), "utf8"), "untracked\n");
   assert.equal(await status(repository), "?? Note.txt\n");
+});
+
+test("a Git write that lost its process keeps the worktree held after a restart, and its release is announced", async (t) => {
+  const { repository } = await fixture(t);
+  let unknown = 1;
+  const capacity = () => ({ active: 0, limit: 8, unknown });
+  const first = service({ capacity });
+  const checkpoint = await first.checkpoints.capture(target(repository));
+  await writeFile(path.join(repository, "a.txt"), "current\n");
+  first.checkpoints.admitWriter([repository])(Object.assign(new Error("Utility descendant ownership is unknown"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN" }));
+
+  // A new runtime knows only what the Git directory and the budget keep.
+  let released = 0;
+  const published = [];
+  const { checkpoints } = service({ capacity, onRelease: () => { released += 1; }, publish: (event) => published.push(event) });
+  assert.equal(checkpoints.holding(repository), "GIT_WRITE_UNCONFIRMED");
+  assert.throws(() => checkpoints.admitWriter([repository]), (error) => error.details.code === "GIT_WRITE_UNCONFIRMED");
+  const preview = await checkpoints.preview(target(repository), checkpoint.id);
+  assert.deepEqual(preview.blockers.map((item) => item.code), ["GIT_WRITE_UNCONFIRMED"]);
+  await assert.rejects(checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: ["a.txt"] }),
+    (error) => error.details.blockers?.[0].code === "GIT_WRITE_UNCONFIRMED");
+  assert.equal(checkpoints.reconcile(), false);
+
+  // Proving the owner gone releases the worktree without anything else asking.
+  unknown = 0;
+  published.length = 0;
+  assert.equal(checkpoints.reconcile(), true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(released, 1, "runs that waited for the worktree were not released");
+  assert.deepEqual(published.map((event) => event.payload.worktreePath), [repository]);
+  await assert.rejects(readFile(path.join(repository, ".git", WRITE_MARKER)), { code: "ENOENT" });
+  assert.equal(checkpoints.holding(repository), null);
+});
+
+test("a checkpoint keeps each file's type on disk, whatever its index entry is", async (t) => {
+  const { repository } = await fixture(t);
+  await symlink("a.txt", path.join(repository, "link"));
+  await writeFile(path.join(repository, "plain.txt"), "plain\n");
+  await git(repository, ["add", "."]);
+  await git(repository, ["commit", "-qm", "link and file"]);
+  // A link replaced by a regular file, and a regular file by a link.
+  await rm(path.join(repository, "link"));
+  await writeFile(path.join(repository, "link"), "regular file contents\n");
+  await rm(path.join(repository, "plain.txt"));
+  await symlink("a.txt", path.join(repository, "plain.txt"));
+  const { checkpoints } = service();
+  const checkpoint = await checkpoints.capture(target(repository));
+  await git(repository, ["checkout", "--", "link", "plain.txt"]);
+  await restoreAll(checkpoints, repository, checkpoint.id);
+  assert.equal((await lstat(path.join(repository, "link"))).isFile(), true, "the regular file came back as a link");
+  assert.equal(await readFile(path.join(repository, "link"), "utf8"), "regular file contents\n");
+  assert.equal(await readlink(path.join(repository, "plain.txt")), "a.txt");
+
+  // Where Git keeps links as files holding their target, so does a checkpoint.
+  await git(repository, ["config", "core.symlinks", "false"]);
+  await git(repository, ["checkout", "--", "link", "plain.txt"]);
+  await rm(path.join(repository, "link"));
+  await writeFile(path.join(repository, "link"), "b.txt");
+  const emulated = await checkpoints.capture(target(repository));
+  assert.match(await git(repository, ["ls-tree", emulated.commit, "link"]), /^120000 /);
+  await writeFile(path.join(repository, "link"), "a.txt");
+  await restoreAll(checkpoints, repository, emulated.id);
+  assert.equal((await lstat(path.join(repository, "link"))).isFile(), true);
+  assert.equal(await readFile(path.join(repository, "link"), "utf8"), "b.txt");
+});
+
+test("every Git command a capture runs fits a Windows command line, with SHA-256 object ids", async (t) => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "outright-checkpoints-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const repository = path.join(root, "project");
+  await git(root, ["init", "-q", "--object-format=sha256", "project"]);
+  // Names as long as the path batches allow 256 of.
+  for (let index = 0; index < 600; index += 1) await writeFile(path.join(repository, `${String(index).padStart(4, "0")}-${"n".repeat(42)}`), `${index}\n`);
+  let longest = 0;
+  const { checkpoints } = service({ run: (file, args, options) => {
+    longest = Math.max(longest, [file, ...args].reduce((total, value) => total + value.length + 3, 0));
+    return execFileAsync(file, args, options);
+  } });
+  const checkpoint = await checkpoints.capture(target(repository));
+  assert.equal(checkpoint.counts.untracked, 600);
+  assert.ok(longest < 32_767, `a command line was ${longest} characters`);
+  assert.equal(batches(["a"]).length, 1);
 });

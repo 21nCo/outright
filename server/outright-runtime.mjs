@@ -160,8 +160,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   // interrupted run in that worktree, and those wait for it, and for one
   // that did not finish, until it is finished or its files are kept. Open
   // terminals are listed for the user to confirm: Outright cannot tell
-  // whether a shell is writing.
-  const checkpoints = createWorktreeCheckpoints({ database, subprocesses, publish: (event) => publish(event),
+  // whether a shell is writing; a new one waits for the restore. A change
+  // rescans projects, as an index-only restore is not seen by the watcher.
+  const checkpoints = createWorktreeCheckpoints({ database, subprocesses, publish: (event) => { publish(event); scheduleRescan(event.payload.worktreePath); },
     writers: (paths) => {
       const found = [];
       if (agents?.hasWorktreeWork(paths)) found.push({ code: "WORKTREE_AGENT_ACTIVE", message: "an agent run is queued or running in this worktree" });
@@ -307,6 +308,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     if (typeof subprocesses.reconcileUnknown === "function") {
       void Promise.resolve().then(() => subprocesses.reconcileUnknown()).then(async (resolved) => {
         onRecovered(resolved);
+        if (resolved && !shuttingDown) checkpoints.reconcile();
         // A terminal proof may have been refused only because utility owners
         // occupied every helper slot. Retry it after capacity is reclaimed.
         if (resolved && !shuttingDown) await terminals.reconcileUnknown();
@@ -421,18 +423,21 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         || /(?:^|\/)\.git\/(?:objects|lfs|modules|worktrees)(?:\/|$)/.test(target),
       awaitWriteFinish: { stabilityThreshold: 250, pollInterval: 100 },
     });
-    watcher.on("all", (_eventName, changedPath) => {
-      clearTimeout(watcherTimer);
-      watcherTimer = setTimeout(async () => {
-        try {
-          const result = await projects(true);
-          publish({ type: "projects.changed", payload: { changedPath, projects: result.projects, scannedAt: result.scannedAt } });
-        } catch { /* The next manual refresh will surface scanner errors. */ }
-      }, 500);
-    });
+    watcher.on("all", (_eventName, changedPath) => scheduleRescan(changedPath));
     watcher.on("error", (error) => {
       if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:watcher]", error.message);
     });
+  }
+
+  function scheduleRescan(changedPath) {
+    clearTimeout(watcherTimer);
+    if (shuttingDown) return;
+    watcherTimer = setTimeout(async () => {
+      try {
+        const result = await projects(true);
+        publish({ type: "projects.changed", payload: { changedPath, projects: result.projects, scannedAt: result.scannedAt } });
+      } catch { /* The next manual refresh will surface scanner errors. */ }
+    }, 500);
   }
 
   function ensureDefaultSpaces(projectList) {
@@ -466,8 +471,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
     // A terminal proof may have waited only for this helper slot.
     if (!shuttingDown) void terminals.reconcileUnknown().catch(() => {});
-    // The last unconfirmed step may now be proven gone.
+    // The last unconfirmed step, or Git write, may now be proven gone.
     if (!shuttingDown && budget === lifecycleSubprocesses) void lifecycle.reconcile().catch(() => {});
+    if (!shuttingDown && budget === subprocesses) checkpoints.reconcile();
     return { released, capacity: runtimeCapacity() };
   }
 
@@ -1055,7 +1061,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         }
         await projects();
         const cwd = await git.requireWorktree(body.cwd);
-        return json(response, 201, await terminals.create({ ...body, cwd }));
+        // Never beside a checkpoint restore, which waits for it in turn.
+        const release = checkpoints.admitWriter([cwd], "terminal");
+        try { return json(response, 201, await terminals.create({ ...body, cwd })); }
+        finally { release(); }
       }
       const terminalMatch = url.pathname.match(/^\/api\/terminals\/([^/]+)$/);
       if (terminalMatch && request.method === "GET") { const terminal = terminals.get(terminalMatch[1]); return json(response, terminal ? 200 : 404, terminal ?? { error: "Terminal not found" }); }

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstatSync, readFileSync } from "node:fs";
+import { lstatSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, rmdir, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -37,6 +37,9 @@ export const CHECKPOINT_REF_PREFIX = "refs/worktree/outright/checkpoints/";
 // anything and removed once it has finished; while it is there, the restore
 // did not finish and the worktree is held against other writers.
 export const RESTORE_MARKER = "outright-checkpoint-restore.json";
+// Written beside it when a stage, unstage or commit loses track of its Git
+// process, and removed once no such process is left.
+export const WRITE_MARKER = "outright-git-write-unconfirmed";
 const ID_PATTERN = /^[0-9a-z]{6,12}-[0-9a-f]{8}$/;
 const OID_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 const REGULAR_MODE = /^100(?:644|755)$/;
@@ -46,8 +49,10 @@ const IDENTITY = { GIT_AUTHOR_NAME: "Outright", GIT_AUTHOR_EMAIL: "checkpoints@o
 const LITERAL = { GIT_LITERAL_PATHSPECS: "1" };
 const IN_PROGRESS = ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"];
 // Exact paths go on the command line in bounded batches (Windows limits a
-// command line to 32,767 characters).
+// command line to 32,767 characters); each value counts with room for its
+// quoting and an option before it, as `--cacheinfo`.
 const BATCH_CHARACTERS = 12_000;
+const BATCH_OVERHEAD = 16;
 const BATCH_PATHS = 256;
 const RUNNING = "CHECKPOINT_RESTORE_RUNNING";
 const UNFINISHED = "CHECKPOINT_RESTORE_INTERRUPTED";
@@ -61,15 +66,17 @@ const INDEX_LOCK_WAIT_MS = 250;
 // that may write in the worktree now, as { code, message }; restore refuses
 // while any is listed. `terminals(paths)` lists open terminals there, which
 // the user must acknowledge. `onRelease` is called when a worktree is no
-// longer held by a restore, so agent runs that waited for it can launch.
+// longer held by a restore, so agent runs that waited for it can launch;
+// `reconcile()` is called when the utility budget proves owners gone.
 export function createWorktreeCheckpoints({ database, subprocesses, publish = () => {}, writers = () => [], terminals = () => [],
   onRelease = () => {}, limits = CHECKPOINT_LIMITS, now = () => new Date() }) {
   if (limits.planEntries < 2 * limits.files) throw new Error("Checkpoint planEntries must be at least twice files");
   const active = new Map();
-  // Git stages, unstages and commits admitted through `admitWriter`.
+  // Git stages, unstages and commits, and terminal launches, admitted
+  // through `admitWriter`.
   const admitted = new Set();
   // Worktrees whose restore lost track of a Git process it started, and
-  // those whose stage, unstage or commit did.
+  // those whose stage, unstage or commit did (also kept in WRITE_MARKER).
   const unconfirmed = new Set();
   const strays = new Set();
   const gitDirs = new Map();
@@ -102,23 +109,36 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       return match ? path.resolve(worktreePath, match[1]) : null;
     } catch { return null; }
   }
-  function markerPresent(worktreePath) {
+  function markerPresent(worktreePath, name = RESTORE_MARKER) {
     const gitDir = gitDirOf(worktreePath);
     if (!gitDir) return false;
-    try { lstatSync(path.join(gitDir, RESTORE_MARKER)); return true; }
+    try { lstatSync(path.join(gitDir, name)); return true; }
     // Anything but a missing marker keeps the worktree held.
     catch (error) { return !["ENOENT", "ENOTDIR"].includes(error.code); }
   }
 
-  // Whether a Git process that lost its owner may still write in `paths`
-  // (listed in `set`, or `always`): the utility budget keeps such owners,
-  // across restarts too, until it proves them gone.
-  function unproven(set, paths, always = false) {
-    if (!always && ![...paths].some((value) => set.has(value))) return false;
-    if ((subprocesses.capacity?.().unknown ?? 0) > 0) return true;
-    // Runs that waited for a worktree this held can launch now.
-    if (paths.map((value) => set.delete(value)).some(Boolean)) queueMicrotask(onRelease);
-    return false;
+  // The utility budget keeps every Git process whose owner was lost, across
+  // restarts too, until it proves it gone. Once none is left, worktrees held
+  // only for such processes are released and the runs waiting for them can
+  // launch. True when that is so.
+  function reconcile() {
+    if ((subprocesses.capacity?.().unknown ?? 0) > 0) return false;
+    const released = [...new Set([...unconfirmed, ...strays])];
+    unconfirmed.clear();
+    strays.clear();
+    for (const value of released) {
+      const gitDir = gitDirOf(value);
+      try { if (gitDir) rmSync(path.join(gitDir, WRITE_MARKER), { force: true }); }
+      catch { strays.add(value); }
+      changed(value);
+    }
+    if (released.length) queueMicrotask(onRelease);
+    return true;
+  }
+  function strayWrite(worktreePath) {
+    if (!strays.has(worktreePath) && !markerPresent(worktreePath, WRITE_MARKER)) return false;
+    strays.add(worktreePath);
+    return !reconcile();
   }
 
   // Why another writer may not start in a worktree now, or null: a restore
@@ -128,28 +148,39 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   function holding(worktreePath) {
     if ([...active.values()].some((entry) => entry.kind === "restore" && entry.paths.has(worktreePath))) return RUNNING;
     if (unconfirmed.has(worktreePath) || markerPresent(worktreePath)) return UNFINISHED;
-    return unproven(strays, [worktreePath]) ? STRAY : null;
+    return strayWrite(worktreePath) ? STRAY : null;
   }
 
-  // Admits an application-owned Git write (stage, unstage, commit) unless a
-  // restore holds the worktree; a restore is refused while one is admitted.
-  // Synchronous, as `claim` is. Returns the release, which takes the write's
-  // failure: one that lost track of its Git process keeps the worktree held.
-  function admitWriter(paths) {
+  // Admits an application-owned writer (a Git stage, unstage or commit, or
+  // a terminal launch) unless a restore holds the worktree; a restore is
+  // refused while one is admitted. Synchronous, as `claim` is. Returns the
+  // release, which takes the write's failure: a Git write that lost track of
+  // its process keeps the worktree held, across restarts too.
+  function admitWriter(paths, kind = "git") {
     const code = paths.map(holding).find(Boolean);
     if (code) throw checkpointError(409, holdMessage(code, "try again"), code);
-    const token = { paths: new Set(paths) };
+    const token = { paths: new Set(paths), kind };
     admitted.add(token);
     return (error) => {
       admitted.delete(token);
-      if (ownershipUnknown(error)) for (const value of paths) strays.add(value);
+      if (kind !== "git" || !ownershipUnknown(error)) return;
+      for (const value of paths) {
+        strays.add(value);
+        const gitDir = gitDirOf(value);
+        try { if (gitDir) writeFileSync(path.join(gitDir, WRITE_MARKER), `${now().toISOString()}\n`, { mode: 0o600 }); }
+        catch { /* Held in memory until the process is proven gone. */ }
+      }
     };
   }
   function gitWriters(paths) {
-    if ([...admitted].some((token) => [...paths].some((value) => token.paths.has(value)))) {
-      return [{ code: "GIT_WRITE_ACTIVE", message: "a Git stage, unstage or commit is running in this worktree" }];
+    const found = [];
+    for (const token of admitted) {
+      if (![...paths].some((value) => token.paths.has(value))) continue;
+      found.push(token.kind === "terminal" ? { code: "TERMINAL_STARTING", message: "a terminal is starting in this worktree" }
+        : { code: "GIT_WRITE_ACTIVE", message: "a Git stage, unstage or commit is running in this worktree" });
     }
-    return unproven(strays, [...paths]) ? [{ code: STRAY, message: "a Git stage, unstage or commit here is not confirmed stopped" }] : [];
+    if ([...paths].some(strayWrite)) found.push({ code: STRAY, message: "a Git stage, unstage or commit here is not confirmed stopped" });
+    return found;
   }
 
   // One checkpoint operation per worktree. Restore also holds the worktree
@@ -180,7 +211,14 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   // after a crash nothing says whether it did: an interrupted restore cannot
   // be finished or dismissed until the utility budget has proven every
   // process whose owner was lost gone.
-  function ownerPending(target, marker) { return unproven(unconfirmed, [...pathsOf(target)], Boolean(marker)); }
+  function ownerPending(target, marker) {
+    const paths = [...pathsOf(target)];
+    if (!marker && !paths.some((value) => unconfirmed.has(value))) return false;
+    if (reconcile()) return false;
+    // Remembered, so the release is signalled once the owners are proven gone.
+    for (const value of paths) unconfirmed.add(value);
+    return true;
+  }
 
   async function audited(action, details, mutate) {
     const evidence = { ...details, operationId: details.operationId ?? randomUUID() };
@@ -217,20 +255,20 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   // own content comparisons (a command that writes an index compares the
   // entries as new as it), so no clean filter runs and a failing required
   // one cannot stop a capture or restore; and whether Git tracks the
-  // executable bit.
+  // executable bit and makes symbolic links.
   async function captureSettings(cwd) {
     let listed = "";
-    try { listed = await git(cwd, ["config", "-z", "--get-regexp", "^(filter\\..+\\.(clean|process|required)|core\\.filemode)$"]); }
+    try { listed = await git(cwd, ["config", "-z", "--get-regexp", "^(filter\\..+\\.(clean|process|required)|core\\.(filemode|symlinks))$"]); }
     catch (error) { if (error.code !== 1) throw error; }
     const names = new Set();
-    let fileMode = true;
+    const settings = { "core.filemode": true, "core.symlinks": true };
     for (const record of listed.split("\0")) {
       const key = record.split("\n", 1)[0];
       const filter = /^filter\.(.+)\.(?:clean|process|required)$/.exec(key);
       if (filter) names.add(filter[1]);
-      else if (key === "core.filemode") fileMode = !/^(?:false|no|off|0)$/i.test(record.slice(key.length + 1).trim());
+      else if (key in settings) settings[key] = !/^(?:false|no|off|0)$/i.test(record.slice(key.length + 1).trim());
     }
-    return { fileMode, unfiltered: [...names].flatMap((name) => ["-c", `filter.${name}.clean=`, "-c", `filter.${name}.process=`, "-c", `filter.${name}.required=false`]) };
+    return { fileMode: settings["core.filemode"], symlinks: settings["core.symlinks"], unfiltered: [...names].flatMap((name) => ["-c", `filter.${name}.clean=`, "-c", `filter.${name}.process=`, "-c", `filter.${name}.required=false`]) };
   }
 
   // Index entries ({ mode, oid }) at exact paths.
@@ -309,16 +347,23 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
           await writeFile(link, await readlink(path.join(cwd, relative), { encoding: "buffer" }));
           hashed.push({ relative, source: link, mode: "120000", entry });
         } else if (info.isFile()) {
-          // Without symbolic links or the executable bit, Git keeps the mode.
+          // The type on disk, except where Git keeps a link as a file holding
+          // its target, or does not track the executable bit.
           const executable = settings.fileMode ? (info.mode & 0o111) !== 0 : entry?.mode === "100755";
-          hashed.push({ relative, source: relative, mode: entry?.mode === "120000" ? "120000" : executable ? "100755" : "100644", entry });
+          const link = !settings.symlinks && entry?.mode === "120000";
+          hashed.push({ relative, source: relative, mode: link ? "120000" : executable ? "100755" : "100644", entry });
         }
       }
-      const oids = hashed.length ? (await git(cwd, ["hash-object", "-w", "--no-filters", "--", ...hashed.map((item) => item.source)])).trim().split("\n") : [];
+      const oids = [];
+      for (const sources of batches(hashed.map((item) => item.source))) {
+        oids.push(...(await git(cwd, ["hash-object", "-w", "--no-filters", "--", ...sources])).trim().split("\n"));
+      }
       const updates = hashed.map((item, position) => ({ ...item, oid: oids[position] }))
         .filter((item) => OID_PATTERN.test(item.oid ?? "") && (item.entry?.mode !== item.mode || item.entry?.oid !== item.oid));
       if (removed.length) await temporary(["update-index", "--force-remove", "--", ...removed]);
-      if (updates.length) await temporary(["update-index", "--add", "--replace", ...updates.flatMap((item) => ["--cacheinfo", `${item.mode},${item.oid},${item.relative}`])]);
+      for (const batch of batches(updates.map((item) => `${item.mode},${item.oid},${item.relative}`))) {
+        await temporary(["update-index", "--add", "--replace", ...batch.flatMap((value) => ["--cacheinfo", value])]);
+      }
     }
     const filesTree = (await temporary(["write-tree"])).trim();
     return { indexTree, filesTree, head, branch, bytes };
@@ -774,7 +819,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     await Promise.all([...active.values()].map((entry) => entry.done));
   }
 
-  return { describe, capture, inspect, preview, restore, recover, remove, fileDiff, holding, admitWriter, shutdown };
+  return { describe, capture, inspect, preview, restore, recover, remove, fileDiff, holding, admitWriter, reconcile, shutdown };
 }
 
 // Raw `diff-tree -z` records: ":<mode> <mode> <oid> <oid> <status>\0<path>\0",
@@ -948,14 +993,14 @@ function blobId(content, oid) {
   return createHash(oid.length === 64 ? "sha256" : "sha1").update(`blob ${content.length}\0`).update(content).digest("hex");
 }
 
-function batches(values) {
+export function batches(values) {
   const result = [];
   let current = [];
   let characters = 0;
   for (const value of values) {
     if (current.length && (current.length >= BATCH_PATHS || characters + value.length > BATCH_CHARACTERS)) { result.push(current); current = []; characters = 0; }
     current.push(value);
-    characters += value.length + 1;
+    characters += value.length + BATCH_OVERHEAD;
   }
   if (current.length) result.push(current);
   return result;
