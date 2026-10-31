@@ -24,6 +24,7 @@ tests.push(
   path.join(root, "tests", "terminal-search.test.mjs"),
   path.join(root, "tests", "pane-layout.test.mjs"),
   path.join(root, "tests", "worktree-lifecycle.test.mjs"),
+  path.join(root, "tests", "worktree-checkpoints.test.mjs"),
   path.join(root, "tests", "ui-races.test.mjs"),
 );
 

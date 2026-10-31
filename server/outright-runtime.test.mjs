@@ -3773,3 +3773,53 @@ test("unconfirmed setup processes hold agent work until acknowledged, and setup 
 }, { agentManagerFactory: (options) => createAgentManager(unconfirmedAgentOptions = options),
   lifecycleSubprocesses: { capacity: () => ({ active: 1, limit: 4, unknown: 1 }), reconcileUnknown: async () => 0, unknownOwnerStatus: () => [],
     run: async () => { throw Object.assign(new Error("ownership unknown"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN", cause: new Error("lost") }); } } }));
+
+let checkpointAgentOptions;
+let checkpointGate = null;
+test("a checkpoint restore is refused beside agent work and holds new runs while it runs", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const target = { projectId: project.id, worktreePath: worktree.path };
+  const notes = path.join(worktree.path, "notes.txt");
+  writeFileSync(notes, "checkpointed\n");
+  const created = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints", { ...target, label: "Before agent" });
+  assert.equal(created.statusCode, 201, created.raw);
+  const { id } = created.body.checkpoint;
+  writeFileSync(notes, "agent changed this\n");
+  const preview = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints/preview", { ...target, id });
+  assert.deepEqual(preview.body.entries.map((entry) => entry.path), ["notes.txt"], preview.raw);
+  const request = { ...target, id, planDigest: preview.body.planDigest, paths: ["notes.txt"] };
+
+  const hasWorktreeWork = runtime.agents.hasWorktreeWork;
+  runtime.agents.hasWorktreeWork = (paths) => paths.includes(worktree.path);
+  const beside = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints/restore", request);
+  runtime.agents.hasWorktreeWork = hasWorktreeWork;
+  assert.deepEqual([beside.statusCode, beside.body.code, beside.body.blockers?.[0].code], [409, "CHECKPOINT_WRITERS_ACTIVE", "WORKTREE_AGENT_ACTIVE"], beside.raw);
+  assert.equal(readFileSync(notes, "utf8"), "agent changed this\n");
+
+  let release;
+  checkpointGate = new Promise((resolve) => { release = resolve; });
+  const restoring = callRuntime(runtime, "POST", "/api/worktrees/checkpoints/restore", request);
+  try {
+    for (const deadline = Date.now() + 15_000; !checkpointAgentOptions.worktreeHeld(worktree.path); await new Promise((resolve) => setTimeout(resolve, 10))) {
+      if (Date.now() > deadline) assert.fail("the restore never held the worktree");
+    }
+    // Provider discovery is not under test here.
+    runtime.agents.providerAvailable = async () => true;
+    const conversation = runtime.database.createConversation({ ...target, worktreeId: worktree.id, title: "During restore", provider: "codex" });
+    const during = await callRuntime(runtime, "POST", `/api/conversations/${conversation.id}/runs`, { prompt: "start during restore" });
+    assert.equal(during.body.code, "CHECKPOINT_RESTORE_RUNNING", during.raw);
+    assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+  } finally {
+    checkpointGate = null;
+    release();
+  }
+  const restored = await restoring;
+  assert.equal(restored.statusCode, 200, restored.raw);
+  assert.equal(readFileSync(notes, "utf8"), "checkpointed\n");
+  assert.equal(checkpointAgentOptions.worktreeHeld(worktree.path), false);
+  const listed = await callRuntime(runtime, "GET", `/api/worktrees/checkpoints?projectId=${encodeURIComponent(project.id)}&path=${encodeURIComponent(worktree.path)}`);
+  assert.deepEqual(listed.body.checkpoints.map((checkpoint) => checkpoint.reason), ["before-restore", "manual"], listed.raw);
+}, { agentManagerFactory: (options) => createAgentManager(checkpointAgentOptions = options),
+  subprocesses: { capacity: () => ({ active: 0, limit: 8 }), run: async (file, args, options) => {
+    if (checkpointGate && args.includes("restore")) await checkpointGate;
+    return execFileAsync(file, args, options);
+  } } }));

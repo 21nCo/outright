@@ -12,6 +12,7 @@ import { createTerminalManager } from "./terminal-manager.mjs";
 import { accountPin, createProviderAccounts } from "./provider-accounts.mjs";
 import { createGitService } from "./git-service.mjs";
 import { createWorktreeLifecycle } from "./worktree-lifecycle.mjs";
+import { createWorktreeCheckpoints } from "./worktree-checkpoints.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { lifecycleProcesses, utilityProcesses } from "./subprocess-budget.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
@@ -144,12 +145,30 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   // a step's processes are unconfirmed, and a run that waited launches when
   // the hold ends. Neither starts beside an unresolved interrupted run.
   const lifecycle = createWorktreeLifecycle({ database, subprocesses: lifecycleSubprocesses, publish: (event) => publish(event),
-    agentWork: (paths) => agents?.hasWorktreeWork(paths) ?? false,
+    agentWork: (paths) => (agents?.hasWorktreeWork(paths) ?? false) || paths.some((worktreePath) => checkpoints.holding(worktreePath)),
     interruptedRun: (paths) => paths.map((worktreePath) => database.findUnresolvedInterruptedRunForWorktree(worktreePath)).find(Boolean) ?? null,
     onRelease: () => { if (!shuttingDown) agents?.resumeQueued(); },
     onPersistError: (error) => {
       if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:worktree-lifecycle]", error);
     } });
+  // A restore replaces files and index entries, so it never runs beside
+  // agent work, setup or teardown, or an unresolved interrupted run in that
+  // worktree, and those wait for it. Open terminals are listed for the user
+  // to confirm: Outright cannot tell whether a shell is writing.
+  const checkpoints = createWorktreeCheckpoints({ database, subprocesses, publish: (event) => publish(event),
+    writers: (paths) => {
+      const found = [];
+      if (agents?.hasWorktreeWork(paths)) found.push({ code: "WORKTREE_AGENT_ACTIVE", message: "an agent run is queued or running in this worktree" });
+      const hold = paths.map((worktreePath) => lifecycle.hold(worktreePath)).find(Boolean);
+      if (hold) found.push({ code: hold, message: hold === "WORKTREE_LIFECYCLE_BUSY" ? "worktree setup or teardown is running" : "setup or teardown processes here are not confirmed stopped" });
+      const interrupted = paths.map((worktreePath) => database.findUnresolvedInterruptedRunForWorktree(worktreePath)).find(Boolean);
+      if (interrupted) found.push({ code: "RUN_RECOVERY_REQUIRED", message: "an interrupted agent run here is not resolved", runId: interrupted.id });
+      return found;
+    },
+    terminals: (paths) => terminals.list({ saved: false })
+      .filter((terminal) => paths.includes(terminal.cwd) && !["exited", "ended"].includes(terminal.status))
+      .map((terminal) => ({ id: terminal.id, name: terminal.name })),
+    onRelease: () => { if (!shuttingDown) agents?.resumeQueued(); } });
   runtimeCapacity = function runtimeCapacity() {
     const capacity = database.capacity();
     return { ...capacity, activeProcesses: agents?.activeProcessCount() ?? 0,
@@ -178,7 +197,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       }
     },
     onProvidersChanged: (providers) => publish({ type: "providers.changed", payload: { providers } }),
-    worktreeHeld: (worktreePath) => Boolean(lifecycle.hold(worktreePath)), validateConversation: async (conversation) => {
+    worktreeHeld: (worktreePath) => Boolean(lifecycle.hold(worktreePath)) || checkpoints.holding(worktreePath), validateConversation: async (conversation) => {
     const target = await resolveWorktreeTarget(conversation);
     return () => {
       if (database.getConversation(conversation.id)?.archived) throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
@@ -788,6 +807,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const lifecycleHold = lifecycle.hold(target.worktreePath) ?? lifecycle.hold(conversation.worktreePath);
         if (lifecycleHold === "WORKTREE_LIFECYCLE_BUSY") throw apiError(409, "Worktree setup or teardown is running; start work when it finishes", { code: lifecycleHold });
         if (lifecycleHold) throw apiError(409, "Setup or teardown processes in this worktree are not confirmed stopped; acknowledge them in Worktree setup first", { code: lifecycleHold });
+        if (checkpoints.holding(target.worktreePath) || checkpoints.holding(conversation.worktreePath)) {
+          throw apiError(409, "A checkpoint restore is running in this worktree; start work when it finishes", { code: "CHECKPOINT_RESTORE_RUNNING" });
+        }
         const { run, message: userMessage } = database.submitRun({ conversationId: conversation.id, worktreePath: conversation.worktreePath, ...runConfig, prompt }, prompt);
         publish({ type: "message.created", conversationId: conversation.id, payload: userMessage });
         return json(response, 202, await agents.schedule({ conversation: database.getConversation(conversation.id), run }));
@@ -1064,6 +1086,25 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (lifecycleMatch[1] === "acknowledge") return json(response, 200, { state: lifecycle.acknowledge(target, acknowledgedRunId(body)) });
         return json(response, 202, { state: await lifecycle.setup(target, { acknowledgeUnconfirmed: acknowledgedRunId(body) }) });
       }
+      const checkpointMatch = url.pathname.match(/^\/api\/worktrees\/checkpoints(?:\/(inspect|diff|preview|restore|recover))?$/);
+      if (checkpointMatch && request.method === "GET" && ["inspect", "diff", undefined].includes(checkpointMatch[1])) {
+        const target = await resolveLifecycleTarget({ projectId: url.searchParams.get("projectId"), worktreePath: requiredQuery(url, "path") });
+        if (checkpointMatch[1] === "inspect") return json(response, 200, await checkpoints.inspect(target, requiredQuery(url, "id")));
+        if (checkpointMatch[1] === "diff") return json(response, 200, await checkpoints.fileDiff(target, { id: requiredQuery(url, "id"), tree: requiredQuery(url, "tree"), file: requiredQuery(url, "file") }));
+        return json(response, 200, await checkpoints.describe(target));
+      }
+      const checkpointAction = checkpointMatch && ((request.method === "POST" && !["inspect", "diff"].includes(checkpointMatch[1]))
+        || (request.method === "DELETE" && checkpointMatch[1] === undefined));
+      if (checkpointAction) {
+        const body = await readJson(request);
+        if (!body || typeof body !== "object" || Array.isArray(body)) throw apiError(400, "Worktree target is required");
+        const target = await resolveLifecycleTarget(body);
+        if (request.method === "DELETE") return json(response, 200, await checkpoints.remove(target, body.id));
+        if (checkpointMatch[1] === "preview") return json(response, 200, await checkpoints.preview(target, body.id));
+        if (checkpointMatch[1] === "restore") return json(response, 200, await checkpoints.restore(target, body));
+        if (checkpointMatch[1] === "recover") return json(response, 200, await checkpoints.recover(target, body.action));
+        return json(response, 201, { checkpoint: await checkpoints.capture(target, { label: body.label }) });
+      }
 
       if (url.pathname === "/api/templates" && request.method === "GET") return json(response, 200, { templates: database.listTemplates() });
       if (url.pathname === "/api/templates" && request.method === "POST") {
@@ -1163,7 +1204,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     let disposed = false;
     shutdownPromise = (async () => {
       const shutdownErrors = [];
-      const preliminaries = await Promise.allSettled([watcher?.close(), agents.shutdown(), accounts.close(), lifecycle.shutdown()]);
+      const preliminaries = await Promise.allSettled([watcher?.close(), agents.shutdown(), accounts.close(), lifecycle.shutdown(), checkpoints.shutdown()]);
       for (const result of preliminaries) if (result.status === "rejected") shutdownErrors.push(result.reason);
       // A failed agent shutdown may be the sole owner of an exited provider's
       // result while both SQLite and its recovery sidecar are unavailable.
@@ -1200,7 +1241,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     return shutdownPromise;
   }
 
-  return { attach, handleRequest, projects, publish, eventHub, database, agents, terminals, git, lifecycle, shutdown, withdrawReattach,
+  return { attach, handleRequest, projects, publish, eventHub, database, agents, terminals, git, lifecycle, checkpoints, shutdown, withdrawReattach,
     whenShutdownComplete: () => shutdownCompletion, whenRunRecoveryComplete: () => runRecovery.cycle };
   } catch (error) {
     runRecoveryController.abort();
