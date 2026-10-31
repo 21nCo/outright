@@ -358,10 +358,12 @@ function stepFailure(error, step, signal, capacity, mask) {
 
 // `agentWork(paths)` reports whether an agent run is queued, launching or
 // running in a worktree, and `interruptedRun(paths)` an interrupted run there
-// whose outcome the user has not resolved; `onRelease` is called when a
-// worktree is no longer held, so runs that waited for it can launch.
+// whose outcome the user has not resolved; `restoreHold(paths)` the code of
+// a checkpoint restore that is running or did not finish there, or null;
+// `onRelease` is called when a worktree is no longer held, so runs that
+// waited for it can launch.
 export function createWorktreeLifecycle({ database, subprocesses, publish = () => {}, readConfig = readLifecycleConfig,
-  identify = worktreeInstance, agentWork = () => false, interruptedRun = () => null, onRelease = () => {},
+  identify = worktreeInstance, agentWork = () => false, interruptedRun = () => null, restoreHold = () => null, onRelease = () => {},
   now = () => new Date().toISOString(), limits = LIFECYCLE_LIMITS, onPersistError = () => {} }) {
   // worktree path -> latest state; path -> claim of the running operation;
   // path -> live output of the latest run.
@@ -486,6 +488,11 @@ export function createWorktreeLifecycle({ database, subprocesses, publish = () =
     if (current) throw apiError(409, `Worktree ${current.phase} is already running`, { code: "WORKTREE_LIFECYCLE_BUSY", phase: current.phase });
     if (agentWork([...paths])) {
       throw apiError(409, `An agent run is queued or running in this worktree; ${phase} waits until it finishes`, { code: "WORKTREE_AGENT_ACTIVE", phase });
+    }
+    const restoring = restoreHold([...paths]);
+    if (restoring) {
+      throw apiError(409, restoring === "CHECKPOINT_RESTORE_RUNNING" ? `A checkpoint restore is running in this worktree; start ${phase} when it finishes`
+        : `A checkpoint restore in this worktree did not finish; finish it or keep the files in Checkpoints before ${phase}`, { code: restoring, phase });
     }
     // An interrupted run's processes are as unconfirmed as a step's.
     const interrupted = interruptedRun([...paths]);

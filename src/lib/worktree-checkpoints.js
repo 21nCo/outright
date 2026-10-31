@@ -41,6 +41,16 @@ export function toggleRestorePath(entries, selected, path, checked) {
   return next;
 }
 
+// The chosen paths as a restore names them: listed, or, for a large
+// selection, as every path offered except the ones left out, which is
+// shorter. The server applies either to the preview it confirms.
+export const EXPLICIT_PATHS = 1000;
+export function restoreSelection(entries, selected) {
+  if (selected.size <= EXPLICIT_PATHS) return { paths: [...selected] };
+  const except = entries.filter((entry) => !entry.blocked && !selected.has(entry.path)).map((entry) => entry.path);
+  return except.length < selected.size ? { except } : { paths: [...selected] };
+}
+
 // Why the confirmed restore cannot be sent yet, or null.
 export function restoreBlockedReason(preview, selected, terminalsAcknowledged) {
   if (preview.blockers.length) return preview.blockers.map((blocker) => blocker.message).join("; ");

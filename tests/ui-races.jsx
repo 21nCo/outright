@@ -9292,14 +9292,20 @@ async function worktreeCheckpointsRegression() {
     { path: "dir/inner.txt", index: null, file: { action: "create" }, coupled: ["dir"] },
   ];
   let previews = 0;
-  const preview = () => ({ checkpoint, planDigest: String(++previews).padStart(64, "0"), currentTree: "d".repeat(40),
-    head: { current: checkpoint.head, checkpoint: checkpoint.head, moved: false }, entries, blockers: [], terminals: [{ id: "t1", name: "zsh" }] });
+  const preview = (resume = false) => ({ checkpoint, planDigest: String(++previews).padStart(64, "0"), currentTree: "d".repeat(40), currentIndexTree: "e".repeat(40),
+    head: { current: checkpoint.head, checkpoint: checkpoint.head, moved: false }, entries: resume ? entries.slice(0, 1) : entries, blockers: [],
+    terminals: [{ id: "t1", name: "zsh" }], resume });
   const posts = [];
+  const diffs = [];
   let restoreAnswer = null;
   route = async (url, options) => {
     if (url.pathname === "/api/worktrees/checkpoints" && (options.method ?? "GET") === "GET") return response(detail);
+    if (url.pathname.endsWith("/diff")) {
+      diffs.push(Object.fromEntries(url.searchParams));
+      return response({ diff: `diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-now ${url.searchParams.get("side")}\n+then ${url.searchParams.get("side")}\n` });
+    }
     posts.push({ path: url.pathname, body: options.body ? JSON.parse(options.body) : null });
-    if (url.pathname.endsWith("/preview")) return response(preview());
+    if (url.pathname.endsWith("/preview")) return response(preview(JSON.parse(options.body).resume === true));
     if (url.pathname.endsWith("/restore")) return restoreAnswer();
     if (url.pathname.endsWith("/recover")) { detail = { ...detail, restore: null }; return response({ restored: 3 }); }
     return response({});
@@ -9309,7 +9315,7 @@ async function worktreeCheckpointsRegression() {
   root.render(<TooltipProvider><WorktreeCheckpointsDialog open onOpenChange={() => {}} project={project} worktree={worktree} events={events} onError={(error) => errors.push(error)} /></TooltipProvider>);
   const dialog = () => document.querySelector(".checkpoint-dialog");
   const button = (name) => [...(dialog()?.querySelectorAll("button") ?? [])].find((item) => item.textContent.trim() === name || item.getAttribute("aria-label") === name);
-  const restoreButton = () => [...dialog().querySelectorAll("button")].find((item) => /^Restore \d/.test(item.textContent));
+  const restoreButton = () => [...dialog().querySelectorAll("button")].find((item) => /^(?:Restore|Finish restoring) \d/.test(item.textContent));
   const box = (path) => [...(dialog()?.querySelectorAll(".checkpoint-paths li") ?? [])].find((item) => item.querySelector("code")?.textContent === path)?.querySelector('input[type="checkbox"]');
   const confirmTerminals = () => dialog().querySelector(".checkpoint-preview .lifecycle-acknowledge input").click();
   await until(() => button("Restore Before agent"), "the checkpoint was not listed with a restore control");
@@ -9317,6 +9323,14 @@ async function worktreeCheckpointsRegression() {
   button("Restore Before agent").click();
   await until(() => box("a.txt"), "the restore preview did not open");
   assert(box("cache").disabled && !box("cache").checked, "a blocked path was offered");
+  // A path whose index entry changes offers its staged difference apart from its file's.
+  button("Show staged difference for a.txt").click();
+  await until(() => /then index/.test(dialog().querySelector(".checkpoint-diff")?.textContent ?? ""), "the staged difference was not shown");
+  assert(diffs.at(-1).side === "index" && diffs.at(-1).tree === "e".repeat(40), "the staged difference did not compare the previewed index");
+  assert(!button("Show staged difference for dir"), "a path whose index does not change offered a staged difference");
+  button("Show file difference for a.txt").click();
+  await until(() => /then files/.test(dialog().querySelector(".checkpoint-diff")?.textContent ?? ""), "the file difference was not shown");
+  assert(diffs.at(-1).side === "files" && diffs.at(-1).tree === "d".repeat(40), "the file difference did not compare the previewed files");
   assert(restoreButton().disabled, "restore was possible before the open terminal was confirmed");
   box("dir/inner.txt").click();
   await until(() => !box("dir").checked && !box("dir/inner.txt").checked, "a file/directory swap was not cleared together");
@@ -9342,11 +9356,26 @@ async function worktreeCheckpointsRegression() {
   // A restarted runtime reports an interrupted restore without an event.
   detail = { ...detail, restore: { status: "interrupted", checkpointId: checkpoint.id, safetyCheckpointId: "lx1abd-0123abce", paths: 3 } };
   events.dispatchEvent(new CustomEvent("reconnect"));
-  await until(() => button("Finish restore") && button("Keep files as they are"), "an interrupted restore did not offer finish and keep");
+  await until(() => button("Finish restore…") && button("Keep files as they are"), "an interrupted restore did not offer finish and keep");
   assert(button("Restore Before agent").disabled, "a new restore was offered over an interrupted one");
-  button("Finish restore").click();
-  await until(() => !button("Finish restore"), "finishing the restore left it reported as interrupted");
-  assert(posts.at(-1).path === "/api/worktrees/checkpoints/recover" && posts.at(-1).body.action === "resume", "finishing did not resume the restore");
+  // Finishing is previewed and confirmed like any restore, against the state now.
+  button("Finish restore…").click();
+  await until(() => box("a.txt") && /Finish restoring/.test(dialog().querySelector(".checkpoint-preview h3")?.textContent ?? ""), "finishing the restore did not open its preview");
+  assert(posts.at(-1).path.endsWith("/preview") && posts.at(-1).body.resume === true, "the finish preview did not ask for the unfinished restore");
+  confirmTerminals();
+  restoreAnswer = () => { detail = { ...detail, restore: null }; return response({ restored: 1, safetyCheckpoint: { ...checkpoint, id: "lx1abe-0123abcf", label: "Before finishing", reason: "before-restore" } }); };
+  await until(() => restoreButton() && !restoreButton().disabled, "the finish preview could not be confirmed");
+  restoreButton().click();
+  await until(() => /Finished the restore of 1 path/.test(dialog().querySelector(".lifecycle-summary")?.textContent ?? "") && !button("Finish restore…"), "finishing the restore left it reported as interrupted");
+  const finished = posts.at(-1);
+  assert(finished.path.endsWith("/restore") && finished.body.resume === true && finished.body.planDigest === String(previews).padStart(64, "0")
+    && finished.body.paths.join() === "a.txt", "finishing did not confirm its own preview");
+
+  // Git processes the restore lost track of keep both choices closed.
+  detail = { ...detail, restore: { status: "interrupted", checkpointId: checkpoint.id, safetyCheckpointId: "lx1abd-0123abce", paths: 1, ownerUnconfirmed: true } };
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => button("Finish restore…")?.disabled && button("Keep files as they are")?.disabled, "unconfirmed Git processes left finish or keep open");
+  assert(/not confirmed stopped/.test(dialog().textContent), "the dialog did not say why the restore cannot be finished");
   assert(!errors.length, `unexpected errors: ${errors.map((error) => error.message).join("; ")}`);
 }
 

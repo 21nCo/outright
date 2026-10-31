@@ -3,7 +3,10 @@ import { access, readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { utilityBudgetUnavailable, utilityProcesses } from "./subprocess-budget.mjs";
 
-export function createGitService({ database, getProjects, getConfig, subprocesses = utilityProcesses }) {
+// `admitWriter(cwd)` admits a stage, unstage or commit in a worktree, or
+// throws while a checkpoint restore holds it; it returns the release that
+// ends the admission. Check and admission are synchronous.
+export function createGitService({ database, getProjects, getConfig, subprocesses = utilityProcesses, admitWriter = () => () => {} }) {
   const git = (cwd, args, overrides = {}) => runGit(subprocesses, cwd, args, overrides);
   const safeGit = async (cwd, args, overrides = {}) => {
     try { return await git(cwd, args, overrides); }
@@ -102,24 +105,34 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
   async function stage(worktreePath, files) {
     const cwd = await requireWorktree(worktreePath);
     const validated = await validateFiles(cwd, files);
-    await auditedMutation("git.stage.requested", "git.stage", { target: cwd, files: validated },
-      () => git(cwd, ["add", "--", ...validated]));
+    const release = admitWriter(cwd);
+    try {
+      await auditedMutation("git.stage.requested", "git.stage", { target: cwd, files: validated },
+        () => git(cwd, ["add", "--", ...validated]));
+    } finally { release(); }
     return statusAfterMutation(cwd);
   }
 
   async function unstage(worktreePath, files) {
     const cwd = await requireWorktree(worktreePath);
     const validated = await validateFiles(cwd, files);
-    await auditedMutation("git.unstage.requested", "git.unstage", { target: cwd, files: validated },
-      () => unstagePaths(cwd, validated));
+    const release = admitWriter(cwd);
+    try {
+      await auditedMutation("git.unstage.requested", "git.unstage", { target: cwd, files: validated },
+        () => unstagePaths(cwd, validated));
+    } finally { release(); }
     return statusAfterMutation(cwd);
   }
 
   async function commit(worktreePath, message) {
     const cwd = await requireWorktree(worktreePath);
     if (!message?.trim()) throw httpError(400, "Commit message is required");
-    const output = await auditedMutation("git.commit.requested", "git.commit", { target: cwd, message: message.trim() },
-      () => git(cwd, ["commit", "-m", message.trim()], { maxBuffer: 8 * 1024 * 1024 }));
+    const release = admitWriter(cwd);
+    let output;
+    try {
+      output = await auditedMutation("git.commit.requested", "git.commit", { target: cwd, message: message.trim() },
+        () => git(cwd, ["commit", "-m", message.trim()], { maxBuffer: 8 * 1024 * 1024 }));
+    } finally { release(); }
     const refreshed = await statusAfterMutation(cwd);
     return { output, status: refreshed.refreshDeferred ? null : refreshed, refreshDeferred: refreshed.refreshDeferred ?? false };
   }
