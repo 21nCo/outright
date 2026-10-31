@@ -9548,7 +9548,7 @@ async function worktreeCheckpointsRegression() {
 
   // An action that disables the focused trigger keeps keyboard focus on an
   // enabled control in the dialog while pending and after its outcome.
-  const press = async (control) => { control.focus(); if (window.__fixtureSendKey) await window.__fixtureSendKey("Enter"); else control.click(); };
+  const press = async (control) => { await until(() => !control.disabled, "the control to press stayed disabled"); control.focus(); if (window.__fixtureSendKey) await window.__fixtureSendKey("Enter"); else control.click(); };
   const held = () => { let release; const promise = new Promise((resolve) => { release = resolve; }); return { promise, release }; };
   const typeLabel = (text) => {
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(labelField(), text);
@@ -9597,6 +9597,18 @@ async function worktreeCheckpointsRegression() {
   typeLabel("Another");
   await until(() => !retryAction(), "a changed label kept the old capture's Retry");
   typeLabel("");
+  // So is a label typed while the capture is pending: its failure has no Retry.
+  const pendingCapture = held();
+  once.set("POST /api/worktrees/checkpoints", () => pendingCapture.promise.then(() => response({ error: "The disk is full" }, 507)));
+  await press(button("Take checkpoint"));
+  await until(() => button("Take checkpoint").disabled, "the capture did not start");
+  typeLabel("Typed while pending");
+  await until(() => labelField().value === "Typed while pending", "the label was not typed");
+  pendingCapture.release();
+  await until(() => /The disk is full/.test(alertText()) && !button("Take checkpoint").disabled, "a failed capture was not reported in the dialog");
+  await settle();
+  assert(!retryAction(), "Retry would take the checkpoint with the label from before the user typed");
+  typeLabel("");
 
   // Inspect: focus stays in the dialog while it loads, a failure offers Retry.
   const inspectHeld = held();
@@ -9631,6 +9643,74 @@ async function worktreeCheckpointsRegression() {
   assert(button("Confirm delete") && !button("Confirm delete").disabled, "a failed delete dropped its confirmation");
   await press(retryAction());
   await until(() => /Deleted/.test(notice()) && !retryAction(), "Retry did not delete the checkpoint");
+  // DELETEs the fixture answered itself, by checkpoint id.
+  const deleted = () => posts.filter((post) => post.path === "/api/worktrees/checkpoints" && !("label" in post.body)).map((post) => post.body.id);
+  assert(deleted().at(-1) === checkpoint.id, "Retry did not delete the checkpoint whose deletion was confirmed");
+  // Retry repeats only the current intent: Keep, or asking to delete another
+  // checkpoint, cancels a failed delete, and no Retry deletes without it.
+  const other = { ...checkpoint, id: "lx1abi-0123abd3", label: "Other" };
+  detail = { ...detail, checkpoints: [checkpoint, other] };
+  events.dispatchEvent(new CustomEvent("reconnect"));
+  await until(() => button("Delete Other"), "the second checkpoint was not listed");
+  const deletes = deleted().length;
+  const failDelete = async () => {
+    button("Delete Before agent").click();
+    await until(() => button("Confirm delete"), "delete did not ask for confirmation");
+    once.set("DELETE /api/worktrees/checkpoints", () => response({ error: "The checkpoint is in use" }, 409));
+    await press(button("Confirm delete"));
+    await until(() => retryAction() && /in use/.test(alertText()), "a failed delete was not reported in the dialog with Retry");
+  };
+  await failDelete();
+  button("Keep").click();
+  await until(() => !button("Confirm delete") && button("Delete Before agent"), "Keep did not cancel the failed delete");
+  await settle();
+  assert(!retryAction(), "Keep left a Retry that deletes the checkpoint without its confirmation");
+  button("Delete Before agent").click();
+  await until(() => button("Confirm delete"), "delete did not ask for confirmation");
+  await settle();
+  assert(!retryAction(), "asking to delete again brought back the cancelled delete's Retry");
+  button("Keep").click();
+  await until(() => !button("Confirm delete"), "Keep did not cancel the delete");
+  await failDelete();
+  button("Delete Other").click();
+  await until(() => button("Confirm delete") && !button("Delete Other"), "delete did not ask to confirm the other checkpoint");
+  await settle();
+  assert(!retryAction(), "asking to delete another checkpoint left a Retry that deletes the first");
+  assert(deleted().length === deletes, `a checkpoint was deleted without its confirmation: ${deleted().slice(deletes).join()}`);
+  button("Keep").click();
+  await until(() => !button("Confirm delete") && button("Inspect Other") && !button("Inspect Other").disabled, "Keep did not cancel the delete");
+  // Nor does Retry inspect a checkpoint the reread no longer lists.
+  once.set("GET /api/worktrees/checkpoints/inspect", () => { detail = { ...detail, checkpoints: [checkpoint] }; return response({ error: "The checkpoint is gone" }, 404); });
+  await press(button("Inspect Other"));
+  await until(() => /is gone/.test(alertText()) && !button("Delete Other") && !button("Take checkpoint").disabled, "a failed inspect was not reported");
+  await settle();
+  assert(!retryAction(), "a checkpoint no longer listed kept its inspect Retry");
+
+  // Keep files and Finish restore… retry only the same interrupted restore:
+  // a reread that clears its record leaves the failure without Retry.
+  const interrupt = async (name) => {
+    detail = { ...detail, restore: { status: "interrupted", checkpointId: checkpoint.id, safetyCheckpointId: "lx1abd-0123abce", paths: 1 } };
+    events.dispatchEvent(new CustomEvent("reconnect"));
+    await until(() => button(name) && !button(name).disabled, `an interrupted restore did not offer ${name}`);
+  };
+  await interrupt("Keep files as they are");
+  once.set("POST /api/worktrees/checkpoints/recover", () => response({ error: "The files could not be kept" }, 500));
+  await press(button("Keep files as they are"));
+  await until(() => retryAction() && /could not be kept/.test(alertText()), "a failed keep was not reported in the dialog with Retry");
+  await press(retryAction());
+  await until(() => /files were kept/.test(notice()) && !retryAction() && !button("Keep files as they are"), "Retry did not keep the files");
+  await interrupt("Keep files as they are");
+  once.set("POST /api/worktrees/checkpoints/recover", () => { detail = { ...detail, restore: null }; return response({ error: "The files could not be kept" }, 500); });
+  await press(button("Keep files as they are"));
+  await until(() => /could not be kept/.test(alertText()) && !button("Keep files as they are") && !button("Take checkpoint").disabled, "a failed keep was not reported");
+  await settle();
+  assert(!retryAction(), "a keep whose interrupted restore is gone kept its Retry");
+  await interrupt("Finish restore…");
+  once.set("POST /api/worktrees/checkpoints/preview", () => { detail = { ...detail, restore: null }; return response({ error: "The restore record changed" }, 500); });
+  await press(button("Finish restore…"));
+  await until(() => /record changed/.test(alertText()) && !button("Finish restore…") && !button("Take checkpoint").disabled, "a failed finish was not reported");
+  await settle();
+  assert(!retryAction(), "a finish whose interrupted restore is gone kept its Retry");
 
   // Preview: a failed difference keeps the chosen paths, a failed restore
   // keeps the preview and its confirmation; Retry repeats each.
@@ -9664,7 +9744,7 @@ async function worktreeCheckpointsRegression() {
 
   // A request left over from a closed dialog neither disables the reopened
   // one nor reaches it: not its busy state, not a later preview.
-  button("Restore Before agent").click();
+  await press(button("Restore Before agent"));
   await until(() => box("a.txt"), "the restore preview did not open");
   const oldDiff = held();
   diffGate = oldDiff.promise;

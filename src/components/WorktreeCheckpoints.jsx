@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { WarningCircle } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -92,7 +92,8 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
     };
   }, [open, load, events, worktree.path]);
 
-  // A changed label or view is a new intent, so Retry no longer repeats the old one.
+  // Retry repeats a failed action only while all it acted on is unchanged: `intent`, a new object whenever the label, view, delete confirmation, listed checkpoints or restore record change.
+  const intent = useMemo(() => ({}), [label, view, confirmDelete, JSON.stringify([detail?.restore, detail?.checkpoints.map((item) => item.id)])]);
   useEffect(() => setFailure(null), [label, view]);
   // `work` gets `live()`, false once the dialog closed after it started. A failure
   // stays until an action succeeds; the list is reread so Retry starts from it.
@@ -101,7 +102,7 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
     const live = () => session === sessionRef.current;
     setBusy(true);
     try { await work(live); if (live()) setFailure(null); }
-    catch (error) { if (live()) { setFailure({ message: error.message, retry: work }); void load(); } }
+    catch (error) { if (live()) { setFailure({ message: error.message, retry: work, intent }); void load(); } }
     finally { if (live()) setBusy(false); }
   }
   const capture = () => act(async (live) => {
@@ -191,7 +192,7 @@ export function WorktreeCheckpointsDialog({ open, onOpenChange, project, worktre
     {loadError && <div className="lifecycle-error" role="alert"><p>{loadError}</p>
       <Button size="sm" variant="outline" data-checkpoint-action="retry" onClick={() => void load(LABEL_FIELD)}>Retry</Button></div>}
     {failure && <div className="lifecycle-error" role="alert"><p>{failure.message}</p>
-      <Button size="sm" variant="outline" data-checkpoint-action="retry-action" disabled={busy} onClick={() => void act(failure.retry)}>Retry</Button></div>}
+      {failure.intent === intent && <Button size="sm" variant="outline" data-checkpoint-action="retry-action" disabled={busy} onClick={() => void act(failure.retry)}>Retry</Button>}</div>}
     {!detail && !loadError && <p className="lifecycle-note" role="status">Reading checkpoints…</p>}
     {detail?.restore?.status === "running" && <p className="lifecycle-note" role="status">A restore is running in this worktree. Agent runs, setup and Git changes here wait until it finishes.</p>}
     {interrupted && !view && <div className="lifecycle-error" role="alert">
