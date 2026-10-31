@@ -724,6 +724,60 @@ test("a Git write that lost its process keeps the worktree held after a restart,
   assert.equal(checkpoints.holding(repository), null);
 });
 
+test("a Git write is recorded before it runs, so a runtime that stops during it leaves the worktree held after a restart", async (t) => {
+  const { repository } = await fixture(t);
+  const marker = path.join(repository, ".git", WRITE_MARKER);
+  let unknown = 0;
+  const capacity = () => ({ active: 0, limit: 8, unknown });
+  const first = service({ capacity });
+  const checkpoint = await first.checkpoints.capture(target(repository));
+  await writeFile(path.join(repository, "a.txt"), "current\n");
+
+  // Writes admitted by this runtime hold their own marker: they do not hold
+  // each other, and a reconcile meanwhile leaves the marker in place.
+  const releaseOne = first.checkpoints.admitWriter([repository]);
+  await lstat(marker);
+  assert.equal(first.checkpoints.holding(repository), null);
+  const releaseTwo = first.checkpoints.admitWriter([repository]);
+  assert.equal(first.checkpoints.reconcile(), true);
+  releaseOne();
+  releaseOne(Object.assign(new Error("late"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN" }));
+  await lstat(marker);
+  releaseTwo();
+  await assert.rejects(lstat(marker), { code: "ENOENT" });
+  assert.equal(first.checkpoints.holding(repository), null, "a second call of a release held the worktree");
+
+  // The runtime stops while a write is admitted; its Git process may live on.
+  first.checkpoints.admitWriter([repository]);
+  unknown = 1;
+  let released = 0;
+  const { checkpoints } = service({ capacity, onRelease: () => { released += 1; } });
+  assert.equal(checkpoints.holding(repository), "GIT_WRITE_UNCONFIRMED");
+  const preview = await checkpoints.preview(target(repository), checkpoint.id);
+  assert.deepEqual(preview.blockers.map((item) => item.code), ["GIT_WRITE_UNCONFIRMED"]);
+  const request = { id: checkpoint.id, planDigest: preview.planDigest, paths: ["a.txt"] };
+  await assert.rejects(checkpoints.restore(target(repository), request), (error) => error.details.blockers?.[0].code === "GIT_WRITE_UNCONFIRMED");
+  assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "current\n");
+
+  unknown = 0;
+  assert.equal(checkpoints.reconcile(), true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(released, 1);
+  await assert.rejects(lstat(marker), { code: "ENOENT" });
+  await checkpoints.restore(target(repository), request);
+  assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "committed\n");
+});
+
+test("a Git write that cannot be recorded does not run", { skip: process.platform === "win32" && "a directory in the marker's place is enough on POSIX" }, async (t) => {
+  const { repository } = await fixture(t);
+  const { checkpoints } = service({ capacity: () => ({ active: 0, limit: 8, unknown: 0 }) });
+  await mkdir(path.join(repository, ".git", WRITE_MARKER, "inside"), { recursive: true });
+  assert.throws(() => checkpoints.admitWriter([repository]), (error) => error.statusCode === 503 && error.details.code === "GIT_WRITE_UNRECORDED");
+  await rm(path.join(repository, ".git", WRITE_MARKER), { recursive: true });
+  checkpoints.admitWriter([repository])();
+  await assert.rejects(lstat(path.join(repository, ".git", WRITE_MARKER)), { code: "ENOENT" });
+});
+
 test("a checkpoint keeps each file's type on disk, whatever its index entry is", async (t) => {
   const { repository } = await fixture(t);
   await symlink("a.txt", path.join(repository, "link"));

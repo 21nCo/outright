@@ -37,8 +37,10 @@ export const CHECKPOINT_REF_PREFIX = "refs/worktree/outright/checkpoints/";
 // anything and removed once it has finished; while it is there, the restore
 // did not finish and the worktree is held against other writers.
 export const RESTORE_MARKER = "outright-checkpoint-restore.json";
-// Written beside it when a stage, unstage or commit loses track of its Git
-// process, and removed once no such process is left.
+// Written beside it when a stage, unstage or commit is admitted, before its
+// Git process starts, and removed when it ends with its process accounted
+// for; one that lost track of its process, or a runtime that stopped while
+// one was admitted, leaves it until no process with a lost owner is left.
 export const WRITE_MARKER = "outright-git-write-unconfirmed";
 const ID_PATTERN = /^[0-9a-z]{6,12}-[0-9a-f]{8}$/;
 const OID_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
@@ -137,16 +139,27 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     unconfirmed.clear();
     strays.clear();
     for (const value of released) {
-      const gitDir = gitDirOf(value);
-      try { if (gitDir) rmSync(path.join(gitDir, WRITE_MARKER), { force: true }); }
-      catch { strays.add(value); }
+      // A write admitted now keeps its own marker until it ends.
+      if (!writing(value)) {
+        try { removeWriteMarker(value); }
+        catch { strays.add(value); }
+      }
       changed(value);
     }
     if (released.length) queueMicrotask(onRelease);
     return true;
   }
+  function writing(worktreePath) {
+    return [...admitted].some((token) => token.kind === "git" && token.paths.has(worktreePath));
+  }
+  function removeWriteMarker(worktreePath) {
+    const gitDir = gitDirOf(worktreePath);
+    if (gitDir) rmSync(path.join(gitDir, WRITE_MARKER), { force: true });
+  }
+  // While a write admitted by this runtime runs, the marker is its own; it is
+  // admitted only once any marker left before it was found stale.
   function strayWrite(worktreePath) {
-    if (!strays.has(worktreePath) && !markerPresent(worktreePath, WRITE_MARKER)) return false;
+    if (!strays.has(worktreePath) && (writing(worktreePath) || !markerPresent(worktreePath, WRITE_MARKER))) return false;
     strays.add(worktreePath);
     return !reconcile();
   }
@@ -163,22 +176,42 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
 
   // Admits an application-owned writer (a Git stage, unstage or commit, or
   // a terminal launch) unless a restore holds the worktree; a restore is
-  // refused while one is admitted. Synchronous, as `claim` is. Returns the
-  // release, which takes the write's failure: a Git write that lost track of
-  // its process keeps the worktree held, across restarts too.
+  // refused while one is admitted. Synchronous, as `claim` is. A Git write
+  // is recorded in WRITE_MARKER before it is admitted, so a runtime that
+  // stops while it runs leaves the worktree held after a restart. Returns
+  // the release, which takes the write's failure: a Git write that lost
+  // track of its process keeps the worktree held, across restarts too.
   function admitWriter(paths, kind = "git") {
     const code = paths.map(holding).find(Boolean);
     if (code) throw checkpointError(409, holdMessage(code, "try again"), code);
     const token = { paths: new Set(paths), kind };
-    admitted.add(token);
-    return (error) => {
-      admitted.delete(token);
-      if (kind !== "git" || !ownershipUnknown(error)) return;
+    if (kind === "git") {
+      const stamp = `${now().toISOString()}\n`;
       for (const value of paths) {
-        strays.add(value);
         const gitDir = gitDirOf(value);
-        try { if (gitDir) writeFileSync(path.join(gitDir, WRITE_MARKER), `${now().toISOString()}\n`, { mode: 0o600 }); }
-        catch { /* Held in memory until the process is proven gone. */ }
+        try {
+          if (!gitDir) throw new Error("No Git directory");
+          writeFileSync(path.join(gitDir, WRITE_MARKER), stamp, { mode: 0o600 });
+        } catch (error) {
+          // Nothing durable says the write ran, so it does not run.
+          for (const written of paths) if (!writing(written)) try { removeWriteMarker(written); } catch { strays.add(written); }
+          throw checkpointError(503, "Outright could not record this Git write in the worktree's Git directory; try again", "GIT_WRITE_UNRECORDED", {}, error);
+        }
+      }
+    }
+    admitted.add(token);
+    let open = true;
+    return (error) => {
+      if (!open) return;
+      open = false;
+      admitted.delete(token);
+      if (kind !== "git") return;
+      const lost = ownershipUnknown(error);
+      for (const value of paths) {
+        if (lost) strays.add(value);
+        if (strays.has(value) || writing(value)) continue;
+        try { removeWriteMarker(value); }
+        catch { strays.add(value); }
       }
     };
   }

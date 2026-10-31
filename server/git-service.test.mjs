@@ -7,6 +7,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { createGitService } from "./git-service.mjs";
+import { WRITE_MARKER, createWorktreeCheckpoints } from "./worktree-checkpoints.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { createOutrightDatabase } from "./database.mjs";
 
@@ -82,6 +83,74 @@ test("unknown native utility ownership preserves Git mutation admission for insp
     assert.deepEqual(actions, ["git.stage.requested"], "an uncertain native outcome was recorded as a failed mutation");
     await assert.rejects(service.commit(repository, "uncertain"), (error) => error.details?.outcomeUnknown === true);
     assert.deepEqual(released, ["SUBPROCESS_OWNERSHIP_UNKNOWN", "SUBPROCESS_OWNERSHIP_UNKNOWN"]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("stage, unstage and commit pass the checkpoint writer fence: refused before Git, released once, and held across a restart", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-git-fence-"));
+  try {
+    const repository = await stagedTrackedFixture(root);
+    const writes = new Set(["add", "restore", "reset", "rm", "update-index", "commit"]);
+    const spawned = [];
+    const actions = [];
+    let hang = false;
+    const service = (admitWriter) => createGitService({
+      database: { auditAdmission: (action) => actions.push(action), auditCritical: (action) => actions.push(action) },
+      getProjects: () => [{ worktrees: [{ path: repository }] }],
+      getConfig: async () => ({ scanRoots: [root] }),
+      subprocesses: { run: (file, args, options) => {
+        spawned.push(args[2]);
+        // A write that never ends: the runtime stops while it runs.
+        if (hang && writes.has(args[2])) return new Promise(() => {});
+        return execFileAsync(file, args, options);
+      } },
+      admitWriter,
+    });
+    const operations = [
+      ["stage", (git) => git.stage(repository, ["tracked.txt"])],
+      ["unstage", (git) => git.unstage(repository, ["tracked.txt"])],
+      ["commit", (git) => git.commit(repository, "fenced")],
+    ];
+
+    // A held worktree refuses each write before any Git process or audit admission.
+    const held = service(() => { throw Object.assign(new Error("held"), { statusCode: 409, details: { code: "CHECKPOINT_RESTORE_RUNNING" } }); });
+    for (const [, run] of operations) {
+      await assert.rejects(run(held), (error) => error.details?.code === "CHECKPOINT_RESTORE_RUNNING");
+    }
+    assert.deepEqual(spawned, [], "a refused write started Git");
+    assert.deepEqual(actions, [], "a refused write recorded an admission");
+
+    // Each admitted write ends its admission exactly once, with no failure.
+    const releases = [];
+    const open = service(() => (...args) => releases.push(args));
+    await operations[1][1](open);
+    await operations[0][1](open);
+    await operations[2][1](open);
+    assert.deepEqual(releases, [[], [], []]);
+
+    // A runtime that stops while a write runs leaves the worktree held, by
+    // the Git directory and the utility budget alone, until no process with
+    // a lost owner is left.
+    let unknown = 1;
+    const capacity = () => ({ active: 0, limit: 8, unknown });
+    const subprocesses = { run: (file, args, options) => execFileAsync(file, args, options), capacity };
+    const database = { auditAdmission: () => {}, auditCritical: () => {} };
+    for (const [name, run] of operations) {
+      unknown = 1;
+      const before = createWorktreeCheckpoints({ database, subprocesses });
+      hang = true;
+      spawned.length = 0;
+      run(service((paths) => before.admitWriter([paths])));
+      while (!spawned.some((command) => writes.has(command))) await new Promise((resolve) => setImmediate(resolve));
+      hang = false;
+      const after = createWorktreeCheckpoints({ database, subprocesses });
+      assert.equal(after.holding(repository), "GIT_WRITE_UNCONFIRMED", `${name} left no durable hold`);
+      assert.throws(() => after.admitWriter([repository]), (error) => error.details?.code === "GIT_WRITE_UNCONFIRMED");
+      assert.equal(after.reconcile(), false);
+      unknown = 0;
+      assert.equal(after.holding(repository), null, `${name} stayed held once its process was proven gone`);
+      await assert.rejects(access(path.join(repository, ".git", WRITE_MARKER)), { code: "ENOENT" });
+    }
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
