@@ -509,9 +509,9 @@ for (const autocrlf of ["true", "false"]) {
     await git(repository, ["config", "core.autocrlf", autocrlf]);
     await git(repository, ["config", "filter.upper.clean", "tr a-z A-Z"]);
     await git(repository, ["config", "filter.upper.smudge", "tr A-Z a-z"]);
-    await writeFile(path.join(repository, ".gitattributes"), "*.crlf text eol=crlf\n*.up filter=upper\n*.id ident\n");
-    const names = ["run.sh", "doc.crlf", "note.up", "version.id"];
-    for (const name of names) await writeFile(path.join(repository, name), name === "version.id" ? "$Id$\n" : "LINE\nNEXT\n");
+    await writeFile(path.join(repository, ".gitattributes"), "*.crlf text eol=crlf\n*.up filter=upper\n*.id ident\n*.u16 working-tree-encoding=UTF-16LE-BOM\n");
+    const names = ["run.sh", "doc.crlf", "note.up", "version.id", "wide.u16"];
+    for (const name of names) await writeFile(path.join(repository, name), name === "version.id" ? "$Id$\n" : name === "wide.u16" ? Buffer.from("\ufeffLINE\nNEXT\n", "utf16le") : "LINE\nNEXT\n");
     await git(repository, ["add", "."]);
     await git(repository, ["commit", "-qm", "converted on checkout"]);
     // Checked out again, each file is CRLF, smudged or expanded on disk, and Git sees it unchanged.
@@ -521,13 +521,80 @@ for (const autocrlf of ["true", "false"]) {
     const eol = autocrlf === "true" ? "\r\n" : "\n";
     assert.deepEqual(names.slice(0, 3).map((name) => String(files[name])), [`LINE${eol}NEXT${eol}`, "LINE\r\nNEXT\r\n", `line${eol}next${eol}`]);
     assert.match(String(files["version.id"]), new RegExp(`^\\$Id: [0-9a-f]+ \\$${eol}$`));
+    assert.deepEqual(files["wide.u16"], Buffer.from(`\ufeffLINE${eol}NEXT${eol}`, "utf16le"));
+    // Older than the index, as a checkout usually is, so Git trusts their stat data (a capture compares racy files without filters).
+    for (const name of names) await utimes(path.join(repository, name), new Date(Date.now() - 10_000), new Date(Date.now() - 10_000));
+    await git(repository, ["update-index", "-q", "--refresh"]);
     assert.equal(await status(repository), "");
     const { checkpoints } = service();
     const checkpoint = await checkpoints.capture(target(repository));
+    // Unchanged to Git, so neither counted nor listed.
+    assert.deepEqual(checkpoint.counts, { staged: 0, unstaged: 0, untracked: 0 });
+    assert.deepEqual((await checkpoints.inspect(target(repository), checkpoint.id)).entries, []);
     for (const name of names) await writeFile(path.join(repository, name), "edited\n");
     await restoreAll(checkpoints, repository, checkpoint.id);
     for (const name of names) assert.deepEqual(await readFile(path.join(repository, name)), files[name], `${name} changed on its way back`);
     assert.equal(await status(repository), "");
+  });
+}
+
+test("a clean checkout Git converted is never refused or counted, has no read of files Git has not converted, and skips sparse paths", async (t) => {
+  const { repository } = await fixture(t);
+  await writeFile(path.join(repository, ".gitattributes"), "* text=auto\n");
+  const names = ["t1.txt", "t2.txt", "t3.txt", "t4.txt", "t5.txt", "s/out1.txt", "s/out2.txt", "s/out3.txt"];
+  await mkdir(path.join(repository, "s"));
+  for (const name of names) await writeFile(path.join(repository, name), `${name}\nnext\n`);
+  await git(repository, ["add", "."]);
+  await git(repository, ["commit", "-qm", "text"]);
+  const limited = service({ limits: { ...CHECKPOINT_LIMITS, files: 3, planEntries: 6 } }).checkpoints;
+  const opened = [];
+  const fsp = createRequire(import.meta.url)("node:fs/promises"), open = fsp.open;
+  fsp.open = (...args) => { opened.push(path.basename(String(args[0]))); return open(...args); };
+  syncBuiltinESMExports();
+  t.after(() => { fsp.open = open; syncBuiltinESMExports(); });
+  // LF on disk, now with CRLF configured, and Git sees it unchanged: nothing is read and the index entries are recorded.
+  await git(repository, ["config", "core.autocrlf", "true"]);
+  assert.equal(await status(repository), "");
+  const unread = await limited.capture(target(repository));
+  assert.deepEqual(unread.counts, { staged: 0, unstaged: 0, untracked: 0 });
+  assert.deepEqual(opened.filter((name) => names.some((file) => file.endsWith(name))), []);
+  // Checked out again as CRLF, more files than the bound: recorded as on disk, and still no change.
+  await git(repository, ["sparse-checkout", "set", "--no-cone", "/*", "!/s/"]);
+  for (const name of names.slice(0, 5)) await rm(path.join(repository, name));
+  await git(repository, ["checkout", "--", ...names.slice(0, 5)]);
+  assert.equal(await status(repository), "");
+  const crlf = await limited.capture(target(repository));
+  assert.deepEqual(crlf.counts, { staged: 0, unstaged: 0, untracked: 0 });
+  assert.deepEqual((await limited.inspect(target(repository), crlf.id)).entries, []);
+  const { checkpoints } = service();
+  await writeFile(path.join(repository, "t1.txt"), "edited\n");
+  const { preview } = await restoreAll(checkpoints, repository, crlf.id);
+  assert.deepEqual(preview.entries.map((entry) => entry.path), ["t1.txt"]);
+  assert.equal(await readFile(path.join(repository, "t1.txt"), "utf8"), "t1.txt\r\nnext\r\n");
+  assert.equal(await status(repository), "");
+  await assert.rejects(lstat(path.join(repository, "s", "out1.txt")), { code: "ENOENT" });
+});
+
+for (const symlinks of ["true", "false"]) {
+  test(`a restore refuses a link over the per-file bound that the checkpoint kept from its commit, before anything changes (core.symlinks ${symlinks})`, { skip: process.platform === "win32" && symlinks === "true" && "links need privileges on Windows" }, async (t) => {
+    const { repository } = await fixture(t);
+    await git(repository, ["config", "core.symlinks", symlinks]);
+    const blob = execFileSync("git", ["-C", repository, "hash-object", "-w", "--stdin"], { input: "t".repeat(100) }).toString().trim();
+    await git(repository, ["update-index", "--add", "--cacheinfo", `120000,${blob},link`]);
+    await git(repository, ["commit", "-qm", "long link"]);
+    await git(repository, ["checkout", "--", "link"]);
+    const { checkpoints } = service({ limits: { ...CHECKPOINT_LIMITS, fileBytes: 64 } });
+    const checkpoint = await checkpoints.capture(target(repository));
+    await git(repository, ["rm", "-q", "link"]);
+    await writeFile(path.join(repository, "a.txt"), "edited\n");
+    await git(repository, ["commit", "-qam", "moved"]);
+    const preview = await checkpoints.preview(target(repository), checkpoint.id);
+    await assert.rejects(checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: ["a.txt", "link"] }),
+      (error) => error.statusCode === 413 && error.details.code === "CHECKPOINT_TOO_LARGE" && error.details.path === "link");
+    assert.deepEqual((await checkpoints.describe(target(repository))).checkpoints.map((item) => item.id), [checkpoint.id]);
+    await assert.rejects(lstat(path.join(repository, "link")), { code: "ENOENT" });
+    assert.equal(await status(repository), "");
+    assert.equal(checkpoints.holding(repository), null);
   });
 }
 
@@ -1427,7 +1494,7 @@ test("a restore lets the event loop run between the files it deletes and writes"
   for (const name of names) assert.equal(await readFile(path.join(repository, name), "utf8"), `${name}\n`);
 });
 
-test("a deletion empties the directories above it in one pass upward, linear in their depth", async (t) => {
+test("a deletion empties the directories above it one level a turn, each step linear in their depth", async (t) => {
   const { repository } = await fixture(t);
   const { checkpoints } = service();
   const checkpoint = await checkpoints.capture(target(repository));
@@ -1437,15 +1504,25 @@ test("a deletion empties the directories above it in one pass upward, linear in 
   await mkdir(path.join(repository, "d0", "kept"));
   await writeFile(path.join(repository, "d0", "kept.txt"), "made after\n");
   const preview = await checkpoints.preview(target(repository), checkpoint.id);
-  const original = process.chdir;
+  const original = process.chdir, events = [], steps = [], home = process.cwd();
   let entered = 0;
   process.chdir = (...args) => { entered += 1; return original.apply(process, args); };
   t.after(() => { process.chdir = original; });
+  fsSeam(t, ["rmdirSync"], () => {
+    steps.push(entered);
+    entered = 0;
+    events.push("rmdir");
+    setImmediate(() => events.push("turn"));
+  });
   await checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: [`${deep}/made.txt`] });
   process.chdir = original;
-  // Down to the file and back up once, not down again for each directory removed.
-  assert.ok(entered <= 2 * depth + 4, `${entered} directory changes for one deletion ${depth} levels deep`);
+  // Each directory up to d0, which is not empty, is removed in its own step, after a callback scheduled during the one before.
+  assert.equal(events.filter((event) => event === "rmdir").length, depth, events.join(" "));
+  for (let index = 1; index < events.length; index += 1) if (events[index] === "rmdir") assert.equal(events[index - 1], "turn", events.join(" "));
+  // Each step enters the directories down to the one it changes once, never down again for each level within it.
+  assert.ok(Math.max(...steps) <= 2 * depth + 4, `${Math.max(...steps)} directory changes in one step of a deletion ${depth} levels deep`);
   assert.deepEqual((await readdir(path.join(repository, "d0"))).sort(), ["kept", "kept.txt"]);
+  assert.equal(process.cwd(), home, "the process's directory changed");
 });
 
 test("a restore leaves the process's directory as it was, and refuses or stops if that directory is removed", { skip: process.platform === "win32" && "Windows keeps a process's directory from being removed" }, async (t) => {

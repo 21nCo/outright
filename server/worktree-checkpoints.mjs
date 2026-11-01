@@ -298,21 +298,28 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   // Content filters configured for this repository, switched off for Git's
   // own content comparisons (a command that writes an index compares the
   // entries as new as it), so no clean filter runs and a failing required
-  // one cannot stop a capture or restore; and whether Git tracks the
-  // executable bit and makes symbolic links.
+  // one cannot stop a capture or restore; whether Git tracks the
+  // executable bit and makes symbolic links; which files it writes with CRLF line
+  // endings ("all" text with core.autocrlf true; "text", those with a text attribute,
+  // with core.eol crlf or Windows' native default, unless core.autocrlf is input);
+  // and whether a filter changes files on checkout.
   async function captureSettings(cwd) {
     let listed = "";
-    try { listed = await git(cwd, ["config", "-z", "--get-regexp", "^(filter\\..+\\.(clean|process|required)|core\\.(filemode|symlinks|autocrlf))$"]); }
+    try { listed = await git(cwd, ["config", "-z", "--get-regexp", "^(filter\\..+\\.(clean|smudge|process|required)|core\\.(filemode|symlinks|autocrlf|eol))$"]); }
     catch (error) { if (error.code !== 1) throw error; }
     const names = new Set();
-    const settings = { "core.filemode": true, "core.symlinks": true, "core.autocrlf": false };
+    const settings = { "core.filemode": "true", "core.symlinks": "true", "core.autocrlf": "false", "core.eol": "native" };
+    let smudged = false;
     for (const record of listed.split("\0")) {
       const key = record.split("\n", 1)[0];
-      const filter = /^filter\.(.+)\.(?:clean|process|required)$/.exec(key);
-      if (filter) names.add(filter[1]);
-      else if (key in settings) settings[key] = !/^(?:false|no|off|0)$/i.test(record.slice(key.length + 1).trim());
+      const filter = /^filter\.(.+)\.(clean|smudge|process|required)$/.exec(key);
+      if (filter) { names.add(filter[1]); smudged ||= ["smudge", "process"].includes(filter[2]); }
+      else if (key in settings) settings[key] = record.slice(key.length + 1).trim().toLowerCase();
     }
-    return { fileMode: settings["core.filemode"], symlinks: settings["core.symlinks"], autocrlf: settings["core.autocrlf"], unfiltered: [...names].flatMap((name) => ["-c", `filter.${name}.clean=`, "-c", `filter.${name}.process=`, "-c", `filter.${name}.required=false`]) };
+    const on = (key) => !/^(?:false|no|off|0)$/.test(settings[key]), autocrlf = settings["core.autocrlf"], eol = settings["core.eol"];
+    return { fileMode: on("core.filemode"), symlinks: on("core.symlinks"), smudged,
+      crlf: on("core.autocrlf") && autocrlf !== "input" ? "all" : autocrlf !== "input" && (eol === "crlf" || (process.platform === "win32" && eol === "native")) ? "text" : null,
+      unfiltered: [...names].flatMap((name) => ["-c", `filter.${name}.clean=`, "-c", `filter.${name}.process=`, "-c", `filter.${name}.required=false`]) };
   }
 
   // Index entries ({ mode, oid }) at exact paths.
@@ -325,20 +332,26 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     return found;
   }
 
-  // Tracked files Git converts on their way in or out (core.autocrlf, or a text, eol, crlf, filter, ident or
-  // working-tree-encoding attribute; a `-text` file only through a filter, ident or encoding) can be unchanged to Git with
-  // bytes on disk that are not their index entry. Each is hashed as it is on disk, and those that differ are returned.
-  async function converted(temporary, root, settings, listed) {
-    const pathspec = settings.autocrlf ? [] : [":(exclude,attr:!text !eol !crlf !filter !ident !working-tree-encoding)", ":(exclude,attr:-text !filter !ident !working-tree-encoding)"];
-    const queue = [], differing = [];
-    for (const record of (await temporary(["ls-files", "--stage", "-z", "--", ...pathspec], { maxBuffer: 64 * 1024 * 1024, names: true })).split("\0")) {
-      const [mode, oid] = record.split(" "), relative = record.slice(record.indexOf("\t") + 1);
-      if (REGULAR_MODE.test(mode) && !listed.has(relative)) queue.push({ relative, oid });
+  // Tracked files Git converts on their way out can be unchanged to Git with bytes on disk that are not their index entry:
+  // line endings where Git writes CRLF (above, or an eol=crlf attribute), told apart by Git's own line-ending info without
+  // Outright reading the file, and files under ident, working-tree-encoding or, with a smudge or process driver configured,
+  // a filter attribute. Returned as lstats when a regular file within the per-file bound. Boundaries: a larger one (Git
+  // LFS content, for one) is recorded as Git stores it, and a conversion no longer configured is not seen.
+  async function converted(temporary, cwd, settings, listed) {
+    const candidates = new Set(), found = new Map(), options = { maxBuffer: 64 * 1024 * 1024, names: true };
+    const crlf = settings.crlf === "all" ? [":(exclude,attr:-text)"] : [":(attr:eol=crlf)", ...settings.crlf ? [":(attr:text)", ":(attr:text=auto)"] : []];
+    for (const record of (await temporary(["ls-files", "--eol", "-z", "--", ...crlf], options)).split("\0")) {
+      // A file missing on disk (as one outside a sparse checkout is) has no line-ending info.
+      const [, index, worktree] = /^i\/(\S*)\s+w\/(\S+)/.exec(record) ?? [];
+      if (worktree && index !== worktree) candidates.add(record.slice(record.indexOf("\t") + 1));
     }
-    await Promise.all(Array.from({ length: 8 }, async () => {
-      for (let item; (item = queue.pop());) if (await rawId(root, item.relative, item.oid) !== item.oid) differing.push(item.relative);
-    }));
-    return differing;
+    const other = `:(exclude,attr:!ident !working-tree-encoding${settings.smudged ? " !filter" : ""})`;
+    for (const relative of (await temporary(["ls-files", "-z", "--", other], options)).split("\0")) if (relative) candidates.add(relative);
+    for (const relative of candidates) {
+      const info = listed.has(relative) ? null : await lstat(path.join(cwd, relative)).catch(absent);
+      if (info?.isFile() && info.size <= limits.fileBytes) found.set(relative, info);
+    }
+    return found;
   }
 
   // The index and the files on disk as trees, through a copy of the index:
@@ -379,8 +392,6 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     catch (error) { throw error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" ? tooMany() : error; }
     // A trailing slash marks a nested repository, which is not captured.
     const changedPaths = [...new Set(listed.split("\0").filter((value) => value && !value.endsWith("/")))];
-    const root = await realpath(cwd);
-    changedPaths.push(...await converted(temporary, root, settings, new Set(changedPaths)));
     if (new Set([...staged.map((change) => change.path), ...changedPaths]).size > limits.files) throw tooMany();
     let bytes = 0;
     const count = (relative, size) => {
@@ -402,7 +413,9 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       if (info?.isFile()) count(relative, info.size);
       found.set(relative, info);
     }
-    for (const batch of batches(changedPaths)) {
+    const root = await realpath(cwd);
+    // Paths `counted` against the budget are checked against it above; others are copied as the lstat found them.
+    const store = async (paths, counted) => { for (const batch of batches(paths)) {
       const entries = await indexEntries(cwd, env, batch);
       const removed = [];
       const hashed = [];
@@ -422,7 +435,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
           // Hashed from a copy of the file the lstat above found, never one a link swapped in since.
           const source = path.join(scratch, `file-${randomUUID()}`);
           const copied = await copyInside(root, relative, info, source, limits.fileBytes);
-          if (copied.size !== info.size) { bytes -= info.size; count(relative, copied.size); }
+          if (copied.size !== info.size) { if (!counted) throw changedError(relative); bytes -= info.size; count(relative, copied.size); }
           const executable = settings.fileMode ? (copied.mode & 0o111) !== 0 : entry?.mode === "100755";
           const link = !settings.symlinks && entry?.mode === "120000";
           hashed.push({ relative, source, mode: link ? "120000" : executable ? "100755" : "100644", entry });
@@ -439,9 +452,16 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       for (const batch of batches(updates.map((item) => `${item.mode},${item.oid},${item.relative}`))) {
         await temporary(["update-index", "--add", "--replace", ...batch.flatMap((value) => ["--cacheinfo", value])]);
       }
-    }
-    const filesTree = (await temporary(["write-tree"])).trim();
-    return { indexTree, filesTree, head, branch, bytes };
+    } };
+    await store(changedPaths, true);
+    // What Git sees (`viewTree`, for counts and listings), then converted files Git sees unchanged as they are on disk:
+    // a restore writes those bytes, but they are not changes and count against no budget (Git stores each content once).
+    const viewTree = (await temporary(["write-tree"])).trim();
+    const conversions = await converted(temporary, cwd, settings, new Set(changedPaths));
+    for (const [relative, info] of conversions) found.set(relative, info);
+    await store([...conversions.keys()], false);
+    const filesTree = conversions.size ? (await temporary(["write-tree"])).trim() : viewTree;
+    return { indexTree, filesTree, viewTree, head, branch, bytes };
   }
 
   async function counts(cwd, repo, { indexTree, filesTree, head }) {
@@ -457,11 +477,13 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
 
   async function record(cwd, repo, trees, { label, reason, restoredFrom }) {
     const id = `${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
-    const meta = { version: 1, id, label: cleanLabel(label, limits.labelCharacters), reason, createdAt: now().toISOString(),
-      head: trees.head, branch: trees.branch, bytes: trees.bytes, counts: await counts(cwd, repo, trees), ...(restoredFrom ? { restoredFrom } : {}) };
+    // The view Git has, where it differs from the files as recorded, is kept as a parent for listings.
+    const view = trees.viewTree && trees.viewTree !== trees.filesTree ? (await git(cwd, ["commit-tree", "--no-gpg-sign", trees.viewTree, "-m", "Outright checkpoint view"], { env: IDENTITY })).trim() : null;
+    const meta = { version: 1, id, label: cleanLabel(label, limits.labelCharacters), reason, createdAt: now().toISOString(), head: trees.head, branch: trees.branch,
+      bytes: trees.bytes, counts: await counts(cwd, repo, { ...trees, filesTree: trees.viewTree ?? trees.filesTree }), ...(view ? { view } : {}), ...(restoredFrom ? { restoredFrom } : {}) };
     const parents = trees.head ? ["-p", trees.head] : [];
     const indexCommit = (await git(cwd, ["commit-tree", "--no-gpg-sign", trees.indexTree, ...parents, "-m", "Outright checkpoint index"], { env: IDENTITY })).trim();
-    const commit = (await git(cwd, ["commit-tree", "--no-gpg-sign", trees.filesTree, "-p", indexCommit, ...parents,
+    const commit = (await git(cwd, ["commit-tree", "--no-gpg-sign", trees.filesTree, "-p", indexCommit, ...parents, ...(view ? ["-p", view] : []),
       "-m", `Outright checkpoint: ${meta.label || id}\n\n${JSON.stringify(meta)}`], { env: IDENTITY })).trim();
     await git(cwd, ["update-ref", "-m", "Outright checkpoint", `${CHECKPOINT_REF_PREFIX}${id}`, commit, ""]);
     return { ...meta, commit };
@@ -673,7 +695,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     const root = await realpath(cwd);
     const { unfiltered } = await captureSettings(cwd);
     // Each change is a short synchronous step, with a turn of the event loop after it.
-    for (const op of ops) if (op.file === "delete") { removeFile(root, op.path); await nextTurn(); }
+    for (const op of ops) if (op.file === "delete") { await removeFile(root, op.path); await nextTurn(); }
     const writes = ops.filter((op) => op.file === "write");
     // A directory where a file goes held only paths the deletions removed.
     for (const op of writes) await removeEmptyDirectory(root, op.path);
@@ -769,7 +791,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     const checkpoint = await load(cwd, id);
     const [staged, local] = await Promise.all([
       diffTrees(cwd, checkpoint.head ? `${checkpoint.head}^{tree}` : repo.emptyTree, checkpoint.indexTree, true),
-      diffTrees(cwd, checkpoint.indexTree, checkpoint.filesTree).then((list) => list.filter((change) => !nested(change))),
+      diffTrees(cwd, checkpoint.indexTree, checkpoint.view ?? checkpoint.filesTree).then((list) => list.filter((change) => !nested(change))),
     ]);
     const entries = [
       ...staged.map((change) => ({ path: change.path, originalPath: change.originalPath, state: "staged", status: change.status })),
@@ -827,9 +849,9 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
         if (result.planDigest !== planDigest) throw checkpointError(409, "The worktree changed after the preview; review the new preview before restoring", "CHECKPOINT_PLAN_CHANGED");
         const ops = selectedOps(result.entries, chosenPaths(result.entries, { paths, except }));
         const name = result.checkpoint.label || id;
-        // Refused before anything is recorded, pruned or changed: a file over the per-file bound (one the checkpoint kept from
-        // its commit), and a restore whose record of its paths (with room for its ids and times) would be over its bound.
-        const sizes = await blobs(cwd, result.checkpoint.commit, ops.filter((op) => op.raw).map((op) => op.path));
+        // Refused before anything is recorded, pruned or changed: a file or link over the per-file bound (one the checkpoint kept
+        // from its commit), and a restore whose record of its paths (with room for its ids and times) would be over its bound.
+        const sizes = await blobs(cwd, result.checkpoint.commit, ops.filter((op) => op.file === "write").map((op) => op.path));
         const large = [...sizes].find(([, blob]) => blob.size > limits.fileBytes)?.[0];
         if (large) throw checkpointError(413, `${large} is larger than ${mebibytes(limits.fileBytes)}; leave it out of this restore and restore it with Git`, "CHECKPOINT_TOO_LARGE", { path: large });
         if (Buffer.byteLength(JSON.stringify([ops.map((op) => op.path), markerCheckpoints(resumed)])) + 1024 > limits.recordBytes) throw recordTooLarge();
@@ -1026,7 +1048,7 @@ function readMeta(id, commit, body) {
     createdAt: typeof meta.createdAt === "string" ? meta.createdAt : null, head: OID_PATTERN.test(meta.head ?? "") ? meta.head : null,
     branch: typeof meta.branch === "string" ? meta.branch : null, bytes: count(meta.bytes),
     counts: { staged: count(meta.counts?.staged), unstaged: count(meta.counts?.unstaged), untracked: count(meta.counts?.untracked) },
-    restoredFrom: typeof meta.restoredFrom === "string" ? meta.restoredFrom : null };
+    restoredFrom: typeof meta.restoredFrom === "string" ? meta.restoredFrom : null, view: OID_PATTERN.test(meta.view ?? "") ? meta.view : null };
 }
 
 function publicCheckpoint({ id, commit, label, reason, createdAt, head, branch, bytes, counts, restoredFrom, unreadable }) {
@@ -1082,20 +1104,18 @@ function inside(root, directory, work, { create = false, relative = directory } 
 const recordTooLarge = () => checkpointError(413, "This restore's record of its paths would be too large; restore fewer paths at a time", "CHECKPOINT_TOO_LARGE");
 const workdirGone = (cause) => checkpointError(503, "The directory Outright was started in was removed; restart Outright from an existing directory to restore", "CHECKPOINT_WORKDIR_UNAVAILABLE", {}, cause);
 
-// Deletes a file (never a directory), then, like Git, the directories that left empty.
-function removeFile(root, relative) {
-  inside(root, path.posix.dirname(relative), (at) => {
+// Deletes a file (never a directory), then, like Git, the directories that left empty, one level a turn, each removed
+// from its parent entered as above.
+async function removeFile(root, relative) {
+  inside(root, path.posix.dirname(relative), () => {
     const name = path.posix.basename(relative), info = lstatSync(name, { throwIfNoEntry: false });
     if (info && !info.isDirectory()) unlinkSync(name);
-    // Upward from the directory entered, each parent entered as `..` and found to be the one entered on the way down.
-    for (let directory = path.posix.dirname(relative); directory !== "."; directory = path.posix.dirname(directory)) {
-      process.chdir("..");
-      const here = statSync("."), parent = at.at(-2);
-      if (here.dev !== parent.dev || here.ino !== parent.ino) throw changedError(relative);
-      try { rmdirSync(path.posix.basename(directory)); } catch { break; }
-      at.pop();
-    }
   }, { relative });
+  for (let directory = path.posix.dirname(relative); directory !== "."; directory = path.posix.dirname(directory)) {
+    await nextTurn();
+    const removed = inside(root, path.posix.dirname(directory), () => { try { rmdirSync(path.posix.basename(directory)); return true; } catch { return false; } }, { relative });
+    if (!removed) break;
+  }
 }
 
 // Removes a directory where a file is restored, once the restore's
@@ -1133,18 +1153,6 @@ async function copyInside(root, relative, expected, destination, limit) {
     if (!await unchanged(root, relative, expected)) throw changedError(relative);
     return { size: (await stat(destination)).size, mode: info.mode };
   } finally { await handle.close(); }
-}
-// The object id of the file at `relative` as it is on disk, hashed as `oid` is, or null where no regular file can be opened
-// as openInside does (the capture then records what is there).
-async function rawId(root, relative, oid) {
-  const opened = await openInside(root, relative, fsConstants.O_RDONLY).catch(() => null);
-  if (!opened) return null;
-  try {
-    if (!opened.info.isFile()) return null;
-    const hash = createHash(oid.length === 64 ? "sha256" : "sha1").update(`blob ${opened.info.size}\0`);
-    for await (const chunk of opened.handle.createReadStream({ autoClose: false })) hash.update(chunk);
-    return hash.digest("hex");
-  } finally { await opened.handle.close(); }
 }
 // Opens a file an agent can replace without blocking: a FIFO or device in its place is refused (EFTYPE), never waited on.
 async function openFile(file, flags = 0) {
