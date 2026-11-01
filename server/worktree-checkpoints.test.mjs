@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { renameSync, symlinkSync, writeFileSync } from "node:fs";
+import { renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { chmod, link, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import os from "node:os";
@@ -478,6 +478,29 @@ test("file bytes round-trip exactly whatever line-ending conversion or filter ap
   // A change of line endings alone is a change to restore.
   await writeFile(path.join(repository, "windows.txt"), "one\ntwo\n");
   assert.deepEqual((await checkpoints.preview(target(repository), checkpoint.id)).entries.map((entry) => entry.path), ["windows.txt"]);
+});
+
+test("a file equal to its index entry restores byte for byte, never through Git's line-ending conversion or smudge filter", async (t) => {
+  const { repository } = await fixture(t);
+  await git(repository, ["config", "core.autocrlf", "true"]);
+  await git(repository, ["config", "filter.upper.clean", "tr a-z A-Z"]);
+  await git(repository, ["config", "filter.upper.smudge", "tr A-Z a-z"]);
+  await writeFile(path.join(repository, ".gitattributes"), "*.crlf text eol=crlf\n*.up filter=upper\n");
+  // Each file on disk is exactly its index entry, so Git and the checkpoint see it unchanged, but a checkout would write
+  // CRLF (core.autocrlf, eol=crlf) or run the smudge filter.
+  const files = { "run.sh": Buffer.from("#!/bin/sh\necho hi\n"), "doc.crlf": Buffer.from("a\nb\n"), "note.up": Buffer.from("HELLO\n") };
+  for (const [name, content] of Object.entries(files)) await writeFile(path.join(repository, name), content);
+  await git(repository, ["add", "."]);
+  await git(repository, ["commit", "-qm", "converted on checkout"]);
+  for (const [name, content] of Object.entries(files)) assert.deepEqual(await readFile(path.join(repository, name)), content, name);
+  assert.equal(await status(repository), "");
+  const { checkpoints } = service();
+  const checkpoint = await checkpoints.capture(target(repository));
+  for (const name of Object.keys(files)) await writeFile(path.join(repository, name), "edited\n");
+  const { preview } = await restoreAll(checkpoints, repository, checkpoint.id);
+  assert.deepEqual(preview.entries.map((entry) => entry.path), ["doc.crlf", "note.up", "run.sh"]);
+  for (const [name, content] of Object.entries(files)) assert.deepEqual(await readFile(path.join(repository, name)), content, `${name} changed on its way back`);
+  assert.equal(await status(repository), "");
 });
 
 test("staged content counts against the budget, and every checkpoint that is taken can be restored", async (t) => {
@@ -1121,6 +1144,7 @@ test("a restore never writes, makes or deletes anything outside the worktree thr
   // an outside file named as the new file is planted first.
   fsSeam(t, ["openSync", "renameSync", "mkdirSync", "unlinkSync"], (name, first) => { if (armed?.(name, first)) armed = null; });
   const temporary = (first) => /^\.outright-[0-9a-f-]+\.tmp$/.test(first);
+  const home = process.cwd();
   const cases = [
     ["write, before the new file is made", "f.txt", (name, first) => name === "openSync" && temporary(first)],
     ["write, before the new file is renamed into place", "f.txt", (name, first) => name === "renameSync" && temporary(first)],
@@ -1163,6 +1187,7 @@ test("a restore never writes, makes or deletes anything outside the worktree thr
     const restoring = checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: preview.entries.map((entry) => entry.path) });
     if (swapped || process.platform !== "win32") await assert.rejects(restoring, (error) => error.details.code === "CHECKPOINT_RESTORE_INTERRUPTED", label);
     else await restoring;
+    assert.equal(process.cwd(), home, `${label}: the process's directory is as it was`);
     assert.equal(armed, null, `${label}: the swap was tried`);
     assert.deepEqual((await readdir(outside)).sort(), ["f.txt", "gone.txt", ...planted].sort(), label);
     assert.equal(await readFile(path.join(outside, "f.txt"), "utf8"), "EXTERNAL\n", label);
@@ -1275,4 +1300,97 @@ test("a worktree created again at the same path records its Git writes in its ow
   assert.ok((await lstat(path.join(gitDir, WRITE_MARKER))).isFile());
   release();
   await assert.rejects(lstat(path.join(gitDir, WRITE_MARKER)), { code: "ENOENT" });
+});
+
+test("a restore record over the size bound is unreadable without being loaded, and its files can still be kept", async (t) => {
+  const { repository } = await fixture(t);
+  const { checkpoints } = service({ limits: { ...CHECKPOINT_LIMITS, recordBytes: 4096 } });
+  const checkpoint = await checkpoints.capture(target(repository));
+  // A well-formed record, padded past the bound.
+  const record = JSON.stringify({ version: 2, operationId: "op", checkpointId: checkpoint.id, commit: checkpoint.commit,
+    safetyCheckpointId: checkpoint.id, startedAt: new Date().toISOString(), paths: ["a.txt"] });
+  await writeFile(path.join(repository, ".git", RESTORE_MARKER), record.padEnd(4097));
+  const described = await checkpoints.describe(target(repository));
+  assert.deepEqual([described.restore.status, described.restore.unreadable], ["interrupted", true]);
+  assert.equal(checkpoints.holding(repository), "CHECKPOINT_RESTORE_INTERRUPTED");
+  await assert.rejects(checkpoints.preview(target(repository), checkpoint.id, { resume: true }), (error) => error.details.code === "CHECKPOINT_MARKER_UNREADABLE");
+  await checkpoints.recover(target(repository), "keep");
+  assert.equal(checkpoints.holding(repository), null);
+  // Within the bound it is read as before.
+  await writeFile(path.join(repository, ".git", RESTORE_MARKER), record.padEnd(4096));
+  assert.equal((await checkpoints.describe(target(repository))).restore.unreadable, false);
+  await checkpoints.recover(target(repository), "keep");
+
+  // A restore whose record would be over the bound is refused before anything changes.
+  const small = service({ limits: { ...CHECKPOINT_LIMITS, recordBytes: 200 } }).checkpoints;
+  await writeFile(path.join(repository, "a.txt"), "edited\n");
+  const preview = await small.preview(target(repository), checkpoint.id);
+  await assert.rejects(small.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: ["a.txt"] }),
+    (error) => error.details.code === "CHECKPOINT_TOO_LARGE");
+  assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "edited\n");
+  assert.equal(small.holding(repository), null);
+});
+
+test("a restore lets the event loop run between the files it deletes and writes", async (t) => {
+  const { repository } = await fixture(t);
+  const names = ["w1.txt", "w2.txt", "w3.txt"];
+  for (const name of names) await writeFile(path.join(repository, name), `${name}\n`);
+  const { checkpoints } = service();
+  const checkpoint = await checkpoints.capture(target(repository));
+  for (const name of names) await writeFile(path.join(repository, name), "edited\n");
+  for (const name of ["x1.txt", "x2.txt", "x3.txt"]) await writeFile(path.join(repository, name), "made after\n");
+  const events = [];
+  fsSeam(t, ["openSync", "unlinkSync"], (name, first) => {
+    if (!(name === "unlinkSync" && /^x\d\.txt$/.test(first)) && !(name === "openSync" && /^\.outright-[0-9a-f-]+\.tmp$/.test(first))) return;
+    events.push(name);
+    setImmediate(() => events.push("turn"));
+  });
+  await restoreAll(checkpoints, repository, checkpoint.id);
+  assert.equal(events.filter((event) => event === "unlinkSync").length, 3);
+  assert.equal(events.filter((event) => event === "openSync").length, 3);
+  // A callback scheduled during each change runs before the next change.
+  for (let index = 1; index < events.length; index += 1) if (events[index] !== "turn") assert.equal(events[index - 1], "turn", events.join(" "));
+  for (const name of names) assert.equal(await readFile(path.join(repository, name), "utf8"), `${name}\n`);
+});
+
+test("a restore leaves the process's directory as it was, and refuses or stops if that directory is removed", { skip: process.platform === "win32" && "Windows keeps a process's directory from being removed" }, async (t) => {
+  const { root, repository } = await fixture(t);
+  const home = process.cwd();
+  t.after(() => process.chdir(home));
+  const { checkpoints } = service();
+  const checkpoint = await checkpoints.capture(target(repository));
+  await writeFile(path.join(repository, "a.txt"), "edited\n");
+  await writeFile(path.join(repository, "made.txt"), "made after\n");
+  await restoreAll(checkpoints, repository, checkpoint.id);
+  assert.equal(process.cwd(), home);
+  assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "committed\n");
+
+  // Removed before the restore: refused before anything changes.
+  const launch = path.join(root, "launch");
+  await mkdir(launch);
+  process.chdir(launch);
+  assert.equal(process.cwd(), launch);
+  await rm(launch, { recursive: true });
+  await writeFile(path.join(repository, "a.txt"), "edited\n");
+  await writeFile(path.join(repository, "made.txt"), "made after\n");
+  const preview = await checkpoints.preview(target(repository), checkpoint.id);
+  const restoring = () => checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: preview.entries.map((entry) => entry.path) });
+  await assert.rejects(restoring(), (error) => error.details.code === "CHECKPOINT_WORKDIR_UNAVAILABLE");
+  assert.equal(process.cwd(), launch);
+  assert.equal(checkpoints.holding(repository), null);
+  assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "edited\n");
+  assert.equal(await readFile(path.join(repository, "made.txt"), "utf8"), "made after\n");
+
+  // Removed while it runs: the restore stops after the change it made, outside the worktree, and finishes later.
+  await mkdir(launch);
+  process.chdir(launch);
+  fsSeam(t, ["unlinkSync"], (name, first) => { if (first === "made.txt") rmSync(launch, { recursive: true }); });
+  await assert.rejects(restoring(), (error) => error.details.code === "CHECKPOINT_RESTORE_INTERRUPTED" && error.cause.details.code === "CHECKPOINT_WORKDIR_UNAVAILABLE");
+  assert.equal(process.cwd(), path.parse(launch).root);
+  await assert.rejects(lstat(path.join(repository, "made.txt")), { code: "ENOENT" });
+  assert.equal(checkpoints.holding(repository), "CHECKPOINT_RESTORE_INTERRUPTED");
+  const resumed = await checkpoints.preview(target(repository), checkpoint.id, { resume: true });
+  await checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: resumed.planDigest, resume: true, paths: resumed.entries.map((entry) => entry.path) });
+  assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "committed\n");
+  assert.equal(checkpoints.holding(repository), null);
 });

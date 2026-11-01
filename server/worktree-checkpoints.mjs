@@ -4,7 +4,7 @@ import { lstat, mkdtemp, open, readdir, readlink, realpath, rename, rm, stat, ut
 import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
-import { setTimeout as delay } from "node:timers/promises";
+import { setImmediate as nextTurn, setTimeout as delay } from "node:timers/promises";
 import { utilityBudgetUnavailable } from "./subprocess-budget.mjs";
 
 // Checkpoints are Git objects in the worktree's own repository. Each one is a
@@ -31,6 +31,8 @@ export const CHECKPOINT_LIMITS = Object.freeze({
   labelCharacters: 120,
   gitTimeoutMs: 120_000,
   diffBytes: 4 * 1024 * 1024,
+  // A restore's record (its paths) is read only up to this size; a larger one is unreadable.
+  recordBytes: 32 * 1024 * 1024,
 });
 
 export const CHECKPOINT_REF_PREFIX = "refs/worktree/outright/checkpoints/";
@@ -520,12 +522,9 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     const checkpoint = await load(cwd, id);
     // The restore checkpoints the current state first, within the same limits.
     const current = await snapshot(cwd, repo, scratch, "before restoring: the restore first takes a checkpoint of the worktree as it is");
-    const [indexChanges, fileChanges, recordedRaw] = await Promise.all([
+    const [indexChanges, fileChanges] = await Promise.all([
       diffTrees(cwd, current.indexTree, checkpoint.indexTree),
       diffTrees(cwd, current.filesTree, checkpoint.filesTree),
-      // A checkpoint file that differs from its index entry was recorded
-      // byte for byte, and is written back as it is.
-      diffTrees(cwd, checkpoint.indexTree, checkpoint.filesTree).then((list) => new Set(list.map((change) => change.path))),
     ]);
     const byPath = new Map();
     const entry = (relative) => byPath.get(relative) ?? byPath.set(relative, { path: relative, index: null, file: null }).get(relative);
@@ -535,7 +534,8 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     for (const change of fileChanges) {
       if (nested(change)) continue;
       entry(change.path).file = change.status === "D" ? { action: "delete" } : { action: change.status === "A" ? "create" : "update",
-        mode: change.dstMode, oid: change.dstOid, raw: REGULAR_MODE.test(change.dstMode) && recordedRaw.has(change.path) };
+        // Every file was recorded byte for byte and is written back as it is, even one equal to its index entry.
+        mode: change.dstMode, oid: change.dstOid, raw: REGULAR_MODE.test(change.dstMode) };
     }
     if (byPath.size > limits.planEntries) throw checkpointError(413, `Restoring would change more than ${limits.planEntries} paths`, "CHECKPOINT_TOO_LARGE");
     const entries = [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
@@ -594,7 +594,15 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
 
   async function readMarker(repo) {
     let text;
-    try { const handle = await openFile(path.join(repo.gitDir, RESTORE_MARKER), NO_FOLLOW); try { text = await handle.readFile("utf8"); } finally { await handle.close(); } }
+    try {
+      const handle = await openFile(path.join(repo.gitDir, RESTORE_MARKER), NO_FOLLOW);
+      // Read only up to its size when opened and within the bound; a larger record, or one that grew, is unreadable.
+      try {
+        const size = (await handle.stat()).size;
+        const { buffer, bytesRead } = size <= limits.recordBytes ? await handle.read(Buffer.alloc(size + 1), 0, size + 1, 0) : {};
+        if (bytesRead <= size) text = buffer.toString("utf8", 0, bytesRead);
+      } finally { await handle.close(); }
+    }
     // A link or FIFO in its place is an unreadable record, which holds the worktree; it is never read through.
     catch (error) { if (error.code === "ENOENT") return null; if (!["EFTYPE", "ELOOP"].includes(error.code)) throw error; }
     try {
@@ -606,8 +614,9 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   }
   async function writeMarker(repo, marker) {
     const file = path.join(repo.gitDir, RESTORE_MARKER);
-    const temporary = `${file}.${randomUUID()}.tmp`;
-    await writeFile(temporary, JSON.stringify(marker), { mode: 0o600, flag: "wx" });
+    const temporary = `${file}.${randomUUID()}.tmp`, text = JSON.stringify(marker);
+    if (Buffer.byteLength(text) > limits.recordBytes) throw checkpointError(413, "This restore's record of its paths would be too large; restore fewer paths at a time", "CHECKPOINT_TOO_LARGE");
+    await writeFile(temporary, text, { mode: 0o600, flag: "wx" });
     await rename(temporary, file);
   }
   async function clearMarker(repo) { await rm(path.join(repo.gitDir, RESTORE_MARKER), { force: true }); }
@@ -643,16 +652,18 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   async function apply(cwd, ops, commit, scratch) {
     const root = await realpath(cwd);
     const { unfiltered } = await captureSettings(cwd);
-    for (const op of ops) if (op.file === "delete") await removeFile(root, op.path);
+    // Each change is a short synchronous step, with a turn of the event loop after it.
+    for (const op of ops) if (op.file === "delete") { removeFile(root, op.path); await nextTurn(); }
     const writes = ops.filter((op) => op.file === "write");
     // A directory where a file goes held only paths the deletions removed.
     for (const op of writes) await removeEmptyDirectory(root, op.path);
+    // Only links are left to Git.
     const checkedOut = writes.filter((op) => !op.raw).map((op) => op.path);
     if (checkedOut.length) {
       const list = path.join(scratch, `paths-${randomUUID()}`);
       await writeFile(list, `${checkedOut.join("\0")}\0`, { mode: 0o600 });
-      // Overlay mode writes only the listed files and removes nothing. Residual: Git checks for a
-      // link above each path before writing (as these helpers do) but not atomically with the write.
+      // Overlay mode writes only the listed links and removes nothing. Residual: Git checks for a
+      // link above each path before writing one (as these helpers do) but not atomically with the write.
       await indexWrite(cwd, ["restore", "--overlay", `--source=${commit}`, "--worktree", `--pathspec-from-file=${list}`, "--pathspec-file-nul"], { env: LITERAL });
     }
     await writeRecorded(cwd, root, commit, writes.filter((op) => op.raw));
@@ -684,7 +695,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
         if (blobId(content, oid) !== oid) throw checkpointError(409, "This checkpoint's content could not be read back intact", "CHECKPOINT_DAMAGED");
         contents.set(oid, content);
       }
-      for (const op of group) await writeFileAt(root, op.path, contents.get(op.oid), op.mode === "100755");
+      for (const op of group) { writeFileAt(root, op.path, contents.get(op.oid), op.mode === "100755"); await nextTurn(); }
       group = [];
       bytes = 0;
     };
@@ -786,6 +797,8 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
         const resumed = admitMarker(value, await readMarker(repo), id, resume === true);
         const gitBlockers = await blockedByGit(repo);
         if (gitBlockers.length) throw checkpointError(409, `Restore refused: ${gitBlockers[0].message}`, "CHECKPOINT_WRITERS_ACTIVE", { blockers: gitBlockers });
+        // Each change returns to Outright's own directory, so one that cannot be entered again refuses before anything changes.
+        try { process.chdir(process.cwd()); } catch (error) { throw workdirGone(error); }
         const open = terminals([...entry.paths]);
         const acknowledged = new Set(Array.isArray(acknowledgeTerminals) ? acknowledgeTerminals : []);
         if (open.some((terminal) => !acknowledged.has(terminal.id))) {
@@ -1035,8 +1048,13 @@ function inside(root, directory, work, { create = false, relative = directory } 
       if (!info?.isDirectory() || info.dev !== expected.dev || info.ino !== expected.ino) throw changedError(relative);
     }
     return result;
-  } finally { process.chdir(home); }
+  } finally {
+    try { process.chdir(home); }
+    // Outright's own directory was removed meanwhile: the root of its filesystem, never a worktree, and the restore stops.
+    catch (error) { process.chdir(path.parse(home).root); throw workdirGone(error); }
+  }
 }
+const workdirGone = (cause) => checkpointError(503, "The directory Outright was started in was removed; restart Outright from an existing directory to restore", "CHECKPOINT_WORKDIR_UNAVAILABLE", {}, cause);
 
 // Deletes a file (never a directory), then, like Git, the directories that left empty.
 function removeFile(root, relative) {
@@ -1052,12 +1070,13 @@ function removeFile(root, relative) {
 
 // Removes a directory where a file is restored, once the restore's
 // deletions have left nothing but empty directories in it.
-function removeEmptyDirectory(root, relative) {
+async function removeEmptyDirectory(root, relative) {
+  await nextTurn();
   const children = inside(root, relative, () => readdirSync(".", { withFileTypes: true }));
   if (!children) return;
   for (const child of children) {
     if (!child.isDirectory()) throw checkpointError(409, `${relative}/${child.name} is in the way of ${relative}`, "CHECKPOINT_PATH_OBSTRUCTED");
-    removeEmptyDirectory(root, `${relative}/${child.name}`);
+    await removeEmptyDirectory(root, `${relative}/${child.name}`);
   }
   inside(root, path.posix.dirname(relative), () => rmdirSync(path.posix.basename(relative)), { relative });
 }
