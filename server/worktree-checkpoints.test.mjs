@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { renameSync, symlinkSync } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { renameSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmod, link, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
@@ -1105,26 +1105,29 @@ test("a restore refused admission at the retention limit leaves checkpoints, fil
   assert.equal(audits.find((entry) => entry.action === "worktree.checkpoint.restore.resumed.requested").details.operationId, recorded.details.operationId);
 });
 
-// Calls `hook(name, firstPath)` before each fs/promises function named, for this test only.
+// Calls `hook(name, firstPath)` before each node:fs function named, for this test only.
 function fsSeam(t, names, hook) {
   const require = createRequire(import.meta.url);
-  const fsp = require("node:fs/promises");
-  const originals = Object.fromEntries(names.map((name) => [name, fsp[name]]));
-  for (const name of names) fsp[name] = (...args) => { hook(name, String(args[0])); return originals[name](...args); };
+  const fs = require("node:fs");
+  const originals = Object.fromEntries(names.map((name) => [name, fs[name]]));
+  for (const name of names) fs[name] = (...args) => { hook(name, String(args[0])); return originals[name](...args); };
   syncBuiltinESMExports();
-  t.after(() => { Object.assign(fsp, originals); syncBuiltinESMExports(); });
+  t.after(() => { Object.assign(fs, originals); syncBuiltinESMExports(); });
 }
 
-test("a restore never writes or deletes outside the worktree through a directory swapped for a link while it runs", { skip: process.platform === "win32" && "directory links need privileges on Windows" }, async (t) => {
+test("a restore never writes, makes or deletes anything outside the worktree through a directory swapped for a link while it runs", async (t) => {
   let armed = null;
-  // Old and new call sites alike: the swap happens just before the restore's file write or deletion.
-  fsSeam(t, ["writeFile", "open", "rename", "unlink"], (name, first) => { if (armed?.(name, first)) armed = null; });
+  // The swap happens just before the restore makes its new file, renames it into place, makes a directory or deletes a file;
+  // an outside file named as the new file is planted first.
+  fsSeam(t, ["openSync", "renameSync", "mkdirSync", "unlinkSync"], (name, first) => { if (armed?.(name, first)) armed = null; });
+  const temporary = (first) => /^\.outright-[0-9a-f-]+\.tmp$/.test(first);
   const cases = [
-    ["write, before the new file is created", (name, first) => ["writeFile", "open"].includes(name) && first.includes("/dir/.outright-")],
-    ["write, before the new file is renamed into place", (name, first) => name === "rename" && first.includes("/dir/.outright-") && first.endsWith(".tmp")],
-    ["delete", (name, first) => ["rename", "unlink"].includes(name) && first.endsWith("/dir/gone.txt")],
+    ["write, before the new file is made", "f.txt", (name, first) => name === "openSync" && temporary(first)],
+    ["write, before the new file is renamed into place", "f.txt", (name, first) => name === "renameSync" && temporary(first)],
+    ["write, before a missing directory is made", "sub/f.txt", (name, first) => name === "mkdirSync" && first === "sub"],
+    ["delete", "gone.txt", (name, first) => name === "unlinkSync" && first === "gone.txt"],
   ];
-  for (const [label, when] of cases) {
+  for (const [label, file, when] of cases) {
     const { root, repository } = await fixture(t);
     const outside = path.join(root, "outside");
     await mkdir(outside);
@@ -1133,37 +1136,52 @@ test("a restore never writes or deletes outside the worktree through a directory
     await mkdir(path.join(repository, "dir"));
     await writeFile(path.join(repository, "dir", "keep.txt"), "kept\n");
     const deleting = label === "delete";
-    if (!deleting) await writeFile(path.join(repository, "dir", "f.txt"), "checkpoint content\n");
+    if (!deleting) {
+      await mkdir(path.dirname(path.join(repository, "dir", file)), { recursive: true });
+      await writeFile(path.join(repository, "dir", file), "checkpoint content\n");
+    }
     const { checkpoints } = service();
     const checkpoint = await checkpoints.capture(target(repository));
     if (deleting) await writeFile(path.join(repository, "dir", "gone.txt"), "made after\n");
-    else await rm(path.join(repository, "dir", "f.txt"));
+    else await rm(path.join(repository, "dir", file.split("/")[0]), { recursive: true });
     const preview = await checkpoints.preview(target(repository), checkpoint.id);
+    const planted = [];
+    let swapped = false;
     armed = (name, first) => {
       if (!when(name, first)) return false;
-      renameSync(path.join(repository, "dir"), path.join(repository, "dir.real"));
-      symlinkSync(outside, path.join(repository, "dir"));
+      if (temporary(first)) { writeFileSync(path.join(outside, first), "ATTACKER\n"); planted.push(first); }
+      try {
+        renameSync(path.join(repository, "dir"), path.join(repository, "dir.real"));
+        symlinkSync(outside, path.join(repository, "dir"), "junction");
+        swapped = true;
+      } catch (error) {
+        // Windows keeps a directory the restore is in from being renamed.
+        if (process.platform !== "win32") throw error;
+      }
       return true;
     };
-    await assert.rejects(checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: preview.entries.map((entry) => entry.path) }),
-      (error) => error.details.code === "CHECKPOINT_RESTORE_INTERRUPTED", label);
-    assert.equal(armed, null, `${label}: the swap happened`);
-    assert.deepEqual((await readdir(outside)).sort(), ["f.txt", "gone.txt"], label);
+    const restoring = checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: preview.entries.map((entry) => entry.path) });
+    if (swapped || process.platform !== "win32") await assert.rejects(restoring, (error) => error.details.code === "CHECKPOINT_RESTORE_INTERRUPTED", label);
+    else await restoring;
+    assert.equal(armed, null, `${label}: the swap was tried`);
+    assert.deepEqual((await readdir(outside)).sort(), ["f.txt", "gone.txt", ...planted].sort(), label);
     assert.equal(await readFile(path.join(outside, "f.txt"), "utf8"), "EXTERNAL\n", label);
     assert.equal(await readFile(path.join(outside, "gone.txt"), "utf8"), "EXTERNAL GONE\n", label);
-    assert.equal(checkpoints.holding(repository), "CHECKPOINT_RESTORE_INTERRUPTED", label);
-
-    // Once the swap is undone, the restore finishes through a new preview.
-    await rm(path.join(repository, "dir"));
-    await rename(path.join(repository, "dir.real"), path.join(repository, "dir"));
-    const resumed = await checkpoints.preview(target(repository), checkpoint.id, { resume: true });
-    await checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: resumed.planDigest, resume: true,
-      paths: resumed.entries.filter((entry) => !entry.blocked).map((entry) => entry.path) });
+    for (const name of planted) assert.equal(await readFile(path.join(outside, name), "utf8"), "ATTACKER\n", label);
+    if (swapped) {
+      assert.equal(checkpoints.holding(repository), "CHECKPOINT_RESTORE_INTERRUPTED", label);
+      // Once the swap is undone, the restore finishes through a new preview, or its files are kept when nothing is left.
+      await rm(path.join(repository, "dir"));
+      await rename(path.join(repository, "dir.real"), path.join(repository, "dir"));
+      const resumed = await checkpoints.preview(target(repository), checkpoint.id, { resume: true });
+      const left = resumed.entries.filter((entry) => !entry.blocked).map((entry) => entry.path);
+      if (left.length) await checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: resumed.planDigest, resume: true, paths: left });
+      else await checkpoints.recover(target(repository), "keep");
+    }
     assert.equal(checkpoints.holding(repository), null, label);
-    // A new file the swap kept from its rename stays where it was made, in the worktree, never outside it.
-    const left = (await readdir(path.join(repository, "dir"))).filter((name) => !/^\.outright-[0-9a-f-]+\.tmp$/.test(name));
-    assert.deepEqual(left.sort(), deleting ? ["keep.txt"] : ["f.txt", "keep.txt"], label);
-    if (!deleting) assert.equal(await readFile(path.join(repository, "dir", "f.txt"), "utf8"), "checkpoint content\n");
+    // What the restore changed before it noticed the swap is in the worktree's own directory, never outside it.
+    assert.deepEqual((await readdir(path.join(repository, "dir"))).sort(), deleting ? ["keep.txt"] : ["keep.txt", file.split("/")[0]].sort(), label);
+    if (!deleting) assert.equal(await readFile(path.join(repository, "dir", file), "utf8"), "checkpoint content\n", label);
   }
 });
 
@@ -1218,6 +1236,18 @@ test("the Git write and restore records are never written or read through a link
   release();
   assert.equal(await readFile(sentinel, "utf8"), "EXTERNAL BYTES\n");
   await assert.rejects(lstat(marker), { code: "ENOENT" });
+
+  // A hard link to an outside file swapped in for the marker of a live write: the next write replaces it, never writes through it.
+  const live = checkpoints.admitWriter([repository]);
+  await rm(marker);
+  await link(sentinel, marker);
+  const next = checkpoints.admitWriter([repository]);
+  assert.equal(await readFile(sentinel, "utf8"), "EXTERNAL BYTES\n");
+  assert.notEqual((await lstat(marker)).ino, (await lstat(sentinel)).ino);
+  live();
+  next();
+  await assert.rejects(lstat(marker), { code: "ENOENT" });
+  assert.equal(await readFile(sentinel, "utf8"), "EXTERNAL BYTES\n");
 
   // A link for the restore record is an unreadable record that holds the worktree, never the file it names.
   const checkpoint = await checkpoints.capture(target(repository));

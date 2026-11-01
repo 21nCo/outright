@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, createWriteStream, constants as fsConstants, fstatSync, lstatSync, openSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readdir, readlink, realpath, rename, rm, rmdir, stat, unlink, utimes, writeFile } from "node:fs/promises";
+import { closeSync, createWriteStream, constants as fsConstants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, renameSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { lstat, mkdtemp, open, readdir, readlink, realpath, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -181,8 +181,14 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
         const gitDir = gitDirOf(value);
         try {
           if (!gitDir) throw new Error("No Git directory");
-          // Never written through a link swapped in for the marker (ELOOP refuses the write).
-          writeFileSync(path.join(gitDir, WRITE_MARKER), stamp, { mode: 0o600, flag: fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | NO_FOLLOW | (fsConstants.O_NONBLOCK ?? 0) });
+          // A new file renamed over the marker, never one opened: a link, hard link or FIFO swapped in for it is never written
+          // through; anything but a file there refuses the write.
+          const marker = path.join(gitDir, WRITE_MARKER), temporary = `${marker}.${randomUUID()}.tmp`;
+          if (!(lstatSync(marker, { throwIfNoEntry: false })?.isFile() ?? true)) throw new Error("Not a file in the marker's place");
+          try {
+            writeFileSync(temporary, stamp, { mode: 0o600, flag: fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | NO_FOLLOW });
+            renameSync(temporary, marker);
+          } finally { rmSync(temporary, { force: true }); }
         } catch (error) {
           for (const written of paths) if (!writing(written)) try { removeWriteMarker(written); } catch { strays.add(written); }
           throw checkpointError(503, "Outright could not record this Git write in the worktree's Git directory; try again", "GIT_WRITE_UNRECORDED", {}, error);
@@ -1000,48 +1006,60 @@ function ancestors(relative) {
 
 // Only a path that is not there is absent; any other error (EACCES, EIO) stops the capture or restore, never counts as a deletion.
 function absent(error) { if (["ENOENT", "ENOTDIR"].includes(error.code)) return null; throw error; }
-// Whether `relative` and every directory above it are directories, not links or files.
-async function directories(root, relative) {
-  for (const part of [...ancestors(relative), relative]) if (!(await lstat(path.join(root, part)).catch(absent))?.isDirectory()) return false;
-  return true;
+// Restore changes the worktree only from inside a directory it entered one level at a time from `root` (a real path), each
+// level found a directory, not a link, and entered as that same directory (made first if `create`, else undefined when
+// missing or not a directory), so relative names resolve from the directory itself: a link swapped in above never sends a
+// change outside. Synchronous, so no other code here runs while the process's directory is changed (the server and its
+// workers use absolute paths); on Windows the open current directory cannot be renamed or removed. The path must still
+// lead there afterwards, else the change is reported and the restore stays interrupted.
+function inside(root, directory, work, { create = false, relative = directory } = {}) {
+  const home = process.cwd(), parts = directory === "." ? [] : directory.split("/"), at = [];
+  const enter = (name, info) => {
+    process.chdir(name);
+    const here = statSync(".");
+    if (!info.isDirectory() || here.dev !== info.dev || here.ino !== info.ino) throw changedError(relative);
+    at.push(here);
+  };
+  try {
+    enter(root, lstatSync(root));
+    for (const [index, part] of parts.entries()) {
+      let info = lstatSync(part, { throwIfNoEntry: false });
+      if (!info && create) { mkdirSync(part); info = lstatSync(part); }
+      if (!info?.isDirectory() && !create) return undefined;
+      if (!info.isDirectory()) throw checkpointError(409, `${parts.slice(0, index + 1).join("/")} is in the way of ${relative}`, "CHECKPOINT_PATH_OBSTRUCTED");
+      enter(part, info);
+    }
+    const result = work();
+    for (const [index, expected] of at.entries()) {
+      const info = lstatSync(path.join(root, ...parts.slice(0, index)), { throwIfNoEntry: false });
+      if (!info?.isDirectory() || info.dev !== expected.dev || info.ino !== expected.ino) throw changedError(relative);
+    }
+    return result;
+  } finally { process.chdir(home); }
 }
 
-// Restore changes files only by pathname, so each change is checked against
-// links swapped in above it: a file is deleted only once it has been moved
-// aside under an unguessable name and found, after the move, still in the
-// worktree; a link above it moves it back. Any change stops the restore,
-// which stays interrupted and holds the worktree.
-async function removeFile(root, relative) {
-  // A link or file now where a directory was: nothing of the worktree's is there.
-  if (!await directories(root, path.posix.dirname(relative))) return;
-  const info = await lstat(path.join(root, relative)).catch(absent);
-  if (!info || info.isDirectory()) return;
-  const aside = relative.replace(/[^/]*$/, `.outright-${randomUUID()}.del`);
-  await rename(path.join(root, relative), path.join(root, aside));
-  if (!await unchanged(root, aside, info)) {
-    await rename(path.join(root, aside), path.join(root, relative)).catch(() => {});
-    throw changedError(relative);
-  }
-  await unlink(path.join(root, aside));
-  // Like Git, remove directories the deletion left empty, each checked first.
+// Deletes a file (never a directory), then, like Git, the directories that left empty.
+function removeFile(root, relative) {
+  inside(root, path.posix.dirname(relative), () => {
+    const name = path.posix.basename(relative), info = lstatSync(name, { throwIfNoEntry: false });
+    if (info && !info.isDirectory()) unlinkSync(name);
+  }, { relative });
   for (let directory = path.posix.dirname(relative); directory !== "."; directory = path.posix.dirname(directory)) {
-    if (!await directories(root, directory).catch(() => false)) break;
-    try { await rmdir(path.join(root, directory)); } catch { break; }
+    try { if (!inside(root, path.posix.dirname(directory), () => (rmdirSync(path.posix.basename(directory)), true), { relative })) break; }
+    catch (error) { if (error.details) throw error; break; }
   }
 }
 
 // Removes a directory where a file is restored, once the restore's
 // deletions have left nothing but empty directories in it.
-async function removeEmptyDirectory(root, relative) {
-  if (!await directories(root, path.posix.dirname(relative))) return;
-  const info = await lstat(path.join(root, relative)).catch(absent);
-  if (!info?.isDirectory()) return;
-  for (const child of await readdir(path.join(root, relative), { withFileTypes: true })) {
+function removeEmptyDirectory(root, relative) {
+  const children = inside(root, relative, () => readdirSync(".", { withFileTypes: true }));
+  if (!children) return;
+  for (const child of children) {
     if (!child.isDirectory()) throw checkpointError(409, `${relative}/${child.name} is in the way of ${relative}`, "CHECKPOINT_PATH_OBSTRUCTED");
-    await removeEmptyDirectory(root, `${relative}/${child.name}`);
+    removeEmptyDirectory(root, `${relative}/${child.name}`);
   }
-  if (!await unchanged(root, relative, info)) throw changedError(relative);
-  await rmdir(path.join(root, relative));
+  inside(root, path.posix.dirname(relative), () => rmdirSync(path.posix.basename(relative)), { relative });
 }
 
 // Opens `relative` under `root` (a real path) with no link on the way: macOS refuses one anywhere, Linux reads back
@@ -1082,27 +1100,17 @@ async function unchanged(root, relative, expected) {
 }
 const changedError = (relative) => checkpointError(409, `${relative} changed while Outright was reading or writing it; try again`, "CHECKPOINT_CHANGED", { path: relative });
 
-// Writes one file through a new file beside it, created one directory level
-// at a time and opened as openInside does; content is written only once the
-// new file is known to be in the worktree, and the rename into place (in the
-// same directory) is checked after.
-async function writeFileAt(root, relative, content, executable) {
-  for (const ancestor of ancestors(relative)) {
-    const at = path.join(root, ancestor);
-    let info = await lstat(at).catch(absent);
-    if (!info) info = await mkdir(at).then(() => lstat(at));
-    if (!info.isDirectory()) throw checkpointError(409, `${ancestor} is in the way of ${relative}`, "CHECKPOINT_PATH_OBSTRUCTED");
-  }
-  const temporary = relative.replace(/[^/]*$/, `.outright-${randomUUID()}.tmp`);
-  try {
-    const { handle, info } = await openInside(root, temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, executable ? 0o777 : 0o666);
-    try { await handle.writeFile(content); } finally { await handle.close(); }
-    await rename(path.join(root, temporary), path.join(root, relative));
-    if (!await unchanged(root, relative, info)) throw changedError(relative);
-  } catch (error) {
-    await rm(path.join(root, temporary), { force: true }).catch(() => {});
-    throw error;
-  }
+// Writes one file through a new file beside it, made with no link followed, in the directory entered as above
+// (missing directories made one level at a time), and renamed into place there.
+function writeFileAt(root, relative, content, executable) {
+  inside(root, path.posix.dirname(relative), () => {
+    const temporary = `.outright-${randomUUID()}.tmp`;
+    try {
+      const fd = openSync(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | NO_FOLLOW, executable ? 0o777 : 0o666);
+      try { writeFileSync(fd, content); } finally { closeSync(fd); }
+      renameSync(temporary, path.posix.basename(relative));
+    } catch (error) { rmSync(temporary, { force: true }); throw error; }
+  }, { create: true, relative });
 }
 
 // A blob's object id, SHA-1 or SHA-256 as the repository uses.
