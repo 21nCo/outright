@@ -8,3 +8,6 @@ server/bin/
 *.db
 *.db-shm
 *.db-wal
+
+# Codex hooks are global (~/.codex/hooks.json); never commit repo-level ones
+.codex/hooks.json
