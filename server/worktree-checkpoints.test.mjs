@@ -970,3 +970,135 @@ test("preview and restore refuse a Git without overlay restore before changing a
   assert.equal(await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]), before, "a safety checkpoint was taken");
   await assert.rejects(readFile(path.join(repository, ".git", RESTORE_MARKER)), { code: "ENOENT" });
 });
+
+// Runs `body` (a module function given `createWorktreeCheckpoints` and the
+// directory) in a child process, so a lookup that blocks the thread fails
+// on the timeout instead of freezing the test runner.
+async function inChild(directory, body) {
+  const script = `const { createWorktreeCheckpoints } = await import(${JSON.stringify(new URL("./worktree-checkpoints.mjs", import.meta.url).href)});
+    const checkpoints = createWorktreeCheckpoints({ database: {}, subprocesses: { run: () => Promise.reject(new Error("no Git here")), capacity: () => ({ unknown: 0 }) } });
+    const attempt = (work) => { try { work(); return "admitted"; } catch (error) { return error.details?.code ?? error.message; } };
+    console.log(JSON.stringify(await (${body})(checkpoints, ${JSON.stringify(directory)}, attempt)));`;
+  const { stdout } = await execFileAsync(process.execPath, ["--input-type=module", "-e", script], { timeout: 10_000 });
+  return JSON.parse(stdout);
+}
+
+test("the Git directory is found through a linked .git, and one that cannot be read never blocks or frees the worktree", { skip: process.platform === "win32" && "no FIFOs or unprivileged links on Windows" }, async (t) => {
+  const { root, repository } = await fixture(t);
+  // A FIFO for .git: holding() and admitWriter() return at once and the worktree stays held.
+  const fifo = path.join(root, "fifo-worktree");
+  await mkdir(fifo);
+  await execFileAsync("mkfifo", [path.join(fifo, ".git")]);
+  assert.deepEqual(await inChild(fifo, `(checkpoints, directory, attempt) => [checkpoints.holding(directory), attempt(() => checkpoints.admitWriter([directory]))]`),
+    ["CHECKPOINT_RESTORE_INTERRUPTED", "CHECKPOINT_RESTORE_INTERRUPTED"]);
+  // A directory with no .git is not a worktree a restore can hold.
+  assert.deepEqual(await inChild(root, `(checkpoints, directory) => [checkpoints.holding(directory)]`), [null]);
+
+  // The write marker of a live write swapped for a FIFO: the next write is refused at once, never waited on.
+  assert.deepEqual(await inChild(repository, `async (checkpoints, directory, attempt) => {
+    const { rm } = await import("node:fs/promises");
+    const { execFileSync } = await import("node:child_process");
+    const release = checkpoints.admitWriter([directory]);
+    await rm(directory + "/.git/${WRITE_MARKER}");
+    execFileSync("mkfifo", [directory + "/.git/${WRITE_MARKER}"]);
+    const second = attempt(() => checkpoints.admitWriter([directory]));
+    release();
+    return [second];
+  }`), ["GIT_WRITE_UNRECORDED"]);
+  await rm(path.join(repository, ".git", WRITE_MARKER), { force: true });
+
+  // .git linked to the real Git directory: both markers hold a new instance,
+  // and a write records its marker in the directory the link names.
+  const real = path.join(root, "real-git");
+  await rename(path.join(repository, ".git"), real);
+  await symlink(real, path.join(repository, ".git"));
+  const checkpoint = await service().checkpoints.capture(target(repository));
+  await writeFile(path.join(real, RESTORE_MARKER), JSON.stringify({ version: 2, operationId: "op", checkpointId: checkpoint.id,
+    commit: checkpoint.commit, safetyCheckpointId: checkpoint.id, startedAt: new Date().toISOString(), paths: ["a.txt"] }));
+  assert.equal(service().checkpoints.holding(repository), "CHECKPOINT_RESTORE_INTERRUPTED");
+  await rm(path.join(real, RESTORE_MARKER));
+  let unknown = 1;
+  const capacity = () => ({ active: 0, limit: 8, unknown });
+  await writeFile(path.join(real, WRITE_MARKER), "stopped\n");
+  const { checkpoints } = service({ capacity });
+  assert.equal(checkpoints.holding(repository), "GIT_WRITE_UNCONFIRMED");
+  unknown = 0;
+  assert.equal(checkpoints.holding(repository), null);
+  await assert.rejects(lstat(path.join(real, WRITE_MARKER)), { code: "ENOENT" });
+  const release = checkpoints.admitWriter([repository]);
+  assert.ok((await lstat(path.join(real, WRITE_MARKER))).isFile());
+  release();
+  await assert.rejects(lstat(path.join(real, WRITE_MARKER)), { code: "ENOENT" });
+});
+
+test("a restore record or index swapped for a FIFO is refused at once, never waited on", { skip: process.platform === "win32" && "no FIFOs on Windows" }, async (t) => {
+  const { repository } = await fixture(t);
+  const { checkpoints } = service();
+  const checkpoint = await checkpoints.capture(target(repository));
+  const promptly = async (work) => {
+    let timer;
+    const hung = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("blocked on a FIFO")), 5_000); });
+    try { return await Promise.race([work, hung]); } finally { clearTimeout(timer); }
+  };
+  await execFileAsync("mkfifo", [path.join(repository, ".git", RESTORE_MARKER)]);
+  const described = await promptly(checkpoints.describe(target(repository)));
+  assert.deepEqual([described.restore.status, described.restore.unreadable], ["interrupted", true]);
+  assert.equal(checkpoints.holding(repository), "CHECKPOINT_RESTORE_INTERRUPTED");
+  await promptly(checkpoints.recover(target(repository), "keep"));
+  assert.equal(checkpoints.holding(repository), null);
+
+  const index = path.join(repository, ".git", "index");
+  await rename(index, `${index}-moved`);
+  await execFileAsync("mkfifo", [index]);
+  await assert.rejects(promptly(checkpoints.capture(target(repository))), (error) => error.code === "EFTYPE");
+  assert.equal((await checkpoints.describe(target(repository))).busy, null);
+  await rm(index);
+  await rename(`${index}-moved`, index);
+  assert.notEqual((await checkpoints.capture(target(repository))).id, checkpoint.id);
+});
+
+test("a restore refused admission at the retention limit leaves checkpoints, files and the record as they were", async (t) => {
+  const { repository } = await fixture(t);
+  let refuse = false;
+  const audits = [];
+  const database = {
+    auditAdmission: (action, details) => {
+      if (refuse && action.startsWith("worktree.checkpoint.restore")) throw Object.assign(new Error("Audit quota reached"), { statusCode: 507 });
+      audits.push({ action, details });
+    },
+    auditCritical: (action, details) => audits.push({ action, details }),
+  };
+  const { checkpoints } = service({ database, limits: { ...CHECKPOINT_LIMITS, perWorktree: 2 } });
+  await writeFile(path.join(repository, "a.txt"), "first\n");
+  await checkpoints.capture(target(repository));
+  await writeFile(path.join(repository, "a.txt"), "second\n");
+  const checkpoint = await checkpoints.capture(target(repository));
+  await writeFile(path.join(repository, "a.txt"), "current\n");
+  const refs = () => git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]);
+  const before = await refs();
+  const markerFile = path.join(repository, ".git", RESTORE_MARKER);
+
+  refuse = true;
+  await assert.rejects(restoreAll(checkpoints, repository, checkpoint.id), { message: "Audit quota reached" });
+  assert.equal(await refs(), before, "a safety checkpoint was recorded or an older one pruned before the admission");
+  assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "current\n");
+  await assert.rejects(lstat(markerFile), { code: "ENOENT" });
+
+  // Finishing an interrupted restore is admitted the same way.
+  const marker = JSON.stringify({ version: 2, operationId: "op", checkpointId: checkpoint.id, commit: checkpoint.commit,
+    safetyCheckpointId: checkpoint.id, startedAt: new Date().toISOString(), paths: ["a.txt"] });
+  await writeFile(markerFile, marker);
+  const preview = await checkpoints.preview(target(repository), checkpoint.id, { resume: true });
+  const resume = { id: checkpoint.id, planDigest: preview.planDigest, paths: ["a.txt"], resume: true };
+  await assert.rejects(checkpoints.restore(target(repository), resume), { message: "Audit quota reached" });
+  assert.equal(await refs(), before);
+  assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "current\n");
+  assert.equal(await readFile(markerFile, "utf8"), marker);
+
+  refuse = false;
+  const result = await checkpoints.restore(target(repository), resume);
+  assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "second\n");
+  const recorded = audits.find((entry) => entry.action === "worktree.checkpoint.restore.resumed");
+  assert.equal(recorded.details.safetyCheckpointId, result.safetyCheckpoint.id);
+  assert.equal(audits.find((entry) => entry.action === "worktree.checkpoint.restore.resumed.requested").details.operationId, recorded.details.operationId);
+});

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createWriteStream, constants as fsConstants, lstatSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { copyFile, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, realpath, rename, rm, rmdir, stat, unlink, utimes, writeFile } from "node:fs/promises";
+import { closeSync, createWriteStream, constants as fsConstants, fstatSync, lstatSync, openSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { lstat, mkdir, mkdtemp, open, readdir, readlink, realpath, rename, rm, rmdir, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -38,10 +38,7 @@ export const CHECKPOINT_REF_PREFIX = "refs/worktree/outright/checkpoints/";
 // anything and removed once it has finished; while it is there, the restore
 // did not finish and the worktree is held against other writers.
 export const RESTORE_MARKER = "outright-checkpoint-restore.json";
-// Written beside it when a stage, unstage or commit is admitted, before its
-// Git process starts, and removed when it ends with its process accounted
-// for; one that lost track of its process, or a runtime that stopped while
-// one was admitted, leaves it until no process with a lost owner is left.
+// Written beside it before an admitted stage, unstage or commit starts Git, and kept, when its process is lost or the runtime stops, until no process with a lost owner is left.
 export const WRITE_MARKER = "outright-git-write-unconfirmed";
 const ID_PATTERN = /^[0-9a-z]{6,12}-[0-9a-f]{8}$/;
 const OID_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
@@ -98,14 +95,10 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     try { return (await git(cwd, args)).trim() || null; }
     catch (error) { if (error.code === 1) return null; throw error; }
   }
-  // Restore writes files with `git restore --overlay --pathspec-from-file`,
-  // which Git 2.26 added; an older Git is refused before anything changes.
+  // Restore needs `git restore --overlay --pathspec-from-file` (Git 2.26); an older Git is refused before anything changes.
   let restorable = null;
   async function requireRestoreGit(cwd) {
-    restorable ??= git(cwd, ["version"]).then((output) => {
-      const [, major = 0, minor = 0] = /(\d+)\.(\d+)/.exec(output) ?? [];
-      return Number(major) > 2 || (Number(major) === 2 && Number(minor) >= 26);
-    }, (error) => { restorable = null; throw error; });
+    restorable ??= git(cwd, ["version"]).then((output) => !/^git version (?:[01]\.|2\.(?:1?\d|2[0-5])\.)/.test(output.trim()), (error) => { restorable = null; throw error; });
     if (!await restorable) throw checkpointError(409, "Restoring a checkpoint needs Git 2.26 or newer; update Git and try again", "CHECKPOINT_GIT_UNSUPPORTED");
   }
   async function repository(cwd) {
@@ -114,20 +107,23 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     return { gitDir, indexPath: path.resolve(cwd, indexPath), emptyTree: EMPTY_TREES[format] ?? EMPTY_TREES.sha1, emptyBlob: EMPTY_BLOBS[format] ?? EMPTY_BLOBS.sha1 };
   }
 
-  // The worktree's Git directory without running Git, for the synchronous
-  // admission checks: `.git` is the directory or a file naming it.
+  // The worktree's Git directory without running Git, for the synchronous admission
+  // checks: `.git` (or what it links to) is the directory or a regular file naming it, read without blocking. Null without one; false, which holds, if unsettled.
   function gitDirOf(worktreePath) {
     if (gitDirs.has(worktreePath)) return gitDirs.get(worktreePath);
     const dotGit = path.join(worktreePath, ".git");
     try {
-      if (lstatSync(dotGit).isDirectory()) return dotGit;
-      const match = /^gitdir: *(.+?)\s*$/m.exec(readFileSync(dotGit, "utf8"));
-      return match ? path.resolve(worktreePath, match[1]) : null;
-    } catch { return null; }
+      if (statSync(dotGit).isDirectory()) return dotGit;
+      const fd = openSync(dotGit, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0)), buffer = Buffer.alloc(8192);
+      try {
+        const match = fstatSync(fd).isFile() && /^gitdir: *(.+?)\s*$/m.exec(buffer.toString("utf8", 0, readSync(fd, buffer)));
+        return match ? path.resolve(worktreePath, match[1]) : false;
+      } finally { closeSync(fd); }
+    } catch (error) { return ["ENOENT", "ENOTDIR"].includes(error.code) ? null : false; }
   }
   function markerPresent(worktreePath, name = RESTORE_MARKER) {
     const gitDir = gitDirOf(worktreePath);
-    if (!gitDir) return false;
+    if (!gitDir) return gitDir === false;
     try { lstatSync(path.join(gitDir, name)); return true; }
     // Anything but a missing marker keeps the worktree held.
     catch (error) { return !["ENOENT", "ENOTDIR"].includes(error.code); }
@@ -143,7 +139,6 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     unconfirmed.clear();
     strays.clear();
     for (const value of released) {
-      // A write admitted now keeps its own marker until it ends.
       if (!writing(value)) {
         try { removeWriteMarker(value); }
         catch { strays.add(value); }
@@ -153,15 +148,9 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     if (released.length) queueMicrotask(onRelease);
     return true;
   }
-  function writing(worktreePath) {
-    return [...admitted].some((token) => token.kind === "git" && token.paths.has(worktreePath));
-  }
-  function removeWriteMarker(worktreePath) {
-    const gitDir = gitDirOf(worktreePath);
-    if (gitDir) rmSync(path.join(gitDir, WRITE_MARKER), { force: true });
-  }
-  // While a write admitted by this runtime runs, the marker is its own; it is
-  // admitted only once any marker left before it was found stale.
+  function writing(worktreePath) { return [...admitted].some((token) => token.kind === "git" && token.paths.has(worktreePath)); }
+  function removeWriteMarker(worktreePath) { const gitDir = gitDirOf(worktreePath); if (gitDir) rmSync(path.join(gitDir, WRITE_MARKER), { force: true }); }
+  // While a write this runtime admitted runs, the marker is its own (admitted once any older one was found stale).
   function strayWrite(worktreePath) {
     if (!strays.has(worktreePath) && (writing(worktreePath) || !markerPresent(worktreePath, WRITE_MARKER))) return false;
     strays.add(worktreePath);
@@ -180,11 +169,8 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
 
   // Admits an application-owned writer (a Git stage, unstage or commit, or
   // a terminal launch) unless a restore holds the worktree; a restore is
-  // refused while one is admitted. Synchronous, as `claim` is. A Git write
-  // is recorded in WRITE_MARKER before it is admitted, so a runtime that
-  // stops while it runs leaves the worktree held after a restart. Returns
-  // the release, which takes the write's failure: a Git write that lost
-  // track of its process keeps the worktree held, across restarts too.
+  // refused while one is admitted. Synchronous, as `claim` is. A Git write is recorded in WRITE_MARKER before it is admitted, so a runtime
+  // that stops during it leaves the worktree held. The release takes the write's failure: one that lost its process keeps the worktree held.
   function admitWriter(paths, kind = "git") {
     const code = paths.map(holding).find(Boolean);
     if (code) throw checkpointError(409, holdMessage(code, "try again"), code);
@@ -195,9 +181,8 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
         const gitDir = gitDirOf(value);
         try {
           if (!gitDir) throw new Error("No Git directory");
-          writeFileSync(path.join(gitDir, WRITE_MARKER), stamp, { mode: 0o600 });
+          writeFileSync(path.join(gitDir, WRITE_MARKER), stamp, { mode: 0o600, flag: fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | (fsConstants.O_NONBLOCK ?? 0) });
         } catch (error) {
-          // Nothing durable says the write ran, so it does not run.
           for (const written of paths) if (!writing(written)) try { removeWriteMarker(written); } catch { strays.add(written); }
           throw checkpointError(503, "Outright could not record this Git write in the worktree's Git directory; try again", "GIT_WRITE_UNRECORDED", {}, error);
         }
@@ -344,7 +329,8 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       // newer than its content): a same-size edit in the second of the last
       // index write is still compared by content.
       const { atime, mtime } = await stat(repo.indexPath);
-      await copyFile(repo.indexPath, index);
+      const source = await openFile(repo.indexPath);
+      try { await pipeline(source.createReadStream({ autoClose: false }), createWriteStream(index, { flags: "wx", mode: 0o600 })); } finally { await source.close(); }
       await utimes(index, atime, mtime);
     } catch (error) { if (error.code !== "ENOENT") throw error; }
     const env = { GIT_INDEX_FILE: index };
@@ -376,8 +362,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     // Large files are refused before anything is copied into the object store.
     const found = new Map();
     const root = await realpath(cwd);
-    // Nothing is read through a link or file where a directory was: its
-    // tracked paths count as deleted, and Git lists the link or file itself.
+    // Nothing is read through a link or file where a directory was: its tracked paths count as deleted, and Git lists the link or file itself.
     const directories = new Map();
     const directory = (relative) => directories.get(relative) ?? directories.set(relative,
       lstat(path.join(cwd, relative)).then((info) => info.isDirectory(), () => false)).get(relative);
@@ -561,8 +546,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       // captured: restore would destroy it, so the path is not offered. The
       // file the restore deletes under another case of the same name is not
       // in the way once it is deleted, which happens first.
-      // Nothing is looked at through a link or file where a directory goes;
-      // once the restore deletes it, nothing is there.
+      // Nothing is looked at through a link or file where a directory goes; once the restore deletes it, nothing is there.
       let through = false;
       for (const ancestor of ancestors(item.path)) {
         const above = await lstat(path.join(cwd, ancestor)).catch(() => null);
@@ -603,8 +587,8 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
 
   async function readMarker(repo) {
     let text;
-    try { text = await readFile(path.join(repo.gitDir, RESTORE_MARKER), "utf8"); }
-    catch (error) { if (error.code === "ENOENT") return null; throw error; }
+    try { const handle = await openFile(path.join(repo.gitDir, RESTORE_MARKER)); try { text = await handle.readFile("utf8"); } finally { await handle.close(); } }
+    catch (error) { if (error.code === "ENOENT") return null; if (error.code !== "EFTYPE") throw error; }
     try {
       const marker = JSON.parse(text);
       if (marker?.version === 2 && ID_PATTERN.test(marker.checkpointId) && OID_PATTERN.test(marker.commit)
@@ -802,14 +786,16 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
         if (result.planDigest !== planDigest) throw checkpointError(409, "The worktree changed after the preview; review the new preview before restoring", "CHECKPOINT_PLAN_CHANGED");
         const ops = selectedOps(result.entries, chosenPaths(result.entries, { paths, except }));
         const name = result.checkpoint.label || id;
-        const safety = await record(cwd, repo, result.current, { label: resumed ? `Before finishing the restore of ${name}` : `Before restoring ${name}`,
-          reason: "before-restore", restoredFrom: id });
-        await prune(cwd, new Set([id, safety.id, ...markerCheckpoints(resumed)]));
-        const marker = { version: 2, operationId: randomUUID(), checkpointId: id, commit: result.checkpoint.commit, safetyCheckpointId: safety.id,
-          ...(resumed ? { earlierSafetyCheckpointIds: markerCheckpoints(resumed).filter((value) => value !== id) } : {}),
-          startedAt: now().toISOString(), paths: ops.map((op) => op.path) };
-        await audited(resumed ? "worktree.checkpoint.restore.resumed" : "worktree.checkpoint.restore", { target: cwd, checkpointId: id,
-          safetyCheckpointId: safety.id, operationId: marker.operationId, ...(resumed ? { resumes: resumed.operationId ?? null } : {}), paths: ops.length }, async () => {
+        // Admitted before the checkpoint of the state now and the retention after it, so a refused admission changes nothing.
+        const safety = await audited(resumed ? "worktree.checkpoint.restore.resumed" : "worktree.checkpoint.restore", { target: cwd, checkpointId: id,
+          ...(resumed ? { resumes: resumed.operationId ?? null } : {}), paths: ops.length }, async (evidence) => {
+          const safety = await record(cwd, repo, result.current, { label: resumed ? `Before finishing the restore of ${name}` : `Before restoring ${name}`,
+            reason: "before-restore", restoredFrom: id });
+          evidence.safetyCheckpointId = safety.id;
+          await prune(cwd, new Set([id, safety.id, ...markerCheckpoints(resumed)]));
+          const marker = { version: 2, operationId: evidence.operationId, checkpointId: id, commit: result.checkpoint.commit, safetyCheckpointId: safety.id,
+            ...(resumed ? { earlierSafetyCheckpointIds: markerCheckpoints(resumed).filter((value) => value !== id) } : {}),
+            startedAt: now().toISOString(), paths: ops.map((op) => op.path) };
           await writeMarker(repo, marker);
           try { await apply(cwd, ops, result.checkpoint.commit, scratch); }
           catch (error) {
@@ -820,6 +806,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
             throw interrupted(error, safety);
           }
           await clearMarker(repo);
+          return safety;
         });
         return { restored: ops.length, safetyCheckpoint: publicCheckpoint(safety) };
       });
@@ -1037,9 +1024,7 @@ async function removeEmptyDirectory(root, relative) {
   await rmdir(target);
 }
 
-// Copies, up to one byte over `limit`, the file `expected` (an lstat) found, through a
-// descriptor not reached through a link (on Linux, one at the path itself). O_NONBLOCK: a
-// FIFO or device swapped in must fail the type check, never hang the open.
+// Copies, up to one byte over `limit`, the file `expected` (an lstat) found, through a descriptor not reached through a link (on Linux, one at the path itself) and opened as openFile does.
 async function copyInside(root, relative, expected, destination, limit) {
   const file = path.join(root, relative);
   const handle = await open(file, fsConstants.O_RDONLY | NO_LINKS | (fsConstants.O_NONBLOCK ?? 0))
@@ -1052,6 +1037,13 @@ async function copyInside(root, relative, expected, destination, limit) {
     if (!await unchanged(root, relative, expected)) throw changedError(relative);
     return { size: (await stat(destination)).size, mode: info.mode };
   } finally { await handle.close(); }
+}
+// Opens a file an agent can replace without blocking: a FIFO or device in its place is refused (EFTYPE), never waited on.
+async function openFile(file) {
+  const handle = await open(file, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
+  if ((await handle.stat()).isFile()) return handle;
+  await handle.close();
+  throw Object.assign(new Error(`${file} is not a regular file`), { code: "EFTYPE" });
 }
 // Whether every ancestor is still a directory and the path still the same entry.
 async function unchanged(root, relative, expected) {
@@ -1070,7 +1062,6 @@ async function writeFileAt(root, relative, content, executable) {
   }
   const target = path.join(root, relative);
   await mkdir(path.dirname(target), { recursive: true });
-  // A fixed-length name, so a name near the length limit still has one.
   const temporary = path.join(path.dirname(target), `.outright-${randomUUID()}.tmp`);
   try {
     await writeFile(temporary, content, { mode: executable ? 0o777 : 0o666, flag: "wx" });
