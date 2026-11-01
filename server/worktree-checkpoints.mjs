@@ -87,6 +87,8 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   // those whose stage, unstage or commit did (also kept in WRITE_MARKER).
   const unconfirmed = new Set();
   const strays = new Set();
+  // Per worktree, the blob ids of converted files as they are on disk, by path, with the lstat they were read at.
+  const rawBlobs = new Map();
   let stopping = false;
 
   async function git(cwd, args, { env, maxBuffer = 16 * 1024 * 1024, encoding = "utf8", names = false } = {}) {
@@ -335,23 +337,28 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   // Tracked files Git converts on their way out can be unchanged to Git with bytes on disk that are not their index entry:
   // line endings where Git writes CRLF (above, or an eol=crlf attribute), told apart by Git's own line-ending info without
   // Outright reading the file, and files under ident, working-tree-encoding or, with a smudge or process driver configured,
-  // a filter attribute. Returned as lstats when a regular file within the per-file bound. Boundaries: a larger one (Git
-  // LFS content, for one) is recorded as Git stores it, and a conversion no longer configured is not seen.
+  // a filter attribute. `found` holds lstats of regular files within the per-file bound and, together, `totalBytes`;
+  // other regular files (Git LFS content, for one) are `unheld`. A conversion no longer configured is not seen.
   async function converted(temporary, cwd, settings, listed) {
-    const candidates = new Set(), found = new Map(), options = { maxBuffer: 64 * 1024 * 1024, names: true };
+    const candidates = new Set(), found = new Map(), unheld = new Set();
+    const list = (args) => temporary(args, { maxBuffer: 64 * 1024 * 1024, names: true }).catch((error) => {
+      throw error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" ? checkpointError(413, "This worktree has too many files Git converts to take checkpoints", "CHECKPOINT_TOO_LARGE") : error;
+    });
     const crlf = settings.crlf === "all" ? [":(exclude,attr:-text)"] : [":(attr:eol=crlf)", ...settings.crlf ? [":(attr:text)", ":(attr:text=auto)"] : []];
-    for (const record of (await temporary(["ls-files", "--eol", "-z", "--", ...crlf], options)).split("\0")) {
+    for (const record of (await list(["ls-files", "--eol", "-z", "--", ...crlf])).split("\0")) {
       // A file missing on disk (as one outside a sparse checkout is) has no line-ending info.
       const [, index, worktree] = /^i\/(\S*)\s+w\/(\S+)/.exec(record) ?? [];
       if (worktree && index !== worktree) candidates.add(record.slice(record.indexOf("\t") + 1));
     }
     const other = `:(exclude,attr:!ident !working-tree-encoding${settings.smudged ? " !filter" : ""})`;
-    for (const relative of (await temporary(["ls-files", "-z", "--", other], options)).split("\0")) if (relative) candidates.add(relative);
+    for (const relative of (await list(["ls-files", "-z", "--", other])).split("\0")) if (relative) candidates.add(relative);
+    let bytes = 0;
     for (const relative of candidates) {
       const info = listed.has(relative) ? null : await lstat(path.join(cwd, relative)).catch(absent);
-      if (info?.isFile() && info.size <= limits.fileBytes) found.set(relative, info);
+      if (info?.isFile() && info.size <= limits.fileBytes && bytes + info.size <= limits.totalBytes) { found.set(relative, info); bytes += info.size; }
+      else if (info?.isFile()) unheld.add(relative);
     }
-    return found;
+    return { found, unheld, bytes };
   }
 
   // The index and the files on disk as trees, through a copy of the index:
@@ -374,7 +381,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       try { await pipeline(source.createReadStream({ autoClose: false }), createWriteStream(index, { flags: "wx", mode: 0o600 })); } finally { await source.close(); }
       await utimes(index, atime, mtime);
     } catch (error) { if (error.code !== "ENOENT") throw error; }
-    const env = { GIT_INDEX_FILE: index };
+    const env = { GIT_INDEX_FILE: index }, started = now().getTime();
     const settings = await captureSettings(cwd);
     const temporary = (args, options) => git(cwd, [...settings.unfiltered, ...args], { ...options, env });
     let indexTree;
@@ -414,6 +421,8 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       found.set(relative, info);
     }
     const root = await realpath(cwd);
+    const known = rawBlobs.get(root) ?? rawBlobs.set(root, new Map()).get(root);
+    let reused = false;
     // Paths `counted` against the budget are checked against it above; others are copied as the lstat found them.
     const store = async (paths, counted) => { for (const batch of batches(paths)) {
       const entries = await indexEntries(cwd, env, batch);
@@ -430,6 +439,9 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
           if (!await unchanged(root, relative, info)) throw changedError(relative);
           hashed.push({ relative, source: link, mode: "120000", entry });
         } else if (info.isFile()) {
+          // A converted file is read again only when its lstat changed since a read when it was over two seconds old.
+          const key = !counted && [info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs, entry?.mode, settings.fileMode, settings.symlinks].join();
+          if (key && known.get(relative)?.key === key) { reused = true; hashed.push({ ...known.get(relative), relative, entry }); continue; }
           // The type on disk, except where Git keeps a link as a file holding
           // its target, or does not track the executable bit.
           // Hashed from a copy of the file the lstat above found, never one a link swapped in since.
@@ -438,14 +450,18 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
           if (copied.size !== info.size) { if (!counted) throw changedError(relative); bytes -= info.size; count(relative, copied.size); }
           const executable = settings.fileMode ? (copied.mode & 0o111) !== 0 : entry?.mode === "100755";
           const link = !settings.symlinks && entry?.mode === "120000";
-          hashed.push({ relative, source, mode: link ? "120000" : executable ? "100755" : "100644", entry });
+          hashed.push({ relative, source, mode: link ? "120000" : executable ? "100755" : "100644", entry, key: Math.max(info.mtimeMs, info.ctimeMs) < started - 2000 && key });
         }
       }
+      const fresh = hashed.filter((item) => item.source);
       const oids = [];
-      for (const sources of batches(hashed.map((item) => item.source))) {
+      for (const sources of batches(fresh.map((item) => item.source))) {
         oids.push(...(await git(cwd, ["hash-object", "-w", "--no-filters", "--", ...sources])).trim().split("\n"));
       }
-      const updates = hashed.map((item, position) => ({ ...item, oid: oids[position] }))
+      fresh.forEach((item, position) => { item.oid = oids[position]; if (item.key) known.set(item.relative, { key: item.key, oid: item.oid, mode: item.mode }); });
+      // Copies are removed batch by batch, so scratch space holds one batch.
+      await Promise.all(fresh.map((item) => rm(item.source, { force: true })));
+      const updates = hashed
         // A `git add -N` entry holds the empty blob but is left out of trees, so one is always replaced.
         .filter((item) => OID_PATTERN.test(item.oid ?? "") && (item.entry?.mode !== item.mode || item.entry?.oid !== item.oid || item.oid === repo.emptyBlob));
       if (removed.length) await temporary(["update-index", "--force-remove", "--", ...removed]);
@@ -458,10 +474,29 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     // a restore writes those bytes, but they are not changes and count against no budget (Git stores each content once).
     const viewTree = (await temporary(["write-tree"])).trim();
     const conversions = await converted(temporary, cwd, settings, new Set(changedPaths));
-    for (const [relative, info] of conversions) found.set(relative, info);
-    await store([...conversions.keys()], false);
-    const filesTree = conversions.size ? (await temporary(["write-tree"])).trim() : viewTree;
-    return { indexTree, filesTree, viewTree, head, branch, bytes };
+    for (const [relative, info] of conversions.found) found.set(relative, info);
+    await store([...conversions.found.keys()], false);
+    let filesTree = viewTree;
+    try { if (conversions.found.size) filesTree = (await temporary(["write-tree"])).trim(); }
+    catch (error) {
+      // A blob reused from an earlier capture that Git has since collected is read again.
+      if (error.code !== 128 || !reused) throw error;
+      rawBlobs.delete(root);
+      return snapshot(cwd, repo, scratch, when);
+    }
+    // Converted files not held are listed as empty files in a tree of their own; a restore that would change one refuses.
+    let unheld = null;
+    if (conversions.unheld.size) {
+      const empty = path.join(scratch, `empty-${randomUUID()}`), unheldEnv = { GIT_INDEX_FILE: path.join(scratch, `unheld-${randomUUID()}`) };
+      await writeFile(empty, "", { flag: "wx" });
+      const oid = (await git(cwd, ["hash-object", "-w", "--no-filters", "--", empty])).trim();
+      for (const batch of batches([...conversions.unheld].map((relative) => `100644,${oid},${relative}`))) {
+        await git(cwd, ["update-index", "--add", ...batch.flatMap((value) => ["--cacheinfo", value])], { env: unheldEnv });
+      }
+      unheld = (await git(cwd, ["write-tree"], { env: unheldEnv })).trim();
+    }
+    // Converted files count toward retention as stored, though Git stores each content once.
+    return { indexTree, filesTree, viewTree, head, branch, bytes: bytes + conversions.bytes, unheld };
   }
 
   async function counts(cwd, repo, { indexTree, filesTree, head }) {
@@ -479,11 +514,12 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     const id = `${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
     // The view Git has, where it differs from the files as recorded, is kept as a parent for listings.
     const view = trees.viewTree && trees.viewTree !== trees.filesTree ? (await git(cwd, ["commit-tree", "--no-gpg-sign", trees.viewTree, "-m", "Outright checkpoint view"], { env: IDENTITY })).trim() : null;
+    const unheld = trees.unheld ? (await git(cwd, ["commit-tree", "--no-gpg-sign", trees.unheld, "-m", "Outright checkpoint unheld files"], { env: IDENTITY })).trim() : null;
     const meta = { version: 1, id, label: cleanLabel(label, limits.labelCharacters), reason, createdAt: now().toISOString(), head: trees.head, branch: trees.branch,
-      bytes: trees.bytes, counts: await counts(cwd, repo, { ...trees, filesTree: trees.viewTree ?? trees.filesTree }), ...(view ? { view } : {}), ...(restoredFrom ? { restoredFrom } : {}) };
+      bytes: trees.bytes, counts: await counts(cwd, repo, { ...trees, filesTree: trees.viewTree ?? trees.filesTree }), ...(view ? { view } : {}), ...(unheld ? { unheld } : {}), ...(restoredFrom ? { restoredFrom } : {}) };
     const parents = trees.head ? ["-p", trees.head] : [];
     const indexCommit = (await git(cwd, ["commit-tree", "--no-gpg-sign", trees.indexTree, ...parents, "-m", "Outright checkpoint index"], { env: IDENTITY })).trim();
-    const commit = (await git(cwd, ["commit-tree", "--no-gpg-sign", trees.filesTree, "-p", indexCommit, ...parents, ...(view ? ["-p", view] : []),
+    const commit = (await git(cwd, ["commit-tree", "--no-gpg-sign", trees.filesTree, "-p", indexCommit, ...parents, ...(view ? ["-p", view] : []), ...(unheld ? ["-p", unheld] : []),
       "-m", `Outright checkpoint: ${meta.label || id}\n\n${JSON.stringify(meta)}`], { env: IDENTITY })).trim();
     await git(cwd, ["update-ref", "-m", "Outright checkpoint", `${CHECKPOINT_REF_PREFIX}${id}`, commit, ""]);
     return { ...meta, commit };
@@ -581,6 +617,10 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     }
     if (byPath.size > limits.planEntries) throw checkpointError(413, `Restoring would change more than ${limits.planEntries} paths`, "CHECKPOINT_TOO_LARGE");
     const entries = [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
+    // A file this checkpoint, or the one of the state now, could not hold as it is on disk is not written or deleted (`unheld`).
+    for (const tree of [checkpoint.unheld, current.unheld].filter(Boolean)) {
+      for (const relative of (await blobs(cwd, tree, entries.filter((item) => item.file).map((item) => item.path))).keys()) byPath.get(relative).unheld = true;
+    }
     const group = new Map(entries.map((item) => [item.path, item.path]));
     const find = (value) => { while (group.get(value) !== value) value = group.get(value); return value; };
     for (const item of entries) {
@@ -854,6 +894,9 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
         const sizes = await blobs(cwd, result.checkpoint.commit, ops.filter((op) => op.file === "write").map((op) => op.path));
         const large = [...sizes].find(([, blob]) => blob.size > limits.fileBytes)?.[0];
         if (large) throw checkpointError(413, `${large} is larger than ${mebibytes(limits.fileBytes)}; leave it out of this restore and restore it with Git`, "CHECKPOINT_TOO_LARGE", { path: large });
+        const unheld = new Set(result.entries.filter((item) => item.unheld).map((item) => item.path));
+        const lost = ops.find((op) => unheld.has(op.path))?.path;
+        if (lost) throw checkpointError(413, `${lost} is converted by Git and was too large to hold as it is on disk; leave it out of this restore`, "CHECKPOINT_TOO_LARGE", { path: lost, unheld: true });
         if (Buffer.byteLength(JSON.stringify([ops.map((op) => op.path), markerCheckpoints(resumed)])) + 1024 > limits.recordBytes) throw recordTooLarge();
         // Admitted before the checkpoint of the state now and the retention after it, so a refused admission changes nothing.
         const safety = await audited(resumed ? "worktree.checkpoint.restore.resumed" : "worktree.checkpoint.restore", { target: cwd, checkpointId: id,
@@ -1048,7 +1091,8 @@ function readMeta(id, commit, body) {
     createdAt: typeof meta.createdAt === "string" ? meta.createdAt : null, head: OID_PATTERN.test(meta.head ?? "") ? meta.head : null,
     branch: typeof meta.branch === "string" ? meta.branch : null, bytes: count(meta.bytes),
     counts: { staged: count(meta.counts?.staged), unstaged: count(meta.counts?.unstaged), untracked: count(meta.counts?.untracked) },
-    restoredFrom: typeof meta.restoredFrom === "string" ? meta.restoredFrom : null, view: OID_PATTERN.test(meta.view ?? "") ? meta.view : null };
+    restoredFrom: typeof meta.restoredFrom === "string" ? meta.restoredFrom : null, view: OID_PATTERN.test(meta.view ?? "") ? meta.view : null,
+    unheld: OID_PATTERN.test(meta.unheld ?? "") ? meta.unheld : null };
 }
 
 function publicCheckpoint({ id, commit, label, reason, createdAt, head, branch, bytes, counts, restoredFrom, unreadable }) {

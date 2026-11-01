@@ -575,6 +575,105 @@ test("a clean checkout Git converted is never refused or counted, has no read of
   await assert.rejects(lstat(path.join(repository, "s", "out1.txt")), { code: "ENOENT" });
 });
 
+// Converted on checkout and made older than the index, so Git trusts their stat data and sees them unchanged.
+async function convertedCheckout(repository, names) {
+  for (const name of names) await rm(path.join(repository, name));
+  await git(repository, ["checkout", "--", ...names]);
+  for (const name of names) await utimes(path.join(repository, name), new Date(Date.now() - 10_000), new Date(Date.now() - 10_000));
+  await git(repository, ["update-index", "-q", "--refresh"]);
+  assert.equal(await status(repository), "");
+}
+
+test("a converted file too large to hold as it is on disk is marked in the preview, and a restore that would change it refuses before anything changes", async (t) => {
+  const { repository } = await fixture(t);
+  // A Git LFS-like filter: a short pointer in Git, large content on disk.
+  await git(repository, ["config", "filter.large.smudge", "cat; printf '%03000d\\n' 0"]);
+  await git(repository, ["config", "filter.large.clean", "head -n 1"]);
+  await writeFile(path.join(repository, ".gitattributes"), "*.bin filter=large\n");
+  await writeFile(path.join(repository, "big.bin"), "pointer\n");
+  await git(repository, ["add", "."]);
+  await git(repository, ["commit", "-qm", "large"]);
+  await convertedCheckout(repository, ["big.bin"]);
+  const large = await readFile(path.join(repository, "big.bin"));
+  assert.equal(large.length, 3009);
+  const { checkpoints } = service({ limits: { ...CHECKPOINT_LIMITS, fileBytes: 2048 } });
+  const checkpoint = await checkpoints.capture(target(repository));
+  assert.deepEqual(checkpoint.counts, { staged: 0, unstaged: 0, untracked: 0 });
+  await writeFile(path.join(repository, "big.bin"), "edited\n");
+  await writeFile(path.join(repository, "a.txt"), "edited\n");
+  const refs = await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]);
+  const preview = await checkpoints.preview(target(repository), checkpoint.id);
+  assert.deepEqual(preview.entries.map((entry) => [entry.path, Boolean(entry.unheld)]), [["a.txt", false], ["big.bin", true]]);
+  await assert.rejects(checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: ["a.txt", "big.bin"] }),
+    (error) => error.statusCode === 413 && error.details.code === "CHECKPOINT_TOO_LARGE" && error.details.path === "big.bin" && error.details.unheld === true);
+  assert.equal(await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]), refs);
+  assert.equal(await readFile(path.join(repository, "big.bin"), "utf8"), "edited\n");
+  assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "edited\n");
+  assert.equal(checkpoints.holding(repository), null);
+  // Left out, the rest restores.
+  await checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: ["a.txt"] });
+  assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "committed\n");
+  // The other way: the file as it is now cannot be held, so a restore over it would lose it.
+  const edited = await checkpoints.capture(target(repository));
+  await convertedCheckout(repository, ["big.bin"]);
+  const back = await checkpoints.preview(target(repository), edited.id);
+  assert.deepEqual(back.entries.map((entry) => [entry.path, Boolean(entry.unheld)]), [["big.bin", true]]);
+  await assert.rejects(checkpoints.restore(target(repository), { id: edited.id, planDigest: back.planDigest, paths: ["big.bin"] }),
+    (error) => error.statusCode === 413 && error.details.path === "big.bin");
+  assert.deepEqual(await readFile(path.join(repository, "big.bin")), large);
+});
+
+test("converted files are held as they are on disk up to the total bound, counted for retention, and read again only once they change", async (t) => {
+  const { repository } = await fixture(t);
+  await writeFile(path.join(repository, ".gitattributes"), "*.txt text eol=crlf\n");
+  const names = ["c1.txt", "c2.txt", "c3.txt"];
+  for (const name of names) await writeFile(path.join(repository, name), `${name}\n`.repeat(200));
+  await git(repository, ["add", "."]);
+  await git(repository, ["commit", "-qm", "text"]);
+  await convertedCheckout(repository, ["a.txt", "old.txt", ...names]);
+  const sizes = await Promise.all(names.map(async (name) => (await lstat(path.join(repository, name))).size));
+  const opened = [];
+  const fsp = createRequire(import.meta.url)("node:fs/promises"), open = fsp.open;
+  fsp.open = (...args) => { opened.push(path.basename(String(args[0]))); return open(...args); };
+  syncBuiltinESMExports();
+  t.after(() => { fsp.open = open; syncBuiltinESMExports(); });
+  // Every file on disk here is at least two seconds old, as files untouched for a while are.
+  const later = () => new Date(Date.now() + 10_000);
+  const size = async (name) => (await lstat(path.join(repository, name))).size;
+  // In Git's order a.txt, c1.txt and c2.txt fit the total bound; c3.txt and old.txt are past it.
+  const held = await size("a.txt") + sizes[0] + sizes[1];
+  const { checkpoints } = service({ limits: { ...CHECKPOINT_LIMITS, totalBytes: held + 5 }, now: later });
+  const checkpoint = await checkpoints.capture(target(repository));
+  assert.deepEqual(checkpoint.counts, { staged: 0, unstaged: 0, untracked: 0 });
+  assert.equal(checkpoint.bytes, held);
+  const rawId = async (name) => (await git(repository, ["hash-object", "--no-filters", name])).trim();
+  await git(repository, ["cat-file", "-e", await rawId("c1.txt")]);
+  for (const name of ["c3.txt", "old.txt"]) await assert.rejects(git(repository, ["cat-file", "-e", await rawId(name)]), undefined, `${name} was stored`);
+  // Unchanged since, nothing is read again.
+  opened.length = 0;
+  assert.equal((await checkpoints.capture(target(repository))).bytes, held);
+  assert.deepEqual(opened.filter((name) => name.endsWith(".txt")), []);
+  // Written again with the same bytes, Git still sees it unchanged and it is read again.
+  await writeFile(path.join(repository, "c2.txt"), await readFile(path.join(repository, "c2.txt")));
+  await git(repository, ["update-index", "-q", "--refresh"]);
+  assert.equal(await status(repository), "");
+  await checkpoints.capture(target(repository));
+  assert.deepEqual(opened.filter((name) => name.endsWith(".txt")), ["c2.txt"]);
+  // A blob Git has collected since (its checkpoints were deleted) is read again rather than recorded missing.
+  for (const ref of (await git(repository, ["for-each-ref", "--format=%(refname)", CHECKPOINT_REF_PREFIX])).trim().split("\n")) await git(repository, ["update-ref", "-d", ref]);
+  await git(repository, ["prune", "--expire=now"]);
+  await assert.rejects(git(repository, ["cat-file", "-e", await rawId("c1.txt")]));
+  opened.length = 0;
+  const last = await checkpoints.capture(target(repository));
+  assert.ok(opened.includes("c1.txt") && opened.includes("c2.txt"));
+  const files = Object.fromEntries(await Promise.all(["c1.txt", "c2.txt"].map(async (name) => [name, await readFile(path.join(repository, name))])));
+  for (const name of ["c1.txt", "c2.txt"]) await writeFile(path.join(repository, name), "edited\n");
+  const preview = await checkpoints.preview(target(repository), last.id);
+  await checkpoints.restore(target(repository), { id: last.id, planDigest: preview.planDigest, paths: ["c1.txt", "c2.txt"] });
+  for (const name of ["c1.txt", "c2.txt"]) assert.deepEqual(await readFile(path.join(repository, name)), files[name]);
+  assert.equal(await status(repository), "");
+});
+
 for (const symlinks of ["true", "false"]) {
   test(`a restore refuses a link over the per-file bound that the checkpoint kept from its commit, before anything changes (core.symlinks ${symlinks})`, { skip: process.platform === "win32" && symlinks === "true" && "links need privileges on Windows" }, async (t) => {
     const { repository } = await fixture(t);
