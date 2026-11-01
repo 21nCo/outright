@@ -703,6 +703,92 @@ test("converted files past the file-count bound are marked unheld rather than re
   assert.deepEqual(await readFile(path.join(repository, "c1.txt")), before["c1.txt"]);
 });
 
+for (const same of [false, true]) {
+  test(`a converted file held by the checkpoint but past the file-count bound now, unchanged to Git, ${same ? "is not offered when its bytes are the held ones" : "is offered and refused when its bytes differ"}`, async (t) => {
+    const { repository } = await fixture(t);
+    await writeFile(path.join(repository, ".gitattributes"), "a.txt text eol=crlf\nz.txt ident\n");
+    await writeFile(path.join(repository, "a.txt"), "a1\na2\n");
+    await writeFile(path.join(repository, "z.txt"), "$Id$\nz2\n");
+    await git(repository, ["add", "."]);
+    await git(repository, ["commit", "-qm", "converted"]);
+    // Git writes z.txt with its id expanded (held, the only converted file); a.txt stays LF, which Git does not see as converted.
+    await convertedCheckout(repository, ["z.txt"]);
+    await writeFile(path.join(repository, "a.txt"), "a1\na2\n");
+    await utimes(path.join(repository, "a.txt"), new Date(Date.now() - 10_000), new Date(Date.now() - 10_000));
+    await git(repository, ["update-index", "-q", "--refresh"]);
+    const expanded = await readFile(path.join(repository, "z.txt"));
+    const { checkpoints } = service({ limits: { ...CHECKPOINT_LIMITS, files: 1 } });
+    const checkpoint = await checkpoints.capture(target(repository));
+    assert.deepEqual(await git(repository, ["show", `${checkpoint.commit}:z.txt`]), expanded.toString());
+    // a.txt goes CRLF and takes the one converted slot; z.txt is now unheld, and Git sees both unchanged.
+    await writeFile(path.join(repository, "a.txt"), "a1\r\na2\r\n");
+    const edited = same ? expanded : Buffer.from("$Id: 0000000000000000000000000000000000000000 $\nz2\n");
+    await writeFile(path.join(repository, "z.txt"), edited);
+    for (const name of ["a.txt", "z.txt"]) await utimes(path.join(repository, name), new Date(Date.now() - 10_000), new Date(Date.now() - 10_000));
+    // Staged again (the same blobs): Git takes any size change as a change until it records the new size.
+    await git(repository, ["add", "a.txt", "z.txt"]);
+    assert.equal(await status(repository), "");
+    const preview = await checkpoints.preview(target(repository), checkpoint.id);
+    assert.deepEqual(preview.entries.map((entry) => [entry.path, Boolean(entry.unheld)]), same ? [["a.txt", false]] : [["a.txt", false], ["z.txt", true]]);
+    if (same) return;
+    const refs = await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]);
+    await assert.rejects(checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: ["a.txt", "z.txt"] }),
+      (error) => error.statusCode === 413 && error.details.path === "z.txt" && error.details.unheld === true && /number of files held/.test(error.message));
+    assert.equal(await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]), refs);
+    assert.deepEqual(await readFile(path.join(repository, "z.txt")), edited);
+    assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "a1\r\na2\r\n");
+  });
+}
+
+test("the converted files remembered for a worktree are only those its latest capture held, for a bounded number of worktrees", async (t) => {
+  const { root, repository } = await fixture(t);
+  await writeFile(path.join(repository, ".gitattributes"), "*.txt text eol=crlf\n");
+  await git(repository, ["add", "."]);
+  await git(repository, ["commit", "-qm", "crlf"]);
+  const rawBlobs = new Map();
+  const { checkpoints } = service({ rawBlobs, now: () => new Date(Date.now() + 10_000) });
+  // Each generation renames every converted file; earlier names are not kept.
+  let names = ["a.txt", "old.txt"];
+  for (let generation = 1; generation <= 3; generation += 1) {
+    const renamed = names.map((name) => `g${generation}-${name.replace(/^g\d+-/, "")}`);
+    for (const [from, to] of names.map((name, position) => [name, renamed[position]])) await git(repository, ["mv", from, to]);
+    await git(repository, ["commit", "-qm", `generation ${generation}`]);
+    await convertedCheckout(repository, renamed);
+    names = renamed;
+    await checkpoints.capture(target(repository));
+    assert.deepEqual([...rawBlobs.get(repository).keys()].sort(), [...names].sort());
+  }
+  // Nothing converted any more: nothing is kept for the worktree.
+  await writeFile(path.join(repository, ".gitattributes"), "");
+  await git(repository, ["commit", "-qm", "no conversion", "--", ".gitattributes"]);
+  for (const name of names) await writeFile(path.join(repository, name), (await readFile(path.join(repository, name), "utf8")).replaceAll("\r\n", "\n"));
+  await git(repository, ["add", ...names]);
+  assert.equal(await status(repository), "");
+  await checkpoints.capture(target(repository));
+  assert.equal(rawBlobs.has(repository), false);
+  // Other worktrees: only the most recently captured few are kept.
+  const others = [];
+  for (let count = 0; count < 9; count += 1) {
+    const other = path.join(root, `other-${count}`);
+    await git(root, ["clone", "-q", "-c", "core.autocrlf=true", repository, `other-${count}`]);
+    await checkpoints.capture(target(other));
+    others.push(other);
+  }
+  assert.ok(rawBlobs.size <= 8, `${rawBlobs.size} worktrees kept`);
+  assert.ok(rawBlobs.has(others.at(-1)) && !rawBlobs.has(others[0]));
+});
+
+test("a checkpoint diff of a file whose name starts with two dots is not refused as outside the worktree", async (t) => {
+  const { repository } = await fixture(t);
+  await writeFile(path.join(repository, "..notes"), "notes\n");
+  const { checkpoints } = service();
+  const checkpoint = await checkpoints.capture(target(repository));
+  await writeFile(path.join(repository, "..notes"), "edited\n");
+  const { currentTree: tree } = await checkpoints.preview(target(repository), checkpoint.id);
+  assert.match((await checkpoints.fileDiff(target(repository), { id: checkpoint.id, tree, file: "..notes" })).diff, /^\+notes$/m);
+  await assert.rejects(checkpoints.fileDiff(target(repository), { id: checkpoint.id, tree, file: "../outside" }), (error) => error.statusCode === 400);
+});
+
 for (const symlinks of ["true", "false"]) {
   test(`a restore refuses a link over the per-file bound that the checkpoint kept from its commit, before anything changes (core.symlinks ${symlinks})`, { skip: process.platform === "win32" && symlinks === "true" && "links need privileges on Windows" }, async (t) => {
     const { repository } = await fixture(t);

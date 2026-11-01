@@ -77,7 +77,7 @@ const INDEX_LOCK_WAIT_MS = 250;
 // longer held by a restore, so agent runs that waited for it can launch;
 // `reconcile()` is called when the utility budget proves owners gone.
 export function createWorktreeCheckpoints({ database, subprocesses, publish = () => {}, writers = () => [], terminals = () => [],
-  onRelease = () => {}, limits = CHECKPOINT_LIMITS, now = () => new Date() }) {
+  onRelease = () => {}, limits = CHECKPOINT_LIMITS, now = () => new Date(), rawBlobs = new Map() }) {
   if (limits.planEntries < 2 * limits.files) throw new Error("Checkpoint planEntries must be at least twice files");
   const active = new Map();
   // Git stages, unstages and commits, and terminal launches, admitted
@@ -87,8 +87,9 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   // those whose stage, unstage or commit did (also kept in WRITE_MARKER).
   const unconfirmed = new Set();
   const strays = new Set();
-  // Per worktree, the blob ids of converted files as they are on disk, by path, with the lstat they were read at.
-  const rawBlobs = new Map();
+  // `rawBlobs`, per worktree, the blob ids of converted files as they are on disk, by path, with the lstat they were read
+  // at: only the files the worktree's latest capture held, for the most recently captured worktrees.
+  const RAW_BLOB_WORKTREES = 8;
   let stopping = false;
 
   async function git(cwd, args, { env, maxBuffer = 16 * 1024 * 1024, encoding = "utf8", names = false } = {}) {
@@ -422,7 +423,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       found.set(relative, info);
     }
     const root = await realpath(cwd);
-    const known = rawBlobs.get(root) ?? rawBlobs.set(root, new Map()).get(root);
+    const known = rawBlobs.get(root) ?? new Map(), kept = new Map();
     let reused = false;
     // Paths `counted` against the budget are checked against it above; others are copied as the lstat found them.
     const store = async (paths, counted) => { for (const batch of batches(paths)) {
@@ -442,7 +443,12 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
         } else if (info.isFile()) {
           // A converted file is read again only when its lstat changed since a read when it was over two seconds old.
           const key = !counted && [info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs, entry?.mode, settings.fileMode, settings.symlinks].join();
-          if (key && known.get(relative)?.key === key) { reused = true; hashed.push({ ...known.get(relative), relative, entry }); continue; }
+          if (key && known.get(relative)?.key === key) {
+            reused = true;
+            kept.set(relative, known.get(relative));
+            hashed.push({ ...known.get(relative), relative, entry });
+            continue;
+          }
           // The type on disk, except where Git keeps a link as a file holding
           // its target, or does not track the executable bit.
           // Hashed from a copy of the file the lstat above found, never one a link swapped in since.
@@ -459,7 +465,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       for (const sources of batches(fresh.map((item) => item.source))) {
         oids.push(...(await git(cwd, ["hash-object", "-w", "--no-filters", "--", ...sources])).trim().split("\n"));
       }
-      fresh.forEach((item, position) => { item.oid = oids[position]; if (item.key) known.set(item.relative, { key: item.key, oid: item.oid, mode: item.mode }); });
+      fresh.forEach((item, position) => { item.oid = oids[position]; if (item.key) kept.set(item.relative, { key: item.key, oid: item.oid, mode: item.mode }); });
       // Copies are removed batch by batch, so scratch space holds one batch.
       await Promise.all(fresh.map((item) => rm(item.source, { force: true })));
       const updates = hashed
@@ -485,6 +491,9 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       rawBlobs.delete(root);
       return snapshot(cwd, repo, scratch, when);
     }
+    rawBlobs.delete(root);
+    if (kept.size) rawBlobs.set(root, kept);
+    if (rawBlobs.size > RAW_BLOB_WORKTREES) rawBlobs.delete(rawBlobs.keys().next().value);
     // Converted files not held are listed as empty files in a tree of their own; a restore that would change one refuses.
     let unheld = null;
     if (conversions.unheld.size) {
@@ -596,6 +605,21 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   // `group` of `groupSize` paths, restored together or not at all. Finishing
   // an interrupted restore (`resumed`, its marker) offers only the paths it
   // was restoring.
+  // Whether the regular file at `relative` is exactly `blob` ({ oid, size }): its size first, then its bytes if within
+  // the per-file bound, so no more is read than the checkpoint held. A file that changes while read is not.
+  async function holds(root, relative, blob) {
+    const info = await lstat(path.join(root, relative)).catch(absent);
+    if (!blob || !info?.isFile() || info.size !== blob.size || info.size > limits.fileBytes) return false;
+    const { handle } = await openInside(root, relative, fsConstants.O_RDONLY).catch(() => ({}));
+    if (!handle) return false;
+    try {
+      const hash = createHash(blob.oid.length === 64 ? "sha256" : "sha1").update(`blob ${info.size}\0`);
+      // One byte past the size is read too, so a file that grew does not match.
+      for await (const chunk of handle.createReadStream({ start: 0, end: info.size, autoClose: false })) hash.update(chunk);
+      return hash.digest("hex") === blob.oid && await unchanged(root, relative, info);
+    } finally { await handle.close(); }
+  }
+
   async function plan(target, id, repo, scratch, resumed = null) {
     const cwd = target.worktreePath;
     const checkpoint = await load(cwd, id);
@@ -619,12 +643,17 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     if (byPath.size > limits.planEntries) throw checkpointError(413, `Restoring would change more than ${limits.planEntries} paths`, "CHECKPOINT_TOO_LARGE");
     // A file this checkpoint, or the one of the state now, could not hold as it is on disk is not written or deleted (`unheld`).
     const files = [...byPath.values()].filter((item) => item.file).map((item) => item.path);
-    for (const tree of [checkpoint.unheld, current.unheld].filter(Boolean)) for (const relative of (await blobs(cwd, tree, files)).keys()) byPath.get(relative).unheld = true;
-    // Unheld on one side, a file Git sees the same on both (only one side's bytes were held) is not a change.
+    const [unheldThen, unheldNow] = await Promise.all([checkpoint.unheld, current.unheld].map((tree) => tree ? blobs(cwd, tree, files) : new Map()));
+    for (const relative of [...unheldThen.keys(), ...unheldNow.keys()]) byPath.get(relative).unheld = true;
+    // A file Git sees the same on both sides is not a change when the checkpoint did not hold its bytes (they are not
+    // known, so a conversion that changed only them is not restored), or when it did and the file on disk is those bytes.
     const unheld = [...byPath.values()].filter((item) => item.unheld).map((item) => item.path);
-    const [seen, was] = await Promise.all([current.viewTree ?? current.filesTree, checkpoint.view ?? checkpoint.commit].map((tree) => blobs(cwd, tree, unheld)));
+    const [seen, was, held] = await Promise.all([current.viewTree ?? current.filesTree, checkpoint.view ?? checkpoint.commit, checkpoint.commit]
+      .map((tree) => blobs(cwd, tree, unheld)));
+    const root = unheld.length ? await realpath(cwd) : cwd;
     for (const relative of unheld) {
       if (seen.get(relative)?.oid !== was.get(relative)?.oid || seen.get(relative)?.mode !== was.get(relative)?.mode) continue;
+      if (!unheldThen.has(relative) && !await holds(root, relative, held.get(relative))) continue;
       const item = byPath.get(relative);
       if (item.index) { item.file = null; delete item.unheld; } else byPath.delete(relative);
     }
@@ -904,7 +933,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
         if (large) throw checkpointError(413, `${large} is larger than ${mebibytes(limits.fileBytes)}; leave it out of this restore and restore it with Git`, "CHECKPOINT_TOO_LARGE", { path: large });
         const unheld = new Set(result.entries.filter((item) => item.unheld).map((item) => item.path));
         const lost = ops.find((op) => unheld.has(op.path))?.path;
-        if (lost) throw checkpointError(413, `${lost} is converted by Git and was too large to hold as it is on disk; leave it out of this restore`, "CHECKPOINT_TOO_LARGE", { path: lost, unheld: true });
+        if (lost) throw checkpointError(413, `${lost} is converted by Git and was not held as it is on disk (too large, or past the number of files held); leave it out of this restore`, "CHECKPOINT_TOO_LARGE", { path: lost, unheld: true });
         if (Buffer.byteLength(JSON.stringify([ops.map((op) => op.path), markerCheckpoints(resumed)])) + 1024 > limits.recordBytes) throw recordTooLarge();
         // Admitted before the checkpoint of the state now and the retention after it, so a refused admission changes nothing.
         const safety = await audited(resumed ? "worktree.checkpoint.restore.resumed" : "worktree.checkpoint.restore", { target: cwd, checkpointId: id,
@@ -1270,7 +1299,10 @@ function cleanLabel(label, limit) {
 }
 function mebibytes(bytes) { return `${Math.round(bytes / (1024 * 1024))} MiB`; }
 async function present(target) { try { await lstat(target); return true; } catch { return false; } }
-function isWithin(root, target) { const relative = path.relative(root, target); return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative)); }
+function isWithin(root, target) {
+  const relative = path.relative(root, target);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
 function checkpointError(statusCode, message, code, extra = {}, cause) {
   const error = new Error(message, cause ? { cause } : undefined);
   error.statusCode = statusCode;
