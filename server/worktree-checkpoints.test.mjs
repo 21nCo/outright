@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { renameSync, symlinkSync } from "node:fs";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -1101,4 +1103,146 @@ test("a restore refused admission at the retention limit leaves checkpoints, fil
   const recorded = audits.find((entry) => entry.action === "worktree.checkpoint.restore.resumed");
   assert.equal(recorded.details.safetyCheckpointId, result.safetyCheckpoint.id);
   assert.equal(audits.find((entry) => entry.action === "worktree.checkpoint.restore.resumed.requested").details.operationId, recorded.details.operationId);
+});
+
+// Calls `hook(name, firstPath)` before each fs/promises function named, for this test only.
+function fsSeam(t, names, hook) {
+  const require = createRequire(import.meta.url);
+  const fsp = require("node:fs/promises");
+  const originals = Object.fromEntries(names.map((name) => [name, fsp[name]]));
+  for (const name of names) fsp[name] = (...args) => { hook(name, String(args[0])); return originals[name](...args); };
+  syncBuiltinESMExports();
+  t.after(() => { Object.assign(fsp, originals); syncBuiltinESMExports(); });
+}
+
+test("a restore never writes or deletes outside the worktree through a directory swapped for a link while it runs", { skip: process.platform === "win32" && "directory links need privileges on Windows" }, async (t) => {
+  let armed = null;
+  // Old and new call sites alike: the swap happens just before the restore's file write or deletion.
+  fsSeam(t, ["writeFile", "open", "rename", "unlink"], (name, first) => { if (armed?.(name, first)) armed = null; });
+  const cases = [
+    ["write, before the new file is created", (name, first) => ["writeFile", "open"].includes(name) && first.includes("/dir/.outright-")],
+    ["write, before the new file is renamed into place", (name, first) => name === "rename" && first.includes("/dir/.outright-") && first.endsWith(".tmp")],
+    ["delete", (name, first) => ["rename", "unlink"].includes(name) && first.endsWith("/dir/gone.txt")],
+  ];
+  for (const [label, when] of cases) {
+    const { root, repository } = await fixture(t);
+    const outside = path.join(root, "outside");
+    await mkdir(outside);
+    await writeFile(path.join(outside, "f.txt"), "EXTERNAL\n");
+    await writeFile(path.join(outside, "gone.txt"), "EXTERNAL GONE\n");
+    await mkdir(path.join(repository, "dir"));
+    await writeFile(path.join(repository, "dir", "keep.txt"), "kept\n");
+    const deleting = label === "delete";
+    if (!deleting) await writeFile(path.join(repository, "dir", "f.txt"), "checkpoint content\n");
+    const { checkpoints } = service();
+    const checkpoint = await checkpoints.capture(target(repository));
+    if (deleting) await writeFile(path.join(repository, "dir", "gone.txt"), "made after\n");
+    else await rm(path.join(repository, "dir", "f.txt"));
+    const preview = await checkpoints.preview(target(repository), checkpoint.id);
+    armed = (name, first) => {
+      if (!when(name, first)) return false;
+      renameSync(path.join(repository, "dir"), path.join(repository, "dir.real"));
+      symlinkSync(outside, path.join(repository, "dir"));
+      return true;
+    };
+    await assert.rejects(checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: preview.entries.map((entry) => entry.path) }),
+      (error) => error.details.code === "CHECKPOINT_RESTORE_INTERRUPTED", label);
+    assert.equal(armed, null, `${label}: the swap happened`);
+    assert.deepEqual((await readdir(outside)).sort(), ["f.txt", "gone.txt"], label);
+    assert.equal(await readFile(path.join(outside, "f.txt"), "utf8"), "EXTERNAL\n", label);
+    assert.equal(await readFile(path.join(outside, "gone.txt"), "utf8"), "EXTERNAL GONE\n", label);
+    assert.equal(checkpoints.holding(repository), "CHECKPOINT_RESTORE_INTERRUPTED", label);
+
+    // Once the swap is undone, the restore finishes through a new preview.
+    await rm(path.join(repository, "dir"));
+    await rename(path.join(repository, "dir.real"), path.join(repository, "dir"));
+    const resumed = await checkpoints.preview(target(repository), checkpoint.id, { resume: true });
+    await checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: resumed.planDigest, resume: true,
+      paths: resumed.entries.filter((entry) => !entry.blocked).map((entry) => entry.path) });
+    assert.equal(checkpoints.holding(repository), null, label);
+    // A new file the swap kept from its rename stays where it was made, in the worktree, never outside it.
+    const left = (await readdir(path.join(repository, "dir"))).filter((name) => !/^\.outright-[0-9a-f-]+\.tmp$/.test(name));
+    assert.deepEqual(left.sort(), deleting ? ["keep.txt"] : ["f.txt", "keep.txt"], label);
+    if (!deleting) assert.equal(await readFile(path.join(repository, "dir", "f.txt"), "utf8"), "checkpoint content\n");
+  }
+});
+
+test("a path that cannot be read is never taken for a deletion, in a capture or a restore", { skip: (process.platform === "win32" || process.getuid?.() === 0) && "needs POSIX permissions that apply" }, async (t) => {
+  const { repository } = await fixture(t);
+  const directory = path.join(repository, "d");
+  await mkdir(directory);
+  await writeFile(path.join(directory, "f.txt"), "one\n");
+  await git(repository, ["add", "d"]);
+  await git(repository, ["commit", "-qm", "d"]);
+  t.after(() => chmod(directory, 0o755).catch(() => {}));
+  let lockAfter = null;
+  const { checkpoints } = service({ run: async (file, args, options) => {
+    const result = await execFileAsync(file, args, options);
+    if (lockAfter?.(args)) { lockAfter = null; await chmod(directory, 0o000); }
+    return result;
+  } });
+
+  // Capture: d/f.txt changed, then unreadable once Git has listed it.
+  await writeFile(path.join(directory, "f.txt"), "two\n");
+  const before = await status(repository);
+  lockAfter = (args) => args.includes("--modified");
+  await assert.rejects(checkpoints.capture(target(repository)), (error) => error.code === "EACCES");
+  await chmod(directory, 0o755);
+  assert.equal(await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]), "");
+  assert.equal(await status(repository), before);
+  assert.equal(await readFile(path.join(directory, "f.txt"), "utf8"), "two\n");
+
+  // Restore: a checkpoint without d/f.txt, restored once d is unreadable, stops instead of skipping the deletion.
+  await git(repository, ["rm", "-qf", "d/f.txt"]);
+  const checkpoint = await checkpoints.capture(target(repository));
+  await git(repository, ["reset", "-q", "--hard"]);
+  const preview = await checkpoints.preview(target(repository), checkpoint.id);
+  lockAfter = (args) => args[2] === "update-ref" && args.includes("Outright checkpoint");
+  await assert.rejects(checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: preview.entries.map((entry) => entry.path) }),
+    (error) => error.details.code === "CHECKPOINT_RESTORE_INTERRUPTED");
+  await chmod(directory, 0o755);
+  assert.equal(await readFile(path.join(directory, "f.txt"), "utf8"), "one\n");
+  assert.equal(checkpoints.holding(repository), "CHECKPOINT_RESTORE_INTERRUPTED");
+});
+
+test("the Git write and restore records are never written or read through a link swapped in for them", { skip: process.platform === "win32" && "no unprivileged links on Windows" }, async (t) => {
+  const { root, repository } = await fixture(t);
+  const sentinel = path.join(root, "sentinel.txt");
+  await writeFile(sentinel, "EXTERNAL BYTES\n");
+  const { checkpoints } = service({ capacity: () => ({ active: 0, limit: 8, unknown: 0 }) });
+  const release = checkpoints.admitWriter([repository]);
+  const marker = path.join(repository, ".git", WRITE_MARKER);
+  await rm(marker);
+  await symlink(sentinel, marker);
+  assert.throws(() => checkpoints.admitWriter([repository]), (error) => error.details.code === "GIT_WRITE_UNRECORDED");
+  release();
+  assert.equal(await readFile(sentinel, "utf8"), "EXTERNAL BYTES\n");
+  await assert.rejects(lstat(marker), { code: "ENOENT" });
+
+  // A link for the restore record is an unreadable record that holds the worktree, never the file it names.
+  const checkpoint = await checkpoints.capture(target(repository));
+  await writeFile(sentinel, JSON.stringify({ version: 2, operationId: "op", checkpointId: checkpoint.id, commit: checkpoint.commit,
+    safetyCheckpointId: checkpoint.id, startedAt: new Date().toISOString(), paths: ["a.txt"] }));
+  await symlink(sentinel, path.join(repository, ".git", RESTORE_MARKER));
+  const described = await checkpoints.describe(target(repository));
+  assert.deepEqual([described.restore.status, described.restore.unreadable], ["interrupted", true]);
+  assert.equal(checkpoints.holding(repository), "CHECKPOINT_RESTORE_INTERRUPTED");
+});
+
+test("a worktree created again at the same path records its Git writes in its own Git directory", async (t) => {
+  const { root, repository } = await fixture(t);
+  const worktree = path.join(root, "linked");
+  await git(repository, ["worktree", "add", "-q", "--detach", worktree]);
+  const { checkpoints } = service({ capacity: () => ({ active: 0, limit: 8, unknown: 0 }) });
+  await checkpoints.capture(target(worktree));
+  await git(repository, ["worktree", "remove", "--force", worktree]);
+  const other = path.join(root, "other");
+  await git(root, ["init", "-q", "other"]);
+  await git(other, ["-c", "user.email=o@example.test", "-c", "user.name=O", "commit", "-q", "--allow-empty", "-m", "o"]);
+  await git(other, ["worktree", "add", "-q", "--detach", worktree]);
+  const gitDir = (await git(worktree, ["rev-parse", "--absolute-git-dir"])).trim();
+  const release = checkpoints.admitWriter([worktree]);
+  assert.ok((await lstat(path.join(gitDir, WRITE_MARKER))).isFile());
+  release();
+  await assert.rejects(lstat(path.join(gitDir, WRITE_MARKER)), { code: "ENOENT" });
 });

@@ -47,6 +47,8 @@ const EMPTY_TREES = { sha1: "4b825dc642cb6eb9a060e54bf8d69288fbee4904", sha256: 
 const EMPTY_BLOBS = { sha1: "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391", sha256: "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813" };
 // macOS refuses a link anywhere in the path (O_NOFOLLOW_ANY), elsewhere only at its end.
 const NO_LINKS = process.platform === "darwin" ? 0x20000000 : fsConstants.O_NOFOLLOW ?? 0;
+// A link at the end of a path in the Git directory, which may itself be reached through links.
+const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
 const IDENTITY = { GIT_AUTHOR_NAME: "Outright", GIT_AUTHOR_EMAIL: "checkpoints@outright.invalid",
   GIT_COMMITTER_NAME: "Outright", GIT_COMMITTER_EMAIL: "checkpoints@outright.invalid" };
 const LITERAL = { GIT_LITERAL_PATHSPECS: "1" };
@@ -82,7 +84,6 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   // those whose stage, unstage or commit did (also kept in WRITE_MARKER).
   const unconfirmed = new Set();
   const strays = new Set();
-  const gitDirs = new Map();
   let stopping = false;
 
   async function git(cwd, args, { env, maxBuffer = 16 * 1024 * 1024, encoding = "utf8" } = {}) {
@@ -103,14 +104,13 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   }
   async function repository(cwd) {
     const [gitDir, indexPath, format] = (await git(cwd, ["rev-parse", "--absolute-git-dir", "--git-path", "index", "--show-object-format"])).trim().split("\n");
-    gitDirs.set(cwd, gitDir);
     return { gitDir, indexPath: path.resolve(cwd, indexPath), emptyTree: EMPTY_TREES[format] ?? EMPTY_TREES.sha1, emptyBlob: EMPTY_BLOBS[format] ?? EMPTY_BLOBS.sha1 };
   }
 
   // The worktree's Git directory without running Git, for the synchronous admission
   // checks: `.git` (or what it links to) is the directory or a regular file naming it, read without blocking. Null without one; false, which holds, if unsettled.
+  // Read every time, never remembered: a worktree created again at the same path has another one.
   function gitDirOf(worktreePath) {
-    if (gitDirs.has(worktreePath)) return gitDirs.get(worktreePath);
     const dotGit = path.join(worktreePath, ".git");
     try {
       if (statSync(dotGit).isDirectory()) return dotGit;
@@ -181,7 +181,8 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
         const gitDir = gitDirOf(value);
         try {
           if (!gitDir) throw new Error("No Git directory");
-          writeFileSync(path.join(gitDir, WRITE_MARKER), stamp, { mode: 0o600, flag: fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | (fsConstants.O_NONBLOCK ?? 0) });
+          // Never written through a link swapped in for the marker (ELOOP refuses the write).
+          writeFileSync(path.join(gitDir, WRITE_MARKER), stamp, { mode: 0o600, flag: fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | NO_FOLLOW | (fsConstants.O_NONBLOCK ?? 0) });
         } catch (error) {
           for (const written of paths) if (!writing(written)) try { removeWriteMarker(written); } catch { strays.add(written); }
           throw checkpointError(503, "Outright could not record this Git write in the worktree's Git directory; try again", "GIT_WRITE_UNRECORDED", {}, error);
@@ -365,11 +366,11 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     // Nothing is read through a link or file where a directory was: its tracked paths count as deleted, and Git lists the link or file itself.
     const directories = new Map();
     const directory = (relative) => directories.get(relative) ?? directories.set(relative,
-      lstat(path.join(cwd, relative)).then((info) => info.isDirectory(), () => false)).get(relative);
+      lstat(path.join(cwd, relative)).then((info) => info.isDirectory(), (error) => absent(error) ?? false)).get(relative);
     for (const relative of changedPaths) {
       let readable = true;
       for (const ancestor of ancestors(relative)) if (!(readable = await directory(ancestor))) break;
-      const info = readable ? await lstat(path.join(cwd, relative)).catch(() => null) : null;
+      const info = readable ? await lstat(path.join(cwd, relative)).catch(absent) : null;
       if (info?.isFile()) count(relative, info.size);
       found.set(relative, info);
     }
@@ -549,12 +550,12 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       // Nothing is looked at through a link or file where a directory goes; once the restore deletes it, nothing is there.
       let through = false;
       for (const ancestor of ancestors(item.path)) {
-        const above = await lstat(path.join(cwd, ancestor)).catch(() => null);
+        const above = await lstat(path.join(cwd, ancestor)).catch(absent);
         if (!above || above.isDirectory()) continue;
         through = true;
         if (byPath.get(ancestor)?.file?.action !== "delete") item.blocked = `An ignored file is in the way at ${ancestor}`;
       }
-      const info = through ? null : await lstat(path.join(cwd, item.path)).catch(() => null);
+      const info = through ? null : await lstat(path.join(cwd, item.path)).catch(absent);
       const renamed = info && !info.isDirectory() && await sameFile(cwd, info, deleted.get(folded(item.path)) ?? []);
       if (renamed) group.set(find(item.path), find(renamed));
       else if (info?.isDirectory()) {
@@ -587,8 +588,9 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
 
   async function readMarker(repo) {
     let text;
-    try { const handle = await openFile(path.join(repo.gitDir, RESTORE_MARKER)); try { text = await handle.readFile("utf8"); } finally { await handle.close(); } }
-    catch (error) { if (error.code === "ENOENT") return null; if (error.code !== "EFTYPE") throw error; }
+    try { const handle = await openFile(path.join(repo.gitDir, RESTORE_MARKER), NO_FOLLOW); try { text = await handle.readFile("utf8"); } finally { await handle.close(); } }
+    // A link or FIFO in its place is an unreadable record, which holds the worktree; it is never read through.
+    catch (error) { if (error.code === "ENOENT") return null; if (!["EFTYPE", "ELOOP"].includes(error.code)) throw error; }
     try {
       const marker = JSON.parse(text);
       if (marker?.version === 2 && ID_PATTERN.test(marker.checkpointId) && OID_PATTERN.test(marker.commit)
@@ -643,7 +645,8 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     if (checkedOut.length) {
       const list = path.join(scratch, `paths-${randomUUID()}`);
       await writeFile(list, `${checkedOut.join("\0")}\0`, { mode: 0o600 });
-      // Overlay mode writes only the listed files and removes nothing.
+      // Overlay mode writes only the listed files and removes nothing. Residual: Git checks for a
+      // link above each path before writing (as these helpers do) but not atomically with the write.
       await indexWrite(cwd, ["restore", "--overlay", `--source=${commit}`, "--worktree", `--pathspec-from-file=${list}`, "--pathspec-file-nul"], { env: LITERAL });
     }
     await writeRecorded(cwd, root, commit, writes.filter((op) => op.raw));
@@ -947,7 +950,7 @@ function folded(relative) { return relative.normalize("NFC").toLowerCase(); }
 // `info` describes, under another name.
 async function sameFile(cwd, info, candidates) {
   for (const candidate of candidates) {
-    const other = await lstat(path.join(cwd, candidate)).catch(() => null);
+    const other = await lstat(path.join(cwd, candidate)).catch(absent);
     if (other && other.ino === info.ino && other.dev === info.dev) return candidate;
   }
   return null;
@@ -995,52 +998,78 @@ function ancestors(relative) {
   return parts.slice(0, -1).map((_, index) => parts.slice(0, index + 1).join("/"));
 }
 
+// Only a path that is not there is absent; any other error (EACCES, EIO) stops the capture or restore, never counts as a deletion.
+function absent(error) { if (["ENOENT", "ENOTDIR"].includes(error.code)) return null; throw error; }
+// Whether `relative` and every directory above it are directories, not links or files.
+async function directories(root, relative) {
+  for (const part of [...ancestors(relative), relative]) if (!(await lstat(path.join(root, part)).catch(absent))?.isDirectory()) return false;
+  return true;
+}
+
+// Restore changes files only by pathname, so each change is checked against
+// links swapped in above it: a file is deleted only once it has been moved
+// aside under an unguessable name and found, after the move, still in the
+// worktree; a link above it moves it back. Any change stops the restore,
+// which stays interrupted and holds the worktree.
 async function removeFile(root, relative) {
-  const target = path.join(root, relative);
-  // A parent replaced by a link must not lead a deletion out of the worktree.
-  const parent = await realpath(path.dirname(target)).catch(() => null);
-  if (!parent || !isWithin(root, parent)) return;
-  const info = await lstat(target).catch(() => null);
+  // A link or file now where a directory was: nothing of the worktree's is there.
+  if (!await directories(root, path.posix.dirname(relative))) return;
+  const info = await lstat(path.join(root, relative)).catch(absent);
   if (!info || info.isDirectory()) return;
-  await unlink(target);
-  // Like Git, remove directories the deletion left empty.
-  for (let directory = path.dirname(target); directory !== root && isWithin(root, directory); directory = path.dirname(directory)) {
-    try { await rmdir(directory); } catch { break; }
+  const aside = relative.replace(/[^/]*$/, `.outright-${randomUUID()}.del`);
+  await rename(path.join(root, relative), path.join(root, aside));
+  if (!await unchanged(root, aside, info)) {
+    await rename(path.join(root, aside), path.join(root, relative)).catch(() => {});
+    throw changedError(relative);
+  }
+  await unlink(path.join(root, aside));
+  // Like Git, remove directories the deletion left empty, each checked first.
+  for (let directory = path.posix.dirname(relative); directory !== "."; directory = path.posix.dirname(directory)) {
+    if (!await directories(root, directory).catch(() => false)) break;
+    try { await rmdir(path.join(root, directory)); } catch { break; }
   }
 }
 
 // Removes a directory where a file is restored, once the restore's
 // deletions have left nothing but empty directories in it.
 async function removeEmptyDirectory(root, relative) {
-  const target = path.join(root, relative);
-  const parent = await realpath(path.dirname(target)).catch(() => null);
-  if (!parent || !isWithin(root, parent)) return;
-  const info = await lstat(target).catch(() => null);
+  if (!await directories(root, path.posix.dirname(relative))) return;
+  const info = await lstat(path.join(root, relative)).catch(absent);
   if (!info?.isDirectory()) return;
-  for (const child of await readdir(target, { withFileTypes: true })) {
+  for (const child of await readdir(path.join(root, relative), { withFileTypes: true })) {
     if (!child.isDirectory()) throw checkpointError(409, `${relative}/${child.name} is in the way of ${relative}`, "CHECKPOINT_PATH_OBSTRUCTED");
     await removeEmptyDirectory(root, `${relative}/${child.name}`);
   }
-  await rmdir(target);
+  if (!await unchanged(root, relative, info)) throw changedError(relative);
+  await rmdir(path.join(root, relative));
 }
 
-// Copies, up to one byte over `limit`, the file `expected` (an lstat) found, through a descriptor not reached through a link (on Linux, one at the path itself) and opened as openFile does.
-async function copyInside(root, relative, expected, destination, limit) {
+// Opens `relative` under `root` (a real path) with no link on the way: macOS refuses one anywhere, Linux reads back
+// where the descriptor is, and each ancestor and the entry opened are checked again. Anything else is a change.
+async function openInside(root, relative, flags, mode) {
   const file = path.join(root, relative);
-  const handle = await open(file, fsConstants.O_RDONLY | NO_LINKS | (fsConstants.O_NONBLOCK ?? 0))
+  const handle = await open(file, flags | NO_LINKS | (fsConstants.O_NONBLOCK ?? 0), mode)
     .catch((error) => { throw ["ENOENT", "ENOTDIR", "ELOOP", "EMLINK"].includes(error.code) ? changedError(relative) : error; });
   try {
     const info = await handle.stat();
-    if (!info.isFile() || info.dev !== expected.dev || info.ino !== expected.ino
-      || (process.platform === "linux" && await readlink(`/proc/self/fd/${handle.fd}`).catch(() => null) !== file)) throw changedError(relative);
+    if ((process.platform === "linux" && await readlink(`/proc/self/fd/${handle.fd}`).catch(() => null) !== file)
+      || !await unchanged(root, relative, info)) throw changedError(relative);
+    return { handle, info };
+  } catch (error) { await handle.close(); throw error; }
+}
+// Copies, up to one byte over `limit`, the file `expected` (an lstat) found, opened as openInside and openFile do.
+async function copyInside(root, relative, expected, destination, limit) {
+  const { handle, info } = await openInside(root, relative, fsConstants.O_RDONLY);
+  try {
+    if (!info.isFile() || info.dev !== expected.dev || info.ino !== expected.ino) throw changedError(relative);
     await pipeline(handle.createReadStream({ start: 0, end: limit, autoClose: false }), createWriteStream(destination, { flags: "wx", mode: 0o600 }));
     if (!await unchanged(root, relative, expected)) throw changedError(relative);
     return { size: (await stat(destination)).size, mode: info.mode };
   } finally { await handle.close(); }
 }
 // Opens a file an agent can replace without blocking: a FIFO or device in its place is refused (EFTYPE), never waited on.
-async function openFile(file) {
-  const handle = await open(file, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
+async function openFile(file, flags = 0) {
+  const handle = await open(file, fsConstants.O_RDONLY | flags | (fsConstants.O_NONBLOCK ?? 0));
   if ((await handle.stat()).isFile()) return handle;
   await handle.close();
   throw Object.assign(new Error(`${file} is not a regular file`), { code: "EFTYPE" });
@@ -1051,23 +1080,27 @@ async function unchanged(root, relative, expected) {
   const info = await lstat(path.join(root, relative)).catch(() => null);
   return info?.dev === expected.dev && info.ino === expected.ino;
 }
-const changedError = (relative) => checkpointError(409, `${relative} changed while the checkpoint was being taken; try again`, "CHECKPOINT_CHANGED", { path: relative });
+const changedError = (relative) => checkpointError(409, `${relative} changed while Outright was reading or writing it; try again`, "CHECKPOINT_CHANGED", { path: relative });
 
-// Writes one file through a new file beside it, never through a link.
+// Writes one file through a new file beside it, created one directory level
+// at a time and opened as openInside does; content is written only once the
+// new file is known to be in the worktree, and the rename into place (in the
+// same directory) is checked after.
 async function writeFileAt(root, relative, content, executable) {
   for (const ancestor of ancestors(relative)) {
-    const info = await lstat(path.join(root, ancestor)).catch(() => null);
-    if (!info) break;
+    const at = path.join(root, ancestor);
+    let info = await lstat(at).catch(absent);
+    if (!info) info = await mkdir(at).then(() => lstat(at));
     if (!info.isDirectory()) throw checkpointError(409, `${ancestor} is in the way of ${relative}`, "CHECKPOINT_PATH_OBSTRUCTED");
   }
-  const target = path.join(root, relative);
-  await mkdir(path.dirname(target), { recursive: true });
-  const temporary = path.join(path.dirname(target), `.outright-${randomUUID()}.tmp`);
+  const temporary = relative.replace(/[^/]*$/, `.outright-${randomUUID()}.tmp`);
   try {
-    await writeFile(temporary, content, { mode: executable ? 0o777 : 0o666, flag: "wx" });
-    await rename(temporary, target);
+    const { handle, info } = await openInside(root, temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, executable ? 0o777 : 0o666);
+    try { await handle.writeFile(content); } finally { await handle.close(); }
+    await rename(path.join(root, temporary), path.join(root, relative));
+    if (!await unchanged(root, relative, info)) throw changedError(relative);
   } catch (error) {
-    await rm(temporary, { force: true }).catch(() => {});
+    await rm(path.join(root, temporary), { force: true }).catch(() => {});
     throw error;
   }
 }
