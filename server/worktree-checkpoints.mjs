@@ -337,8 +337,9 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   // Tracked files Git converts on their way out can be unchanged to Git with bytes on disk that are not their index entry:
   // line endings where Git writes CRLF (above, or an eol=crlf attribute), told apart by Git's own line-ending info without
   // Outright reading the file, and files under ident, working-tree-encoding or, with a smudge or process driver configured,
-  // a filter attribute. `found` holds lstats of regular files within the per-file bound and, together, `totalBytes`;
-  // other regular files (Git LFS content, for one) are `unheld`. A conversion no longer configured is not seen.
+  // a filter attribute. `found` holds lstats of regular files within the per-file bound and, together, `files` and
+  // `totalBytes`; other regular files (Git LFS content, for one) are `unheld`. A conversion no longer configured is not seen.
+  // Residual (OUT-140): capture still runs Git once per batch of converted paths, so very large converted repos are slow.
   async function converted(temporary, cwd, settings, listed) {
     const candidates = new Set(), found = new Map(), unheld = new Set();
     const list = (args) => temporary(args, { maxBuffer: 64 * 1024 * 1024, names: true }).catch((error) => {
@@ -355,7 +356,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     let bytes = 0;
     for (const relative of candidates) {
       const info = listed.has(relative) ? null : await lstat(path.join(cwd, relative)).catch(absent);
-      if (info?.isFile() && info.size <= limits.fileBytes && bytes + info.size <= limits.totalBytes) { found.set(relative, info); bytes += info.size; }
+      if (info?.isFile() && found.size < limits.files && info.size <= limits.fileBytes && bytes + info.size <= limits.totalBytes) { found.set(relative, info); bytes += info.size; }
       else if (info?.isFile()) unheld.add(relative);
     }
     return { found, unheld, bytes };
@@ -616,11 +617,18 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
         mode: change.dstMode, oid: change.dstOid, raw: REGULAR_MODE.test(change.dstMode) };
     }
     if (byPath.size > limits.planEntries) throw checkpointError(413, `Restoring would change more than ${limits.planEntries} paths`, "CHECKPOINT_TOO_LARGE");
-    const entries = [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
     // A file this checkpoint, or the one of the state now, could not hold as it is on disk is not written or deleted (`unheld`).
-    for (const tree of [checkpoint.unheld, current.unheld].filter(Boolean)) {
-      for (const relative of (await blobs(cwd, tree, entries.filter((item) => item.file).map((item) => item.path))).keys()) byPath.get(relative).unheld = true;
+    const files = [...byPath.values()].filter((item) => item.file).map((item) => item.path);
+    for (const tree of [checkpoint.unheld, current.unheld].filter(Boolean)) for (const relative of (await blobs(cwd, tree, files)).keys()) byPath.get(relative).unheld = true;
+    // Unheld on one side, a file Git sees the same on both (only one side's bytes were held) is not a change.
+    const unheld = [...byPath.values()].filter((item) => item.unheld).map((item) => item.path);
+    const [seen, was] = await Promise.all([current.viewTree ?? current.filesTree, checkpoint.view ?? checkpoint.commit].map((tree) => blobs(cwd, tree, unheld)));
+    for (const relative of unheld) {
+      if (seen.get(relative)?.oid !== was.get(relative)?.oid || seen.get(relative)?.mode !== was.get(relative)?.mode) continue;
+      const item = byPath.get(relative);
+      if (item.index) { item.file = null; delete item.unheld; } else byPath.delete(relative);
     }
+    const entries = [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
     const group = new Map(entries.map((item) => [item.path, item.path]));
     const find = (value) => { while (group.get(value) !== value) value = group.get(value); return value; };
     for (const item of entries) {

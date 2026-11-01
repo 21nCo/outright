@@ -674,6 +674,35 @@ test("converted files are held as they are on disk up to the total bound, counte
   assert.equal(await status(repository), "");
 });
 
+test("converted files past the file-count bound are marked unheld rather than refused, and a restore that would change one refuses before anything changes", async (t) => {
+  const { repository } = await fixture(t);
+  await writeFile(path.join(repository, ".gitattributes"), "*.txt text eol=crlf\n");
+  const names = ["c1.txt", "c2.txt", "c3.txt"];
+  for (const name of names) await writeFile(path.join(repository, name), `${name}\n`);
+  await git(repository, ["add", "."]);
+  await git(repository, ["commit", "-qm", "text"]);
+  await convertedCheckout(repository, ["a.txt", "old.txt", ...names]);
+  const before = Object.fromEntries(await Promise.all(names.map(async (name) => [name, await readFile(path.join(repository, name))])));
+  // In Git's order a.txt and c1.txt fit two files; c2.txt, c3.txt and old.txt are past it. Git sees nothing changed, so nothing is refused.
+  const { checkpoints } = service({ limits: { ...CHECKPOINT_LIMITS, files: 2 } });
+  const checkpoint = await checkpoints.capture(target(repository));
+  assert.deepEqual(checkpoint.counts, { staged: 0, unstaged: 0, untracked: 0 });
+  const rawId = async (name) => (await git(repository, ["hash-object", "--no-filters", name])).trim();
+  await git(repository, ["cat-file", "-e", await rawId("c1.txt")]);
+  for (const name of ["c2.txt", "c3.txt"]) await assert.rejects(git(repository, ["cat-file", "-e", await rawId(name)]), undefined, `${name} was stored`);
+  for (const name of ["c1.txt", "c3.txt"]) await writeFile(path.join(repository, name), "edited\n");
+  const refs = await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]);
+  const preview = await checkpoints.preview(target(repository), checkpoint.id);
+  assert.deepEqual(preview.entries.map((entry) => [entry.path, Boolean(entry.unheld)]), [["c1.txt", false], ["c3.txt", true]]);
+  await assert.rejects(checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: ["c1.txt", "c3.txt"] }),
+    (error) => error.statusCode === 413 && error.details.code === "CHECKPOINT_TOO_LARGE" && error.details.path === "c3.txt" && error.details.unheld === true);
+  assert.equal(await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]), refs);
+  for (const name of ["c1.txt", "c3.txt"]) assert.equal(await readFile(path.join(repository, name), "utf8"), "edited\n");
+  assert.equal(checkpoints.holding(repository), null);
+  await checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: ["c1.txt"] });
+  assert.deepEqual(await readFile(path.join(repository, "c1.txt")), before["c1.txt"]);
+});
+
 for (const symlinks of ["true", "false"]) {
   test(`a restore refuses a link over the per-file bound that the checkpoint kept from its commit, before anything changes (core.symlinks ${symlinks})`, { skip: process.platform === "win32" && symlinks === "true" && "links need privileges on Windows" }, async (t) => {
     const { repository } = await fixture(t);
