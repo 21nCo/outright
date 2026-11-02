@@ -175,10 +175,15 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       if (hold) found.push({ code: hold, message: hold === "WORKTREE_LIFECYCLE_BUSY" ? "worktree setup or teardown is running" : "setup or teardown processes here are not confirmed stopped" });
       const interrupted = paths.map((worktreePath) => database.findUnresolvedInterruptedRunForWorktree(worktreePath)).find(Boolean);
       if (interrupted) found.push({ code: "RUN_RECOVERY_REQUIRED", message: "an interrupted agent run here is not resolved", runId: interrupted.id });
+      // Until terminal ownership is rebuilt, inherited shells are not listed.
+      const recovery = terminals.capacity();
+      if (recovery.recoveryPending) found.push({ code: "TERMINAL_RECOVERY_PENDING", message: recovery.recoveryError
+        ? "terminal ownership recovery stopped; restart Outright after checking storage" : "terminal ownership recovery is still scanning; retry shortly" });
       return found;
     },
+    // A recovered shell with no recorded worktree may be in any of them.
     terminals: (paths) => terminals.list({ saved: false })
-      .filter((terminal) => paths.includes(terminal.cwd) && !["exited", "ended"].includes(terminal.status))
+      .filter((terminal) => (paths.includes(terminal.cwd) || (terminal.recoveryReservation && !terminal.cwd)) && !["exited", "ended"].includes(terminal.status))
       .map((terminal) => ({ id: terminal.id, name: terminal.name })),
     onRelease: () => { if (!shuttingDown) agents?.resumeQueued(); } });
   runtimeCapacity = function runtimeCapacity() {

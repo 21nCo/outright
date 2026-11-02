@@ -3832,6 +3832,64 @@ test("a checkpoint restore is refused beside agent work and holds new runs and G
     return execFileAsync(file, args, options);
   } } }));
 
+test("a restore waits for terminal ownership recovery and confirms recovered shells with no recorded worktree", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const target = { projectId: project.id, worktreePath: worktree.path };
+  const notes = path.join(worktree.path, "notes.txt");
+  writeFileSync(notes, "checkpointed\n");
+  const created = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints", target);
+  assert.equal(created.statusCode, 201, created.raw);
+  const { id } = created.body.checkpoint;
+  writeFileSync(notes, "changed\n");
+  const restoreRequest = async (acknowledgeTerminals) => {
+    const preview = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints/preview", { ...target, id });
+    assert.equal(preview.statusCode, 200, preview.raw);
+    const restored = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints/restore",
+      { ...target, id, planDigest: preview.body.planDigest, paths: ["notes.txt"], acknowledgeTerminals });
+    return { preview: preview.body, restored };
+  };
+
+  // While the audit scan rebuilds inherited owners, none of them is listed.
+  const pending = Object.getOwnPropertyDescriptor(runtime.database, "terminalAuditScanPending");
+  const failure = Object.getOwnPropertyDescriptor(runtime.database, "terminalAuditScanError");
+  try {
+    Object.defineProperty(runtime.database, "terminalAuditScanPending", { configurable: true, get: () => true });
+    for (const error of [null, "storage unavailable"]) {
+      Object.defineProperty(runtime.database, "terminalAuditScanError", { configurable: true, get: () => error });
+      const { preview, restored } = await restoreRequest([]);
+      assert.deepEqual(preview.blockers.map((item) => item.code), ["TERMINAL_RECOVERY_PENDING"], JSON.stringify(preview));
+      assert.deepEqual([restored.statusCode, restored.body.code, restored.body.blockers?.map((item) => item.code)],
+        [409, "CHECKPOINT_WRITERS_ACTIVE", ["TERMINAL_RECOVERY_PENDING"]], restored.raw);
+      assert.match(restored.body.error, error ? /restart Outright/ : /retry shortly/);
+      assert.equal(readFileSync(notes, "utf8"), "changed\n");
+    }
+  } finally {
+    Object.defineProperty(runtime.database, "terminalAuditScanPending", pending);
+    Object.defineProperty(runtime.database, "terminalAuditScanError", failure);
+  }
+
+  // An inherited owner recorded without a worktree is charged to every one.
+  const list = runtime.terminals.list;
+  runtime.terminals.list = () => [
+    { id: "recovered-anywhere", cwd: null, name: "Terminal recovery required", status: "unknown", recoveryReservation: true },
+    { id: "shell-here", cwd: worktree.path, name: "zsh", status: "running" },
+    { id: "shell-elsewhere", cwd: path.join(worktree.path, "..", "elsewhere"), name: "zsh", status: "running" },
+    { id: "shell-exited", cwd: worktree.path, name: "zsh", status: "exited" },
+  ];
+  try {
+    const { preview, restored } = await restoreRequest(["shell-here"]);
+    assert.deepEqual(preview.blockers, []);
+    assert.deepEqual(preview.terminals.map((terminal) => terminal.id), ["recovered-anywhere", "shell-here"]);
+    assert.deepEqual([restored.statusCode, restored.body.code, restored.body.terminals?.map((terminal) => terminal.id)],
+      [409, "CHECKPOINT_TERMINALS_UNACKNOWLEDGED", ["recovered-anywhere", "shell-here"]], restored.raw);
+    assert.equal(readFileSync(notes, "utf8"), "changed\n");
+    const confirmed = await restoreRequest(["recovered-anywhere", "shell-here"]);
+    assert.equal(confirmed.restored.statusCode, 200, confirmed.restored.raw);
+  } finally {
+    runtime.terminals.list = list;
+  }
+  assert.equal(readFileSync(notes, "utf8"), "checkpointed\n");
+}, { subprocesses: { capacity: () => ({ active: 0, limit: 8 }), run: (file, args, options) => execFileAsync(file, args, options) } }));
+
 let interruptedAgentOptions;
 test("a restore that did not finish holds agent runs, setup and Git writes after a restart until its files are kept", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
   const target = { projectId: project.id, worktreePath: worktree.path };
