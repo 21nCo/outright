@@ -11,6 +11,9 @@ import { CHECKPOINT_LIMITS, CHECKPOINT_REF_PREFIX, RESTORE_MARKER, WRITE_MARKER,
 
 const execFileAsync = promisify(execFile);
 process.env.GIT_TRACE2_EVENT = "0";
+// Host Git config (a global Git LFS filter, for one) must not change what these tests see.
+process.env.GIT_CONFIG_GLOBAL = path.join(os.tmpdir(), `outright-absent-gitconfig-${process.pid}`);
+process.env.GIT_CONFIG_NOSYSTEM = "1";
 
 async function git(cwd, args) { return (await execFileAsync("git", ["-C", cwd, ...args], { encoding: "utf8" })).stdout; }
 
@@ -600,6 +603,27 @@ for (const normalized of ["core.autocrlf input", "* text=auto"]) {
     assert.equal(await status(repository), "");
   });
 }
+
+test("a file a clean-only filter changes on its way in restores as it was on disk, not as its index entry", async (t) => {
+  const { repository } = await fixture(t);
+  await git(repository, ["config", "filter.secret.clean", "sed s/SECRET/xxx/"]);
+  await writeFile(path.join(repository, ".gitattributes"), "s.txt filter=secret\n");
+  await writeFile(path.join(repository, "s.txt"), "x SECRET\n");
+  await utimes(path.join(repository, "s.txt"), new Date(Date.now() - 10_000), new Date(Date.now() - 10_000));
+  await git(repository, ["add", "."]);
+  await git(repository, ["commit", "-qm", "filtered"]);
+  assert.equal(await git(repository, ["show", "HEAD:s.txt"]), "x xxx\n");
+  assert.equal(await status(repository), "");
+  const { checkpoints } = service();
+  const checkpoint = await checkpoints.capture(target(repository));
+  assert.deepEqual(checkpoint.counts, { staged: 0, unstaged: 0, untracked: 0 });
+  assert.deepEqual((await checkpoints.inspect(target(repository), checkpoint.id)).entries, []);
+  await writeFile(path.join(repository, "s.txt"), "edited\n");
+  const { preview } = await restoreAll(checkpoints, repository, checkpoint.id);
+  assert.deepEqual(preview.entries.map((entry) => entry.path), ["s.txt"]);
+  assert.equal(await readFile(path.join(repository, "s.txt"), "utf8"), "x SECRET\n");
+  assert.equal(await status(repository), "");
+});
 
 // Converted on checkout and made older than the index, so Git trusts their stat data and sees them unchanged.
 async function convertedCheckout(repository, names) {

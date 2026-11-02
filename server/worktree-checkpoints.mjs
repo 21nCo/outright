@@ -307,22 +307,22 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   // executable bit and makes symbolic links; which files may have line endings
   // converted on checkout or check-in ("all" text with core.autocrlf true or input;
   // otherwise "text", those with a text or eol attribute, whatever core.eol says);
-  // and whether a filter changes files on checkout.
+  // and whether any filter driver (clean, smudge or process) is configured.
   async function captureSettings(cwd) {
     let listed = "";
     try { listed = await git(cwd, ["config", "-z", "--get-regexp", "^(filter\\..+\\.(clean|smudge|process|required)|core\\.(filemode|symlinks|autocrlf))$"]); }
     catch (error) { if (error.code !== 1) throw error; }
     const names = new Set();
     const settings = { "core.filemode": "true", "core.symlinks": "true", "core.autocrlf": "false" };
-    let smudged = false;
+    let filtered = false;
     for (const record of listed.split("\0")) {
       const key = record.split("\n", 1)[0];
       const filter = /^filter\.(.+)\.(clean|smudge|process|required)$/.exec(key);
-      if (filter) { names.add(filter[1]); smudged ||= ["smudge", "process"].includes(filter[2]); }
+      if (filter) { names.add(filter[1]); filtered ||= filter[2] !== "required"; }
       else if (key in settings) settings[key] = record.slice(key.length + 1).trim().toLowerCase();
     }
     const on = (key) => !/^(?:false|no|off|0)$/.test(settings[key]);
-    return { fileMode: on("core.filemode"), symlinks: on("core.symlinks"), smudged,
+    return { fileMode: on("core.filemode"), symlinks: on("core.symlinks"), filtered,
       crlf: on("core.autocrlf") ? "all" : "text",
       unfiltered: [...names].flatMap((name) => ["-c", `filter.${name}.clean=`, "-c", `filter.${name}.process=`, "-c", `filter.${name}.required=false`]) };
   }
@@ -340,7 +340,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   // Tracked files Git converts on checkout or check-in can be unchanged to Git with bytes on disk that are not their index entry:
   // line endings (above: CRLF written out, or CRLF normalized on add), told apart without reading files by a size on disk Git
   // recorded that is not the blob's (racy or unrefreshed entries, size 0, are read too; a file missing on disk, as one outside
-  // a sparse checkout is, is not), and files under ident, working-tree-encoding or, with a smudge or process driver configured,
+  // a sparse checkout is, is not), and files under ident, working-tree-encoding or, with a clean, smudge or process driver configured,
   // a filter attribute. `found` holds lstats of regular files within the per-file bound and, together, `files` and
   // `totalBytes`; other regular files (Git LFS content, for one) are `unheld`. A conversion no longer configured is not seen.
   // Residual (OUT-140): capture still runs Git once per batch of converted paths, so very large converted repos are slow.
@@ -353,7 +353,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     const recorded = await list(["ls-files", "--debug", "-z", "--", ...crlf]);
     const sizes = recorded ? new Map((await list(["ls-tree", "-r", "-l", "-z", viewTree])).split("\0").map((record) => [record.slice(record.indexOf("\t") + 1), record.split(/ +|\t/)[3]])) : new Map();
     for (const [, relative, size] of recorded.matchAll(DEBUGGED)) if (sizes.get(relative) !== size) candidates.add(relative);
-    const other = `:(exclude,attr:!ident !working-tree-encoding${settings.smudged ? " !filter" : ""})`;
+    const other = `:(exclude,attr:!ident !working-tree-encoding${settings.filtered ? " !filter" : ""})`;
     for (const relative of (await list(["ls-files", "-z", "--", other])).split("\0")) if (relative) candidates.add(relative);
     let bytes = 0;
     for (const relative of candidates) {
@@ -930,7 +930,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
         // Refused before anything is recorded, pruned or changed: a file or link over the per-file bound (one the checkpoint kept
         // from its commit), and a restore whose record of its paths (with room for its ids and times) would be over its bound.
         const sizes = await blobs(cwd, result.checkpoint.commit, ops.filter((op) => op.file === "write").map((op) => op.path));
-        const large = [...sizes].find(([, blob]) => blob.size > limits.fileBytes)?.[0];
+        const large = [...sizes].find(([, blob]) => !(blob.size <= limits.fileBytes))?.[0];
         if (large) throw checkpointError(413, `${large} is larger than ${mebibytes(limits.fileBytes)}; leave it out of this restore and restore it with Git`, "CHECKPOINT_TOO_LARGE", { path: large });
         const unheld = new Set(result.entries.filter((item) => item.unheld).map((item) => item.path));
         const lost = ops.find((op) => unheld.has(op.path))?.path;
