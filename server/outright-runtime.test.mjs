@@ -3891,7 +3891,8 @@ test("a Git write that lost its process before a restart holds the worktree unti
   assert.deepEqual(events.of("worktree.checkpoints").map((event) => event.payload.worktreePath), [worktree.path]);
   // The Changes pane and the sidebar learn of a restore through a rescan,
   // as the watcher does not see an index-only change in a linked worktree.
-  const rescanned = () => events.of("projects.changed").some((event) => event.payload.changedPath === worktree.path);
+  // The marker's removal is also seen by the watcher in the same window.
+  const rescanned = () => events.of("projects.changed").some((event) => event.payload.changedPaths.includes(worktree.path));
   for (const deadline = Date.now() + 10_000; !rescanned(); await new Promise((resolve) => setTimeout(resolve, 50))) {
     if (Date.now() > deadline) assert.fail("no project rescan followed the checkpoint change");
   }

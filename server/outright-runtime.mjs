@@ -35,6 +35,8 @@ function throwFailedRuntimeStartup(error, { eventHub, wss, database }) {
 // failed recovery that a later bootstrap request may explicitly restart.
 const RUN_RECOVERY_RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000];
 const RUN_RECOVERY_RESTART_COOLDOWN_MS = 1000;
+// At most this many paths are named by one `projects.changed` event.
+const RESCAN_PATHS = 64;
 const UTILITY_OWNER_RELEASE_ROUTE = /^\/api\/capacity\/utility-owners\/([0-9a-f-]{36})\/release$/;
 
 function transientRunRecoveryFailure(error) {
@@ -122,6 +124,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   let inFlightScan = null;
   let watcher = null;
   let watcherTimer = null;
+  // The paths a pending rescan covers, so a watcher event in the same window
+  // never hides a checkpoint change from `projects.changed`.
+  const rescanPaths = new Set();
   let shutdownPromise;
   let resolveShutdownCompletion;
   let rejectShutdownCompletion;
@@ -432,10 +437,13 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   function scheduleRescan(changedPath) {
     clearTimeout(watcherTimer);
     if (shuttingDown) return;
+    if (rescanPaths.size < RESCAN_PATHS) rescanPaths.add(changedPath);
     watcherTimer = setTimeout(async () => {
+      const changedPaths = [...rescanPaths];
+      rescanPaths.clear();
       try {
         const result = await projects(true);
-        publish({ type: "projects.changed", payload: { changedPath, projects: result.projects, scannedAt: result.scannedAt } });
+        publish({ type: "projects.changed", payload: { changedPath, changedPaths, projects: result.projects, scannedAt: result.scannedAt } });
       } catch { /* The next manual refresh will surface scanner errors. */ }
     }, 500);
   }
