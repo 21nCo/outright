@@ -3214,7 +3214,7 @@ function captureEvents(runtime) {
   // Storage reports each committed change's task ids as a set.
   return { taskChanges: () => events.filter((event) => event.type === "tasks.changed")
     .map((event) => ({ ...event.payload, taskIds: [...event.payload.taskIds].sort() })),
-    of: (type) => events.filter((event) => event.type === type), clear: () => { events.length = 0; } };
+    of: (type) => events.filter((event) => event.type === type), all: () => [...events], clear: () => { events.length = 0; } };
 }
 
 async function callRuntime(runtime, method, url, body) {
@@ -3888,6 +3888,50 @@ test("a restore waits for terminal ownership recovery and confirms recovered she
     runtime.terminals.list = list;
   }
   assert.equal(readFileSync(notes, "utf8"), "checkpointed\n");
+}, { subprocesses: { capacity: () => ({ active: 0, limit: 8 }), run: (file, args, options) => execFileAsync(file, args, options) } }));
+
+test("a checkpoint change is named by its project rescan however many watcher paths share the window", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const events = captureEvents(runtime);
+  const watched = (event) => event.type === "projects.changed" && Array.isArray(event.payload.changedPaths);
+  const waitFor = async (found, what) => {
+    for (const deadline = Date.now() + 20_000; !found(); await new Promise((resolve) => setTimeout(resolve, 25))) {
+      if (Date.now() > deadline) assert.fail(`timed out waiting for ${what}`);
+    }
+  };
+  // The watcher reports changes once its initial scan is done.
+  let probes = 0;
+  const probe = setInterval(() => writeFileSync(path.join(worktree.path, `probe-${probes++}.txt`), "probe\n"), 600);
+  try {
+    await waitFor(() => events.all().some(watched), "the watcher to report a change");
+  } finally {
+    clearInterval(probe);
+  }
+  events.clear();
+  // Changes arriving faster than the rescan debounce keep one window open
+  // while more watcher paths than one event names, then the checkpoint, join it.
+  let written = 0;
+  const flood = setInterval(() => {
+    for (let burst = 0; burst < 16; burst += 1) writeFileSync(path.join(worktree.path, `flood-${written++}.txt`), "flood\n");
+  }, 50);
+  try {
+    await waitFor(() => written >= 160, "the watcher paths");
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    const created = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints", { projectId: project.id, worktreePath: worktree.path });
+    assert.equal(created.statusCode, 201, created.raw);
+  } finally {
+    clearInterval(flood);
+  }
+  const checkpointAt = events.all().findIndex((event) => event.type === "worktree.checkpoints");
+  assert.notEqual(checkpointAt, -1, "the checkpoint change was not published");
+  const coalesced = !events.all().slice(0, checkpointAt).some(watched);
+  const rescan = () => events.all().slice(checkpointAt).find(watched);
+  await waitFor(rescan, "the rescan after the checkpoint change");
+  const { changedPaths, changedPathsTruncated } = rescan().payload;
+  assert.ok(changedPaths.includes(worktree.path), `the checkpoint's worktree is missing from ${changedPaths.length} changed paths`);
+  assert.ok(changedPaths.length <= 65, `${changedPaths.length} changed paths`);
+  // Unless a stalled event loop let an earlier rescan fire, the flood
+  // exceeded the bound and the event says its list is incomplete.
+  if (coalesced) assert.equal(changedPathsTruncated, true);
 }, { subprocesses: { capacity: () => ({ active: 0, limit: 8 }), run: (file, args, options) => execFileAsync(file, args, options) } }));
 
 let interruptedAgentOptions;

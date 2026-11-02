@@ -35,7 +35,7 @@ function throwFailedRuntimeStartup(error, { eventHub, wss, database }) {
 // failed recovery that a later bootstrap request may explicitly restart.
 const RUN_RECOVERY_RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000];
 const RUN_RECOVERY_RESTART_COOLDOWN_MS = 1000;
-// At most this many paths are named by one `projects.changed` event.
+// At most this many watcher paths are named by one `projects.changed` event.
 const RESCAN_PATHS = 64;
 const UTILITY_OWNER_RELEASE_ROUTE = /^\/api\/capacity\/utility-owners\/([0-9a-f-]{36})\/release$/;
 
@@ -124,9 +124,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   let inFlightScan = null;
   let watcher = null;
   let watcherTimer = null;
-  // The paths a pending rescan covers, so a watcher event in the same window
-  // never hides a checkpoint change from `projects.changed`.
+  // The paths a pending rescan covers. A checkpoint's worktree is always
+  // named, however many watcher paths share its window; a watcher path past
+  // the bound is dropped and the event says the list is incomplete.
   const rescanPaths = new Set();
+  let rescanTruncated = false;
   let shutdownPromise;
   let resolveShutdownCompletion;
   let rejectShutdownCompletion;
@@ -167,7 +169,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   // terminals are listed for the user to confirm: Outright cannot tell
   // whether a shell is writing; a new one waits for the restore. A change
   // rescans projects, as an index-only restore is not seen by the watcher.
-  const checkpoints = createWorktreeCheckpoints({ database, subprocesses, publish: (event) => { publish(event); scheduleRescan(event.payload.worktreePath); },
+  const checkpoints = createWorktreeCheckpoints({ database, subprocesses, publish: (event) => { publish(event); scheduleRescan(event.payload.worktreePath, { keep: true }); },
     writers: (paths) => {
       const found = [];
       if (agents?.hasWorktreeWork(paths)) found.push({ code: "WORKTREE_AGENT_ACTIVE", message: "an agent run is queued or running in this worktree" });
@@ -439,16 +441,19 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     });
   }
 
-  function scheduleRescan(changedPath) {
+  function scheduleRescan(changedPath, { keep = false } = {}) {
     clearTimeout(watcherTimer);
     if (shuttingDown) return;
-    if (rescanPaths.size < RESCAN_PATHS) rescanPaths.add(changedPath);
+    if (keep || rescanPaths.size < RESCAN_PATHS) rescanPaths.add(changedPath);
+    else if (!rescanPaths.has(changedPath)) rescanTruncated = true;
     watcherTimer = setTimeout(async () => {
       const changedPaths = [...rescanPaths];
+      const changedPathsTruncated = rescanTruncated;
       rescanPaths.clear();
+      rescanTruncated = false;
       try {
         const result = await projects(true);
-        publish({ type: "projects.changed", payload: { changedPath, changedPaths, projects: result.projects, scannedAt: result.scannedAt } });
+        publish({ type: "projects.changed", payload: { changedPath, changedPaths, changedPathsTruncated, projects: result.projects, scannedAt: result.scannedAt } });
       } catch { /* The next manual refresh will surface scanner errors. */ }
     }, 500);
   }
