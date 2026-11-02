@@ -37,6 +37,7 @@ const RUN_RECOVERY_RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000];
 const RUN_RECOVERY_RESTART_COOLDOWN_MS = 1000;
 // At most this many watcher paths are named by one `projects.changed` event.
 const RESCAN_PATHS = 64;
+const OWNER_PROOF_POLL_MS = 500;
 const UTILITY_OWNER_RELEASE_ROUTE = /^\/api\/capacity\/utility-owners\/([0-9a-f-]{36})\/release$/;
 
 function transientRunRecoveryFailure(error) {
@@ -131,6 +132,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   // rescan publishes a scan that started after its last path was queued.
   const rescanPaths = new Set();
   let rescanTruncated = false;
+  let ownerProofTimer = null;
   let shutdownPromise;
   let resolveShutdownCompletion;
   let rejectShutdownCompletion;
@@ -151,7 +153,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   // Stages, unstages and commits are refused while a checkpoint restore
   // holds their worktree, and a restore waits for them.
   const git = createGitService({ database, getProjects: () => latestScan?.projects ?? [], getConfig: () => loadOutrightConfig(configUrl), subprocesses,
-    admitWriter: (cwd) => checkpoints.admitWriter([cwd]) });
+    admitWriter: (cwd) => {
+      const release = checkpoints.admitWriter([cwd]);
+      return (error) => { release(error); watchOwnerProof(); };
+    } });
   // Setup and teardown never run beside agent work in the same worktree: the
   // agent manager holds queued runs while a worktree is held, including while
   // a step's processes are unconfirmed, and a run that waited launches when
@@ -171,7 +176,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   // terminals are listed for the user to confirm: Outright cannot tell
   // whether a shell is writing; a new one waits for the restore. A change
   // rescans projects, as an index-only restore is not seen by the watcher.
-  const checkpoints = createWorktreeCheckpoints({ database, subprocesses, publish: (event) => { publish(event); scheduleRescan(event.payload.worktreePath, { keep: true }); },
+  const checkpoints = createWorktreeCheckpoints({ database, subprocesses, publish: (event) => { publish(event); scheduleRescan(event.payload.worktreePath, { keep: true }); watchOwnerProof(); },
     writers: (paths) => {
       const found = [];
       if (agents?.hasWorktreeWork(paths)) found.push({ code: "WORKTREE_AGENT_ACTIVE", message: "an agent run is queued or running in this worktree" });
@@ -218,7 +223,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       }
     },
     onProvidersChanged: (providers) => publish({ type: "providers.changed", payload: { providers } }),
-    worktreeHeld: (worktreePath) => Boolean(lifecycle.hold(worktreePath) || checkpoints.holding(worktreePath)), validateConversation: async (conversation) => {
+    worktreeHeld: (worktreePath) => {
+      const held = Boolean(lifecycle.hold(worktreePath) || checkpoints.holding(worktreePath));
+      if (held) watchOwnerProof();
+      return held;
+    }, validateConversation: async (conversation) => {
     const target = await resolveWorktreeTarget(conversation);
     return () => {
       if (database.getConversation(conversation.id)?.archived) throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
@@ -331,6 +340,24 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     // Proving the previous runtime's setup and teardown steps gone releases
     // the worktrees they held.
     void Promise.resolve().then(() => lifecycle.reconcile()).then(onRecovered).catch(() => {});
+    // A previous runtime's lost Git writes may hold worktrees from the start.
+    watchOwnerProof();
+  }
+  // The utility budget may prove a lost Git process gone by itself (its
+  // late empty-tree frame) and tells no one. While an owner is unknown and
+  // a checkpoint hold may wait on it, its count is re-read; once none is
+  // left, the holds are released, which resumes waiting runs and publishes
+  // the change. Nothing is re-read once shutdown begins.
+  function watchOwnerProof() {
+    if (ownerProofTimer || shuttingDown || !((subprocesses.capacity?.().unknown ?? 0) > 0)) return;
+    ownerProofTimer = setInterval(() => {
+      if (!shuttingDown && (subprocesses.capacity().unknown ?? 0) > 0) return;
+      clearInterval(ownerProofTimer);
+      ownerProofTimer = null;
+      try { if (!shuttingDown && checkpoints.reconcile()) publish({ type: "capacity.changed", payload: runtimeCapacity() }); }
+      catch (error) { if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:checkpoint-owners]", error); }
+    }, OWNER_PROOF_POLL_MS);
+    ownerProofTimer.unref?.();
   }
   startOwnershipRecovery();
 
@@ -429,7 +456,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const result = await remove(async (options) => { await prepare?.(options); release = checkpoints.admitWriter([worktreePath]); });
         release?.();
         return result;
-      } catch (error) { release?.(error); throw error; }
+      } catch (error) { release?.(error); watchOwnerProof(); throw error; }
     };
     return lifecycle.removeWorktree({ project, worktree, worktreePath }, { remove: admitted,
       skipTeardown: body.skipTeardown === true, acknowledgeUnconfirmed: acknowledgedRunId(body) });
@@ -1262,6 +1289,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     shuttingDown = true;
     runRecoveryController.abort();
     clearTimeout(watcherTimer);
+    clearInterval(ownerProofTimer);
     let disposed = false;
     shutdownPromise = (async () => {
       const shutdownErrors = [];

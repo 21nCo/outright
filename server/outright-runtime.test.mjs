@@ -4115,6 +4115,40 @@ test("a Git write that lost its process before a restart holds the worktree unti
     releaseUnknownOwner: async (id, { audit }) => { const outcome = { id, proven: true, reason: "test" }; await audit(outcome); strayUnknown = 0; return outcome; },
     run: (file, args, options) => execFileAsync(file, args, options) } }));
 
+let provenAgentOptions;
+let provenUnknown = 1;
+let provenCapacityReads = 0;
+test("a lost Git write's hold is released when the budget proves its owner gone by itself, and nothing re-checks after shutdown", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { worktree, signal }) => {
+  const marker = path.join(worktree.path, ".git", "outright-git-write-unconfirmed");
+  const events = captureEvents(runtime);
+  // What a stage that lost its Git process left; the budget still holds its owner.
+  writeFileSync(marker, "earlier\n");
+  let resumed = 0;
+  runtime.agents.resumeQueued = () => { resumed += 1; };
+  assert.equal(provenAgentOptions.worktreeHeld(worktree.path), true);
+  events.clear();
+  // The budget's own late empty-tree frame: no operator release, no request.
+  provenUnknown = 0;
+  const published = () => events.of("worktree.checkpoints").some((event) => sameWorktree(event.payload.worktreePath, worktree));
+  await waitUntil(() => resumed > 0 && published(), "the hold's release to resume queued runs and publish the change", signal, 5_000);
+  assert.equal(existsSync(marker), false);
+  assert.equal(provenAgentOptions.worktreeHeld(worktree.path), false);
+  // Held again, then shut down: the budget is not re-read afterwards.
+  writeFileSync(marker, "again\n");
+  provenUnknown = 1;
+  assert.equal(provenAgentOptions.worktreeHeld(worktree.path), true);
+  const armed = provenCapacityReads;
+  await waitUntil(() => provenCapacityReads > armed, "the budget to be re-read while the hold waits", signal, 5_000);
+  await runtime.shutdown();
+  const stopped = provenCapacityReads;
+  provenUnknown = 0;
+  await delay(1_500, undefined, { signal });
+  assert.equal(provenCapacityReads, stopped, "the budget was re-read after shutdown");
+  assert.equal(existsSync(marker), true, "a hold was released after shutdown");
+}, { agentManagerFactory: (options) => createAgentManager(provenAgentOptions = options),
+  subprocesses: { capacity: () => { provenCapacityReads += 1; return { active: provenUnknown, limit: 8, unknown: provenUnknown }; }, unknownOwnerStatus: () => [],
+    run: (file, args, options) => execFileAsync(file, args, options) } }));
+
 let removalUnknown = 0;
 let removalAttempts = 0;
 let removalGate = null;
