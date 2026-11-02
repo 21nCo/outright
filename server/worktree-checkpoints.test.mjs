@@ -103,6 +103,62 @@ test("an edit Git can tell only by content, made as the index was written, is ca
   assert.deepEqual(checkpoint.counts, { staged: 1, unstaged: 1, untracked: 0 });
 });
 
+for (const flag of ["--assume-unchanged", "--skip-worktree"]) {
+  test(`an edit to a file marked ${flag} is captured and kept by a restore's safety checkpoint, and the index keeps its mark`, async (t) => {
+    const { repository } = await fixture(t);
+    const { checkpoints } = service();
+    const first = await checkpoints.capture(target(repository));
+    await writeFile(path.join(repository, "a.txt"), "second\n");
+    await git(repository, ["commit", "-qam", "second"]);
+    await git(repository, ["update-index", flag, "a.txt"]);
+    await writeFile(path.join(repository, "a.txt"), "LOCAL EDIT\n");
+    assert.equal(await status(repository), "", "Git lists the edit");
+    const marks = await git(repository, ["ls-files", "-v", "a.txt"]);
+    const index = await readFile(path.join(repository, ".git", "index"));
+    const checkpoint = await checkpoints.capture(target(repository));
+    assert.equal(await git(repository, ["show", `${checkpoint.commit}:a.txt`]), "LOCAL EDIT\n");
+    assert.deepEqual(checkpoint.counts, { staged: 0, unstaged: 1, untracked: 0 });
+    assert.deepEqual(await readFile(path.join(repository, ".git", "index")), index, "capture rewrote the index");
+    assert.match(marks, flag === "--skip-worktree" ? /^S a\.txt$/m : /^h a\.txt$/m);
+    const { result } = await restoreAll(checkpoints, repository, first.id);
+    assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "committed\n");
+    assert.equal(await git(repository, ["show", `${result.safetyCheckpoint.commit}:a.txt`]), "LOCAL EDIT\n");
+    await restoreAll(checkpoints, repository, result.safetyCheckpoint.id);
+    assert.equal(await readFile(path.join(repository, "a.txt"), "utf8"), "LOCAL EDIT\n");
+  });
+}
+
+for (const kind of ["an untracked file", "a file Git converts"]) {
+  test(`capture refuses ${kind} written over in place, at the same size, after it looked at it`, async (t) => {
+    const { repository } = await fixture(t);
+    const file = path.join(repository, "c.txt");
+    if (kind === "a file Git converts") {
+      await writeFile(path.join(repository, ".gitattributes"), "c.txt ident\n");
+      await writeFile(file, "$Id$\n");
+      await git(repository, ["add", "."]);
+      await git(repository, ["commit", "-qm", "ident"]);
+      await rm(file);
+      await git(repository, ["checkout", "--", "c.txt"]);
+      assert.equal(await status(repository), "");
+    } else await writeFile(file, "before\n");
+    const old = new Date(Date.now() - 60_000);
+    await utimes(file, old, old);
+    const { ino, size } = await lstat(file);
+    let armed = true;
+    // After the capture took the file's lstat and before it reads it: same inode and size, other bytes.
+    const { checkpoints } = service({ run: async (command, args, options) => {
+      if (armed && args.includes("ls-files") && args.includes("-s")) { armed = false; await writeFile(file, "x".repeat(size)); }
+      return execFileAsync(command, args, options);
+    } });
+    await assert.rejects(checkpoints.capture(target(repository)), (error) => error.statusCode === 409 && error.details.code === "CHECKPOINT_CHANGED");
+    assert.equal(armed, false);
+    assert.deepEqual([(await lstat(file)).ino, (await lstat(file)).size], [ino, size]);
+    assert.equal(await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]), "");
+    const checkpoint = await checkpoints.capture(target(repository));
+    assert.equal(await git(repository, ["show", `${checkpoint.commit}:c.txt`]), "x".repeat(size));
+  });
+}
+
 test("restore previews each change, needs that preview, and returns all three states with a way back", async (t) => {
   const { repository } = await fixture(t);
   await writeFile(path.join(repository, "a.txt"), "staged\n");
@@ -1208,6 +1264,8 @@ test("a Git write that cannot be recorded does not run", { skip: process.platfor
 
 test("a checkpoint keeps each file's type on disk, whatever its index entry is", async (t) => {
   const { repository } = await fixture(t);
+  // Git makes links where it can; `git init` turns that off where it finds it cannot, as Git for Windows may.
+  await git(repository, ["config", "core.symlinks", "true"]);
   await symlink("a.txt", path.join(repository, "link"));
   await writeFile(path.join(repository, "plain.txt"), "plain\n");
   await git(repository, ["add", "."]);
@@ -1223,6 +1281,8 @@ test("a checkpoint keeps each file's type on disk, whatever its index entry is",
   await restoreAll(checkpoints, repository, checkpoint.id);
   assert.equal((await lstat(path.join(repository, "link"))).isFile(), true, "the regular file came back as a link");
   assert.equal(await readFile(path.join(repository, "link"), "utf8"), "regular file contents\n");
+  assert.equal((await lstat(path.join(repository, "plain.txt"))).isSymbolicLink(), true,
+    `the link came back as a file (core.symlinks ${(await git(repository, ["config", "--show-origin", "--get-all", "core.symlinks"])).trim()})`);
   assert.equal(await readlink(path.join(repository, "plain.txt")), "a.txt");
 
   // Where Git keeps links as files holding their target, so does a checkpoint.
@@ -1760,6 +1820,8 @@ test("a restore lets the event loop run between the files it deletes and writes"
 
 test("a deletion empties the directories above it one level a turn, each step linear in their depth", async (t) => {
   const { repository } = await fixture(t);
+  // Git for Windows lists no file whose whole path is over 260 characters, as this one is, without core.longpaths.
+  await git(repository, ["config", "core.longpaths", "true"]);
   const { checkpoints } = service();
   const checkpoint = await checkpoints.capture(target(repository));
   const depth = 60, deep = Array.from({ length: depth }, (_, index) => `d${index}`).join("/");
@@ -1768,6 +1830,8 @@ test("a deletion empties the directories above it one level a turn, each step li
   await mkdir(path.join(repository, "d0", "kept"));
   await writeFile(path.join(repository, "d0", "kept.txt"), "made after\n");
   const preview = await checkpoints.preview(target(repository), checkpoint.id);
+  assert.ok(preview.entries.some((entry) => entry.path === `${deep}/made.txt`), JSON.stringify({ path: path.join(repository, deep, "made.txt").length,
+    longpaths: (await git(repository, ["config", "--show-origin", "--get-all", "core.longpaths"])).trim(), untracked: await git(repository, ["ls-files", "--others"]), entries: preview.entries.map((entry) => entry.path) }));
   const original = process.chdir, events = [], steps = [], home = process.cwd();
   let entered = 0;
   process.chdir = (...args) => { entered += 1; return original.apply(process, args); };

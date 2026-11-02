@@ -397,6 +397,22 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       optional(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"])]);
     const tooMany = () => checkpointError(413, `This worktree has more than ${limits.files} changed, staged, deleted or untracked files; ignore, commit or remove some ${when}`, "CHECKPOINT_TOO_LARGE");
     const staged = (await diffTrees(cwd, head ? `${head}^{tree}` : repo.emptyTree, indexTree)).filter((change) => !nested(change));
+    // Nothing is read through a link or file where a directory was: its tracked paths count as deleted, and Git lists the link or file itself.
+    const directories = new Map();
+    const directory = (relative) => directories.get(relative) ?? directories.set(relative,
+      lstat(path.join(cwd, relative)).then((info) => info.isDirectory(), (error) => absent(error) ?? false)).get(relative);
+    const reachable = async (relative) => { for (const ancestor of ancestors(relative)) if (!await directory(ancestor)) return false; return true; };
+    // Git compares no entry marked assume-unchanged or skip-worktree, so the copy's marks are cleared and an edit to one is captured
+    // (the worktree's own index keeps them). A skip-worktree entry with no file, as outside a sparse checkout, keeps its mark.
+    const marked = { "--no-assume-unchanged": [], "--no-skip-worktree": [] };
+    for (const record of (await temporary(["ls-files", "-v", "-z"], { maxBuffer: 64 * 1024 * 1024, names: true }).catch((error) => {
+      throw error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" ? checkpointError(413, "This worktree has too many files to take checkpoints", "CHECKPOINT_TOO_LARGE") : error;
+    })).split("\0")) {
+      const relative = record.slice(2);
+      if (/^[a-z]/.test(record)) marked["--no-assume-unchanged"].push(relative);
+      if (/^[Ss]/.test(record) && await reachable(relative) && await lstat(path.join(cwd, relative)).catch(absent)) marked["--no-skip-worktree"].push(relative);
+    }
+    for (const [option, paths] of Object.entries(marked)) for (const batch of batches(paths)) await temporary(["update-index", option, "--", ...batch]);
     let listed;
     try { listed = await temporary(["ls-files", "-z", "--modified", "--others", "--exclude-standard"], { maxBuffer: 32 * 1024 * 1024, names: true }); }
     catch (error) { throw error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" ? tooMany() : error; }
@@ -412,21 +428,15 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     for (const [relative, blob] of await blobs(cwd, indexTree, staged.filter((change) => change.status !== "D").map((change) => change.path))) count(relative, blob.size);
     // Large files are refused before anything is copied into the object store.
     const found = new Map();
-    // Nothing is read through a link or file where a directory was: its tracked paths count as deleted, and Git lists the link or file itself.
-    const directories = new Map();
-    const directory = (relative) => directories.get(relative) ?? directories.set(relative,
-      lstat(path.join(cwd, relative)).then((info) => info.isDirectory(), (error) => absent(error) ?? false)).get(relative);
     for (const relative of changedPaths) {
-      let readable = true;
-      for (const ancestor of ancestors(relative)) if (!(readable = await directory(ancestor))) break;
-      const info = readable ? await lstat(path.join(cwd, relative)).catch(absent) : null;
+      const info = await reachable(relative) ? await lstat(path.join(cwd, relative)).catch(absent) : null;
       if (info?.isFile()) count(relative, info.size);
       found.set(relative, info);
     }
     const root = await realpath(cwd);
     const known = rawBlobs.get(root) ?? new Map(), kept = new Map();
     let reused = false;
-    // Paths `counted` against the budget are checked against it above; others are copied as the lstat found them.
+    // Paths `counted` against the budget are checked against it above; all are copied only as the lstat found them.
     const store = async (paths, counted) => { for (const batch of batches(paths)) {
       const entries = await indexEntries(cwd, env, batch);
       const removed = [];
@@ -455,7 +465,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
           // Hashed from a copy of the file the lstat above found, never one a link swapped in since.
           const source = path.join(scratch, `file-${randomUUID()}`);
           const copied = await copyInside(root, relative, info, source, limits.fileBytes);
-          if (copied.size !== info.size) { if (!counted) throw changedError(relative); bytes -= info.size; count(relative, copied.size); }
+          if (copied.size !== info.size) throw changedError(relative);
           const executable = settings.fileMode ? (copied.mode & 0o111) !== 0 : entry?.mode === "100755";
           const link = !settings.symlinks && entry?.mode === "120000";
           hashed.push({ relative, source, mode: link ? "120000" : executable ? "100755" : "100644", entry, key: Math.max(info.mtimeMs, info.ctimeMs) < started - 2000 && key });
@@ -1071,7 +1081,7 @@ export function selectedOps(entries, paths) {
   for (const [group, { size, count }] of groups) {
     if (count < size) throw checkpointError(409, `The ${size} paths restored together with ${group} must all be chosen`, "CHECKPOINT_SELECTION_INVALID");
   }
-  return [...chosen].sort().map((relative) => {
+  return [...chosen].sort((a, b) => (a < b ? -1 : Number(a > b))).map((relative) => {
     const { file, index } = byPath.get(relative);
     return { path: relative, file: file && (file.action === "delete" ? "delete" : "write"), raw: Boolean(file?.raw), oid: file?.oid ?? null,
       index: index && (index.action === "remove" ? "remove" : { mode: index.mode, oid: index.oid }) };
@@ -1162,7 +1172,7 @@ function inside(root, directory, work, { create = false, relative = directory } 
     if (!info.isDirectory() || here.dev !== info.dev || here.ino !== info.ino) throw changedError(relative);
     at.push(here);
   };
-  try {
+  const run = () => {
     enter(root, lstatSync(root));
     for (const [index, part] of parts.entries()) {
       let info = lstatSync(part, { throwIfNoEntry: false });
@@ -1177,11 +1187,15 @@ function inside(root, directory, work, { create = false, relative = directory } 
       if (!info?.isDirectory() || info.dev !== expected.dev || info.ino !== expected.ino) throw changedError(relative);
     }
     return result;
-  } finally {
-    try { process.chdir(home); }
-    // Outright's own directory was removed meanwhile: the root of its filesystem, never a worktree, and the restore stops.
-    catch (error) { process.chdir(path.parse(home).root); throw workdirGone(error); }
-  }
+  };
+  // Back to the process's directory, whatever happened; if it was removed meanwhile, to the root of its filesystem (never a
+  // worktree), and the restore stops.
+  const back = () => { try { process.chdir(home); return null; } catch (error) { process.chdir(path.parse(home).root); return workdirGone(error); } };
+  let result;
+  try { result = run(); } catch (error) { throw back() ?? error; }
+  const gone = back();
+  if (gone) throw gone;
+  return result;
 }
 const recordTooLarge = () => checkpointError(413, "This restore's record of its paths would be too large; restore fewer paths at a time", "CHECKPOINT_TOO_LARGE");
 const workdirGone = (cause) => checkpointError(503, "The directory Outright was started in was removed; restart Outright from an existing directory to restore", "CHECKPOINT_WORKDIR_UNAVAILABLE", {}, cause);
@@ -1243,11 +1257,12 @@ async function openFile(file, flags = 0) {
   await handle.close();
   throw Object.assign(new Error(`${file} is not a regular file`), { code: "EFTYPE" });
 }
-// Whether every ancestor is still a directory and the path still the same entry.
+// Whether every ancestor is still a directory and the path still the same entry, of the same size and times: a write in place
+// changes them (to within the precision of a time in milliseconds as a double, well under a microsecond).
 async function unchanged(root, relative, expected) {
   for (const ancestor of ancestors(relative)) if (!(await lstat(path.join(root, ancestor)).catch(() => null))?.isDirectory()) return false;
   const info = await lstat(path.join(root, relative)).catch(() => null);
-  return info?.dev === expected.dev && info.ino === expected.ino;
+  return ["dev", "ino", "size", "mtimeMs", "ctimeMs"].every((key) => info?.[key] === expected[key]);
 }
 const changedError = (relative) => checkpointError(409, `${relative} changed while Outright was reading or writing it; try again`, "CHECKPOINT_CHANGED", { path: relative });
 
