@@ -1893,6 +1893,88 @@ test("on Windows, a path too long to restore there is marked in the preview and 
   assert.equal(await readFile(path.join(repository, deep, "made.txt"), "utf8"), "made after\n");
 });
 
+// The service is told it runs on Windows where it does not, so the Windows rule is checked on every platform CI runs.
+function onWindows(t) {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  if (process.platform !== "win32") Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+  t.after(() => Object.defineProperty(process, "platform", platform));
+}
+// A relative directory whose whole path under `root` is `length` characters, the parent of its last name at most `parent`.
+function directoryOf(root, length, parent) {
+  let directory = "";
+  while (path.join(root, directory, "d".repeat(40)).length <= parent) directory = path.posix.join(directory, "d".repeat(40));
+  return path.posix.join(directory, "e".repeat(length - path.join(root, directory).length - 1));
+}
+
+test("on Windows, a deletion is judged by its own path alone, in a coupled group and when an interrupted restore is finished", async (t) => {
+  const { repository } = await fixture(t);
+  await git(repository, ["config", "core.longpaths", "true"]);
+  // A file where the restore deletes a directory of two files whose parent is 220 characters long: no new file is made
+  // beside a deleted one, so each fits; the file restored in the directory's place is made beside it, 207 characters long.
+  const coupled = directoryOf(repository, 220, 207);
+  await mkdir(path.join(repository, path.dirname(coupled)), { recursive: true });
+  await writeFile(path.join(repository, coupled), "file\n");
+  // A deletion whose whole path is over 258 characters.
+  const long = path.posix.join(directoryOf(repository, 255, 215), "z.txt");
+  const { checkpoints } = service();
+  const checkpoint = await checkpoints.capture(target(repository));
+  await rm(path.join(repository, coupled));
+  await mkdir(path.join(repository, coupled));
+  for (const name of ["x.txt", "y.txt"]) await writeFile(path.join(repository, coupled, name), "made after\n");
+  await mkdir(path.join(repository, path.dirname(long)), { recursive: true });
+  await writeFile(path.join(repository, long), "made after\n");
+  assert.equal(path.join(repository, coupled, "x.txt").length, 226);
+  assert.ok(path.join(repository, long).length > 258);
+  onWindows(t);
+  const preview = await checkpoints.preview(target(repository), checkpoint.id);
+  const group = [coupled, `${coupled}/x.txt`, `${coupled}/y.txt`];
+  assert.deepEqual(preview.entries.filter((entry) => group.includes(entry.path)).map((entry) => [entry.path, entry.file?.action, entry.blocked ?? null, entry.groupSize]),
+    [[coupled, "create", null, 3], [`${coupled}/x.txt`, "delete", null, 3], [`${coupled}/y.txt`, "delete", null, 3]]);
+  assert.match(preview.entries.find((entry) => entry.path === long)?.blocked ?? "", /Too long a path for Windows/, JSON.stringify(preview.entries));
+  // The restore stops after deleting x.txt, then is finished.
+  let stop = true;
+  fsSeam(t, ["unlinkSync"], (name, first) => { if (first === "y.txt" && stop) { stop = false; throw Object.assign(new Error("stopped"), { code: "EIO" }); } });
+  await assert.rejects(checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: group }),
+    (error) => error.details.code === "CHECKPOINT_RESTORE_INTERRUPTED");
+  await assert.rejects(lstat(path.join(repository, coupled, "x.txt")), { code: "ENOENT" });
+  const resumed = await checkpoints.preview(target(repository), checkpoint.id, { resume: true });
+  assert.deepEqual(resumed.entries.map((entry) => [entry.path, entry.blocked ?? null]), [[coupled, null], [`${coupled}/y.txt`, null]]);
+  await checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: resumed.planDigest, paths: [coupled, `${coupled}/y.txt`], resume: true });
+  assert.equal(await readFile(path.join(repository, coupled), "utf8"), "file\n");
+  assert.equal(await readFile(path.join(repository, long), "utf8"), "made after\n");
+  assert.equal(checkpoints.holding(repository), null);
+});
+
+test("on Windows, a file restored over empty directories too deep to enter there is marked and refused before anything changes", async (t) => {
+  const { repository } = await fixture(t);
+  await git(repository, ["config", "core.longpaths", "true"]);
+  for (const name of ["deep", "shallow"]) await writeFile(path.join(repository, name), `${name}\n`);
+  const { checkpoints } = service();
+  const checkpoint = await checkpoints.capture(target(repository));
+  // The restore removes the empty directories where each file goes, entering every level of them.
+  const chain = (name, length) => { let at = name; while (path.join(repository, at).length <= length) at = path.posix.join(at, "d".repeat(30)); return at; };
+  const deep = chain("deep", 258), shallow = chain("shallow", 200);
+  for (const name of ["deep", "shallow"]) await rm(path.join(repository, name));
+  for (const directory of [deep, shallow]) await mkdir(path.join(repository, directory), { recursive: true });
+  assert.ok(path.join(repository, deep).length > 258 && path.join(repository, shallow).length <= 258);
+  onWindows(t);
+  const preview = await checkpoints.preview(target(repository), checkpoint.id);
+  assert.match(preview.entries.find((entry) => entry.path === "deep")?.blocked ?? "", /Too long a path for Windows/, JSON.stringify(preview.entries));
+  assert.equal(preview.entries.find((entry) => entry.path === "shallow")?.blocked, undefined);
+  const refs = await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]), home = process.cwd();
+  await assert.rejects(checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: ["deep"] }),
+    (error) => error.statusCode === 409 && error.details.code === "CHECKPOINT_SELECTION_INVALID" && error.message.includes("deep"));
+  assert.equal(await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]), refs, "a refused restore recorded a checkpoint");
+  await assert.rejects(readFile(path.join(repository, ".git", RESTORE_MARKER)), { code: "ENOENT" });
+  assert.ok((await lstat(path.join(repository, deep))).isDirectory());
+  assert.equal(checkpoints.holding(repository), null);
+  assert.equal(process.cwd(), home);
+  // A file over empty directories that fit is restored.
+  await restoreAll(checkpoints, repository, checkpoint.id);
+  assert.equal(await readFile(path.join(repository, "shallow"), "utf8"), "shallow\n");
+  assert.ok((await lstat(path.join(repository, deep))).isDirectory());
+});
+
 const fifo = process.platform === "win32" && "Windows makes no FIFO";
 // A FIFO, and a socket where one can be made, in place of a tracked file; resolves to the paths made.
 async function specialFiles(repository) {

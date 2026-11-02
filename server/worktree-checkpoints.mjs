@@ -604,6 +604,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       for (const child of await readdir(path.join(cwd, current), { withFileTypes: true })) {
         const relative = `${current}/${child.name}`;
         if ((visited += 1) > limits.planEntries) return relative;
+        if (child.isDirectory() && tooLongForWindows(cwd, relative)) return { long: relative };
         if (child.isDirectory()) pending.push(relative);
         else if (byPath.get(relative)?.file?.action !== "delete") return relative;
       }
@@ -671,8 +672,8 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       if (item.index) { item.file = null; delete item.unheld; } else byPath.delete(relative);
     }
     const entries = [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
-    // Windows enters no directory, and opens no name from one, whose whole path is over 258 characters, a new file's name beside it included.
-    for (const item of entries) if (process.platform === "win32" && item.file && Math.max(path.join(root, item.path).length, path.join(root, path.dirname(item.path)).length + 51) > 258) item.blocked = "Too long a path for Windows to restore here; restore it with Git";
+    // A file written goes first to a new name (51 characters) beside it; a deletion opens only its own name, and the empty directories above it are shorter.
+    for (const item of entries) if (item.file && (tooLongForWindows(root, item.path) || (item.file.action !== "delete" && tooLongForWindows(root, path.dirname(item.path), 51)))) item.blocked = WINDOWS_TOO_LONG;
     const group = new Map(entries.map((item) => [item.path, item.path]));
     const find = (value) => { while (group.get(value) !== value) value = group.get(value); return value; };
     for (const item of entries) {
@@ -699,8 +700,8 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       const renamed = info && !info.isDirectory() && await sameFile(cwd, info, deleted.get(folded(item.path)) ?? []);
       if (renamed) group.set(find(item.path), find(renamed));
       else if (info?.isDirectory()) {
-        const left = await uncaptured(cwd, item.path, byPath);
-        if (left) item.blocked = `An ignored or nested file is in the way at ${left}`;
+        const left = await uncaptured(root, item.path, byPath);
+        if (left) item.blocked = left.long ? WINDOWS_TOO_LONG : `An ignored or nested file is in the way at ${left}`;
       } else if (info) item.blocked = "An ignored file or directory is in the way";
     }
     const members = new Map();
@@ -1160,6 +1161,9 @@ function ancestors(relative) {
   return parts.slice(0, -1).map((_, index) => parts.slice(0, index + 1).join("/"));
 }
 
+// Windows enters no directory, and opens no name from one, whose whole path (and `extra` characters) is over 258 characters.
+const tooLongForWindows = (root, relative, extra = 0) => process.platform === "win32" && path.join(root, relative).length + extra > 258;
+const WINDOWS_TOO_LONG = "Too long a path for Windows to restore here; restore it with Git";
 // Only a path that is not there is absent; any other error (EACCES, EIO) stops the capture or restore, never counts as a deletion.
 function absent(error) { if (["ENOENT", "ENOTDIR"].includes(error.code)) return null; throw error; }
 // Restore changes the worktree only from inside a directory it entered one level at a time from `root` (a real path), each
