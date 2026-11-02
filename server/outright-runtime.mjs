@@ -360,11 +360,16 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
 
   // A `fresh` scan starts after the call: one already running may have read
   // Git status before the caller's change, so it waits for that one to end.
+  // Once shutdown begins it starts no scan; shutdown waits for it to settle.
   async function projects(force = false, { fresh = false } = {}) {
     const timestamp = Date.now();
     if (!force && latestScan && timestamp - latestScanAt < 1500) return latestScan;
     if (fresh && inFlightScan) {
-      freshScan ??= inFlightScan.catch(() => {}).then(() => { freshScan = null; return projects(true); });
+      freshScan ??= inFlightScan.catch(() => {}).then(() => {
+        freshScan = null;
+        if (shuttingDown) throw apiError(503, "Runtime is shutting down");
+        return projects(true);
+      });
       return freshScan;
     }
     if (!inFlightScan) {
@@ -461,6 +466,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       rescanTruncated = false;
       try {
         const result = await projects(true, { fresh: true });
+        if (shuttingDown) return;
         publish({ type: "projects.changed", payload: { changedPath, changedPaths, changedPathsTruncated, projects: result.projects, scannedAt: result.scannedAt } });
       } catch { /* The next manual refresh will surface scanner errors. */ }
     }, 500);
@@ -1257,7 +1263,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (agents.hasPendingFinishes()) error.code = "OUTRIGHT_SHUTDOWN_RECOVERY_PENDING";
         throw error;
       }
-      await inFlightScan?.catch(() => {});
+      // A deferred fresh scan settles without scanning, or joins the scan it
+      // started, before the database closes.
+      await Promise.allSettled([inFlightScan, freshScan]);
       await runRecovery.cycle;
       // Native-owner probes may remain slow or stuck. Terminal shutdown fences
       // their late results before the database lease is released.

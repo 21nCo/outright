@@ -3978,6 +3978,46 @@ test("a checkpoint change is published from a project scan that started after it
   return result;
 } } }));
 
+let shutdownScanLog = [];
+test("a checkpoint rescan still waiting on an earlier scan starts no scan once shutdown begins", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const events = captureEvents(runtime);
+  let release;
+  const read = new Promise((resolve) => { heldScan = { read: resolve, released: new Promise((done) => { release = done; }) }; });
+  try {
+    const running = runtime.projects(true);
+    await read;
+    writeFileSync(path.join(worktree.path, "after-scan.txt"), "after\n");
+    await runtime.checkpoints.capture({ project, worktree, worktreePath: realpathSync.native(worktree.path) });
+    // The rescan's debounce ends, and its fresh scan queues behind the held one.
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    events.clear();
+    shutdownScanLog.push("shutdown-start");
+    const down = runtime.shutdown();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    release();
+    await running.catch(() => {});
+    await down;
+    shutdownScanLog.push("shutdown-done");
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    const after = shutdownScanLog.slice(shutdownScanLog.indexOf("shutdown-start") + 1);
+    assert.deepEqual(after.filter((entry) => entry === "status-start"), [], JSON.stringify(shutdownScanLog));
+    assert.deepEqual(events.of("projects.changed"), []);
+  } finally {
+    heldScan = null;
+    release();
+  }
+}, { subprocesses: { capacity: () => ({ active: 0, limit: 8 }), run: async (file, args, options) => {
+  if (args.includes("--porcelain=v1")) shutdownScanLog.push("status-start");
+  const result = await execFileAsync(file, args, options);
+  const gate = args.includes("--porcelain=v1") && heldScan;
+  if (gate) {
+    heldScan = null;
+    gate.read();
+    await gate.released;
+  }
+  return result;
+} } }));
+
 let interruptedAgentOptions;
 test("a restore that did not finish holds agent runs, setup and Git writes after a restart until its files are kept", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
   const target = { projectId: project.id, worktreePath: worktree.path };
