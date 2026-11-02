@@ -8,6 +8,7 @@ import { createOutrightDatabase } from "./database.mjs";
 import { createGitService } from "./git-service.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
 import { lifecycleSummary } from "../src/lib/worktree-lifecycle.js";
+import { holdMessage } from "./worktree-checkpoints.mjs";
 import { LIFECYCLE_CONFIG_FILE, LIFECYCLE_LIMITS, createOutputDecoder, createOutputMask, createWorktreeLifecycle, environmentSecrets, parseLifecycleConfig, readLifecycleConfig, sanitizeOutput, worktreeInstance } from "./worktree-lifecycle.mjs";
 
 // Disposable repositories must not be attached to a host Git Trace2 consumer.
@@ -391,6 +392,31 @@ test("setup and teardown are refused beside agent work, before any command runs,
   assert.equal((await settled(lifecycle, target)).state.status, "ready");
   assert.equal(lifecycle.busy(repository), false);
   assert.deepEqual(released, [repository], "the end of the hold was not reported");
+}));
+
+test("setup and teardown are refused while a checkpoint restore or an unconfirmed Git write holds the worktree", withLifecycle(async ({ root, repository, database, project, target, create }) => {
+  const marker = path.join(root, "ran");
+  writeConfig(repository, { setup: [{ name: "Mark", command: node("require('fs').appendFileSync(process.argv[1], 's')", marker) }],
+    teardown: [{ name: "Mark", command: node("require('fs').appendFileSync(process.argv[1], 't')", marker) }] });
+  database.trustLifecycleConfig(project.id, project.path, (await readLifecycleConfig(repository)).digest);
+  let hold = "CHECKPOINT_RESTORE_RUNNING";
+  const asked = [];
+  const lifecycle = create({ restoreHold: (paths) => { asked.push(paths); return hold; } });
+  await assert.rejects(lifecycle.setup(target), (error) => error.statusCode === 409 && error.details?.code === "CHECKPOINT_RESTORE_RUNNING"
+    && error.details.phase === "setup" && error.message === holdMessage("CHECKPOINT_RESTORE_RUNNING", "start setup"));
+  assert.deepEqual(asked.at(-1), [repository]);
+  hold = "GIT_WRITE_UNCONFIRMED";
+  let removed = false;
+  await assert.rejects(lifecycle.removeWorktree(target, { remove: async (prepare) => { await prepare(); removed = true; } }),
+    (error) => error.details?.code === "GIT_WRITE_UNCONFIRMED" && error.details.phase === "teardown"
+      && error.message === holdMessage("GIT_WRITE_UNCONFIRMED", "start teardown"));
+  assert.equal(removed, false);
+  assert.equal(existsSync(marker), false, "a held phase ran a command");
+  assert.equal((await lifecycle.describe(target)).state, null, "a refusal for a restore hold recorded a state");
+  hold = null;
+  await lifecycle.setup(target);
+  assert.equal((await settled(lifecycle, target)).state.status, "ready");
+  assert.equal(readFileSync(marker, "utf8"), "s");
 }));
 
 test("a refused retry keeps the resume checkpoint and the unconfirmed-processes acknowledgement", withLifecycle(async ({ repository, database, project, target, create }) => {

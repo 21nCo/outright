@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
 import { mapWithConcurrency, parseStatus, parseWorktreePorcelain, scanProjects } from "./project-scanner.mjs";
+
+const execFileAsync = promisify(execFile);
 
 test("default-root candidate resolution is bounded and preserves first discovered worktree", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "outright-scan-order-"));
@@ -117,8 +120,12 @@ test("scanner reports divergence when Git disables ahead/behind by default", asy
     git("-C", local, "commit", "-m", "local");
     git("-C", local, "fetch", "origin");
     git("-C", local, "config", "status.aheadBehind", "false");
+    // The scan only reads, so its status never takes the optional index
+    // lock a checkpoint restore or a commit needs.
+    const options = [];
     const result = await scanProjects({ scanRoots: [local], maxDepth: 0, maxProjects: 1,
-      excludeDirectories: new Set() });
+      excludeDirectories: new Set() }, { run: (file, args, runOptions) => { options.push(runOptions); return execFileAsync(file, args, runOptions); } });
     assert.deepEqual([result.projects[0].worktrees[0].ahead, result.projects[0].worktrees[0].behind], [1, 1]);
+    assert.ok(options.length && options.every((item) => item.env?.GIT_OPTIONAL_LOCKS === "0"));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

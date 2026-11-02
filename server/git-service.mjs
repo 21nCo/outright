@@ -3,7 +3,12 @@ import { access, readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { utilityBudgetUnavailable, utilityProcesses } from "./subprocess-budget.mjs";
 
-export function createGitService({ database, getProjects, getConfig, subprocesses = utilityProcesses }) {
+// `admitWriter(cwd)` admits a stage, unstage or commit in a worktree, or
+// throws while a checkpoint restore holds it; it returns the release that
+// ends the admission, given the failure if there was one (a Git process
+// whose ownership was lost keeps the worktree held). Check and admission
+// are synchronous.
+export function createGitService({ database, getProjects, getConfig, subprocesses = utilityProcesses, admitWriter = () => () => {} }) {
   const git = (cwd, args, overrides = {}) => runGit(subprocesses, cwd, args, overrides);
   const safeGit = async (cwd, args, overrides = {}) => {
     try { return await git(cwd, args, overrides); }
@@ -68,7 +73,8 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
     const [branch, porcelain, recent] = await Promise.all([
       git(cwd, ["branch", "--show-current"]),
       // NUL-delimited output keeps filenames with spaces or quotes intact.
-      git(cwd, ["status", "--porcelain=v1", "--branch", "-z"]),
+      // Read-only: no optional index lock for a restore or commit to meet.
+      git(cwd, ["status", "--porcelain=v1", "--branch", "-z"], { env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } }),
       optionalGit(cwd, ["log", "-8", "--pretty=format:%h%x09%an%x09%ar%x09%s"]),
     ]);
     const { header, files } = parsePorcelain(porcelain);
@@ -102,24 +108,37 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
   async function stage(worktreePath, files) {
     const cwd = await requireWorktree(worktreePath);
     const validated = await validateFiles(cwd, files);
-    await auditedMutation("git.stage.requested", "git.stage", { target: cwd, files: validated },
-      () => git(cwd, ["add", "--", ...validated]));
+    const release = admitWriter(cwd);
+    try {
+      await auditedMutation("git.stage.requested", "git.stage", { target: cwd, files: validated },
+        () => git(cwd, ["add", "--", ...validated]));
+    } catch (error) { release(error); throw error; }
+    release();
     return statusAfterMutation(cwd);
   }
 
   async function unstage(worktreePath, files) {
     const cwd = await requireWorktree(worktreePath);
     const validated = await validateFiles(cwd, files);
-    await auditedMutation("git.unstage.requested", "git.unstage", { target: cwd, files: validated },
-      () => unstagePaths(cwd, validated));
+    const release = admitWriter(cwd);
+    try {
+      await auditedMutation("git.unstage.requested", "git.unstage", { target: cwd, files: validated },
+        () => unstagePaths(cwd, validated));
+    } catch (error) { release(error); throw error; }
+    release();
     return statusAfterMutation(cwd);
   }
 
   async function commit(worktreePath, message) {
     const cwd = await requireWorktree(worktreePath);
     if (!message?.trim()) throw httpError(400, "Commit message is required");
-    const output = await auditedMutation("git.commit.requested", "git.commit", { target: cwd, message: message.trim() },
-      () => git(cwd, ["commit", "-m", message.trim()], { maxBuffer: 8 * 1024 * 1024 }));
+    const release = admitWriter(cwd);
+    let output;
+    try {
+      output = await auditedMutation("git.commit.requested", "git.commit", { target: cwd, message: message.trim() },
+        () => git(cwd, ["commit", "-m", message.trim()], { maxBuffer: 8 * 1024 * 1024 }));
+    } catch (error) { release(error); throw error; }
+    release();
     const refreshed = await statusAfterMutation(cwd);
     return { output, status: refreshed.refreshDeferred ? null : refreshed, refreshDeferred: refreshed.refreshDeferred ?? false };
   }
