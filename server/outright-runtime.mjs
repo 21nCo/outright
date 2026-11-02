@@ -419,7 +419,19 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     // An unknown target gets the guarded removal's own refusal.
     if (!project || !worktree) return remove();
     const worktreePath = await git.requireWorktree(worktree.path);
-    return lifecycle.removeWorktree({ project, worktree, worktreePath }, { remove,
+    // Git removal is a checkpoint Git writer, admitted after teardown and
+    // before Git starts: a restore holding the worktree refuses it first, and
+    // one that loses its Git process keeps the worktree held (its write
+    // marker survives a restart) until that process is proven gone.
+    const admitted = async (prepare) => {
+      let release = null;
+      try {
+        const result = await remove(async (options) => { await prepare?.(options); release = checkpoints.admitWriter([worktreePath]); });
+        release?.();
+        return result;
+      } catch (error) { release?.(error); throw error; }
+    };
+    return lifecycle.removeWorktree({ project, worktree, worktreePath }, { remove: admitted,
       skipTeardown: body.skipTeardown === true, acknowledgeUnconfirmed: acknowledgedRunId(body) });
   }
 
@@ -1132,7 +1144,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (lifecycleMatch[1] === "acknowledge") return json(response, 200, { state: lifecycle.acknowledge(target, acknowledgedRunId(body)) });
         return json(response, 202, { state: await lifecycle.setup(target, { acknowledgeUnconfirmed: acknowledgedRunId(body) }) });
       }
-      const checkpointMatch = url.pathname.match(/^\/api\/worktrees\/checkpoints(?:\/(inspect|diff|preview|restore|recover))?$/);
+      const checkpointMatch = /^\/api\/worktrees\/checkpoints(?:\/(inspect|diff|preview|restore|recover))?$/.exec(url.pathname);
       if (checkpointMatch && request.method === "GET" && ["inspect", "diff", undefined].includes(checkpointMatch[1])) {
         const target = await resolveLifecycleTarget({ projectId: url.searchParams.get("projectId"), worktreePath: requiredQuery(url, "path") });
         if (checkpointMatch[1] === "inspect") return json(response, 200, await checkpoints.inspect(target, requiredQuery(url, "id")));

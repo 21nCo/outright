@@ -5,9 +5,10 @@ import { PassThrough, Readable } from "node:stream";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { assertRuntimeRequest, createOutrightRuntime, defaultRecoveryProcessAlive, defaultRecoveryProcessIdentity, defaultTerminateRecoveryProcess, runtimeAllowedHosts } from "./outright-runtime.mjs";
@@ -1269,7 +1270,7 @@ function seedLegacyRunningUnknownTargetDatabase(filename, { secondRun = false } 
 // behaviour skip win32. The native realpath expands Windows short names, as
 // the runtime's does.
 function withWorktreeRuntime(fn, options = {}) {
-  return async () => {
+  return async (t) => {
     const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-e2e-")));
     const repo = path.join(root, "repo");
     const bin = path.join(root, "bin");
@@ -1300,7 +1301,14 @@ function withWorktreeRuntime(fn, options = {}) {
       const worktree = project?.worktrees.find((item) => !item.isLinked);
       if (!project || !worktree) throw new Error("the temp repo was not discovered as a project worktree");
       runtime.database.trustProject(project.id, project.path);
-      await fn(runtime, { project, worktree, bin });
+      // A restart stops this runtime and starts another over the same data.
+      const restart = async () => {
+        await runtime.shutdown();
+        runtime = createOutrightRuntime({ configUrl: pathToFileURL(configFile), ...options });
+        await runtime.projects();
+        return runtime;
+      };
+      await fn(runtime, { project, worktree, bin, restart, signal: t?.signal });
     } finally {
       process.env.PATH = previousPath;
       if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
@@ -3780,9 +3788,24 @@ test("unconfirmed setup processes hold agent work until acknowledged, and setup 
   lifecycleSubprocesses: { capacity: () => ({ active: 1, limit: 4, unknown: 1 }), reconcileUnknown: async () => 0, unknownOwnerStatus: () => [],
     run: async () => { throw Object.assign(new Error("ownership unknown"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN", cause: new Error("lost") }); } } }));
 
+// Polls until `found` holds. A test's signal aborts when it times out, so
+// the wait ends with it and its fixture still shuts the runtime down.
+async function waitUntil(found, what, signal, ms = 15_000) {
+  for (const deadline = Date.now() + ms; !found(); await delay(25, undefined, { signal })) {
+    if (Date.now() > deadline) assert.fail(`timed out waiting for ${what}`);
+  }
+}
+async function within(promise, what, signal, ms = 15_000) {
+  const settled = new AbortController();
+  try {
+    return await Promise.race([promise, delay(ms, undefined, { signal: signal ? AbortSignal.any([signal, settled.signal]) : settled.signal })
+      .then(() => assert.fail(`timed out waiting for ${what}`))]);
+  } finally { settled.abort(); }
+}
+
 let checkpointAgentOptions;
 let checkpointGate = null;
-test("a checkpoint restore is refused beside agent work and holds new runs and Git writes while it runs", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+test("a checkpoint restore is refused beside agent work and holds new runs and Git writes while it runs", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree, signal }) => {
   const target = { projectId: project.id, worktreePath: worktree.path };
   const notes = path.join(worktree.path, "notes.txt");
   writeFileSync(notes, "checkpointed\n");
@@ -3805,9 +3828,7 @@ test("a checkpoint restore is refused beside agent work and holds new runs and G
   checkpointGate = new Promise((resolve) => { release = resolve; });
   const restoring = callRuntime(runtime, "POST", "/api/worktrees/checkpoints/restore", request);
   try {
-    for (const deadline = Date.now() + 15_000; !checkpointAgentOptions.worktreeHeld(worktree.path); await new Promise((resolve) => setTimeout(resolve, 10))) {
-      if (Date.now() > deadline) assert.fail("the restore never held the worktree");
-    }
+    await waitUntil(() => checkpointAgentOptions.worktreeHeld(worktree.path), "the restore to hold the worktree", signal);
     // Provider discovery is not under test here.
     runtime.agents.providerAvailable = async () => true;
     const conversation = runtime.database.createConversation({ ...target, worktreeId: worktree.id, title: "During restore", provider: "codex" });
@@ -3896,42 +3917,50 @@ test("a restore waits for terminal ownership recovery and confirms recovered she
   assert.equal(readFileSync(notes, "utf8"), "checkpointed\n");
 }, { subprocesses: { capacity: () => ({ active: 0, limit: 8 }), run: (file, args, options) => execFileAsync(file, args, options) } }));
 
-test("a checkpoint change is named by its project rescan however many watcher paths share the window", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+test("a checkpoint change is named by its project rescan however many watcher paths share the window", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree, signal }) => {
   const events = captureEvents(runtime);
   const watched = (event) => event.type === "projects.changed" && Array.isArray(event.payload.changedPaths);
-  const waitFor = async (found, what) => {
-    for (const deadline = Date.now() + 20_000; !found(); await new Promise((resolve) => setTimeout(resolve, 25))) {
-      if (Date.now() > deadline) assert.fail(`timed out waiting for ${what}`);
-    }
+  // Ignored by Git, so the files the watcher reports add nothing to a
+  // project scan or the checkpoint.
+  mkdirSync(path.join(worktree.path, ".git", "info"), { recursive: true });
+  appendFileSync(path.join(worktree.path, ".git", "info", "exclude"), "\nprobe-*\nflood-*\n");
+  // Writes stop at a fixed count, when the checkpoint is taken, or when the
+  // test ends, whichever is first.
+  let written = 0;
+  const writer = (prefix, count, every, limit) => {
+    const timer = setInterval(() => {
+      for (let burst = 0; burst < count && written < limit; burst += 1) writeFileSync(path.join(worktree.path, `${prefix}-${written++}.txt`), `${prefix}\n`);
+      if (written >= limit) clearInterval(timer);
+    }, every);
+    const stop = () => clearInterval(timer);
+    signal?.addEventListener("abort", stop, { once: true });
+    return stop;
   };
   // The watcher reports changes once its initial scan is done.
-  let probes = 0;
-  const probe = setInterval(() => writeFileSync(path.join(worktree.path, `probe-${probes++}.txt`), "probe\n"), 600);
+  const stopProbe = writer("probe", 1, 600, 40);
   try {
-    await waitFor(() => events.all().some(watched), "the watcher to report a change");
+    await waitUntil(() => events.all().some(watched), "the watcher to report a change", signal);
   } finally {
-    clearInterval(probe);
+    stopProbe();
   }
   events.clear();
   // Changes arriving faster than the rescan debounce keep one window open
   // while more watcher paths than one event names, then the checkpoint, join it.
-  let written = 0;
-  const flood = setInterval(() => {
-    for (let burst = 0; burst < 16; burst += 1) writeFileSync(path.join(worktree.path, `flood-${written++}.txt`), "flood\n");
-  }, 50);
+  written = 0;
+  const stopFlood = writer("flood", 16, 50, 1_600);
   try {
-    await waitFor(() => written >= 160, "the watcher paths");
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    await waitUntil(() => written >= 160, "the watcher paths", signal);
+    await delay(600, undefined, { signal });
     const created = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints", { projectId: project.id, worktreePath: worktree.path });
     assert.equal(created.statusCode, 201, created.raw);
   } finally {
-    clearInterval(flood);
+    stopFlood();
   }
   const checkpointAt = events.all().findIndex((event) => event.type === "worktree.checkpoints");
   assert.notEqual(checkpointAt, -1, "the checkpoint change was not published");
   const coalesced = !events.all().slice(0, checkpointAt).some(watched);
   const rescan = () => events.all().slice(checkpointAt).find(watched);
-  await waitFor(rescan, "the rescan after the checkpoint change");
+  await waitUntil(rescan, "the rescan after the checkpoint change", signal);
   const { changedPaths, changedPathsTruncated } = rescan().payload;
   assert.ok(changedPaths.some((value) => sameWorktree(value, worktree)), `the checkpoint's worktree is missing from ${changedPaths.length} changed paths`);
   assert.ok(changedPaths.length <= 65, `${changedPaths.length} changed paths`);
@@ -3942,25 +3971,23 @@ test("a checkpoint change is named by its project rescan however many watcher pa
 
 // The scan the gate holds read Git status before the change.
 let heldScan = null;
-test("a checkpoint change is published from a project scan that started after it, not one already running", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+test("a checkpoint change is published from a project scan that started after it, not one already running", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree, signal }) => {
   const events = captureEvents(runtime);
   let release;
   const read = new Promise((resolve) => { heldScan = { read: resolve, released: new Promise((done) => { release = done; }) }; });
   try {
     const running = runtime.projects(true);
-    await read;
+    await within(read, "the held scan to read Git status", signal);
     writeFileSync(path.join(worktree.path, "after-scan.txt"), "after\n");
     events.clear();
     await runtime.checkpoints.capture({ project, worktree, worktreePath: realpathSync.native(worktree.path) });
     assert.equal(events.of("worktree.checkpoints").length, 1);
     // The rescan's debounce ends while the earlier scan is still running.
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    await delay(1_000, undefined, { signal });
     release();
     await running;
     const named = () => events.of("projects.changed").find((event) => event.payload.changedPaths.some((value) => sameWorktree(value, worktree)));
-    for (const deadline = Date.now() + 20_000; !named(); await new Promise((resolve) => setTimeout(resolve, 25))) {
-      if (Date.now() > deadline) assert.fail("no project rescan followed the checkpoint change");
-    }
+    await waitUntil(named, "a project rescan after the checkpoint change", signal);
     const scanned = named().payload.projects.find((item) => item.id === project.id)?.worktrees.find((item) => sameWorktree(item.path, worktree));
     assert.ok(scanned?.changedFiles.some((file) => file.path === "after-scan.txt"), JSON.stringify(scanned?.changedFiles));
   } finally {
@@ -3979,26 +4006,26 @@ test("a checkpoint change is published from a project scan that started after it
 } } }));
 
 let shutdownScanLog = [];
-test("a checkpoint rescan still waiting on an earlier scan starts no scan once shutdown begins", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+test("a checkpoint rescan still waiting on an earlier scan starts no scan once shutdown begins", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree, signal }) => {
   const events = captureEvents(runtime);
   let release;
   const read = new Promise((resolve) => { heldScan = { read: resolve, released: new Promise((done) => { release = done; }) }; });
   try {
     const running = runtime.projects(true);
-    await read;
+    await within(read, "the held scan to read Git status", signal);
     writeFileSync(path.join(worktree.path, "after-scan.txt"), "after\n");
     await runtime.checkpoints.capture({ project, worktree, worktreePath: realpathSync.native(worktree.path) });
     // The rescan's debounce ends, and its fresh scan queues behind the held one.
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    await delay(1_000, undefined, { signal });
     events.clear();
     shutdownScanLog.push("shutdown-start");
     const down = runtime.shutdown();
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await delay(200, undefined, { signal });
     release();
     await running.catch(() => {});
     await down;
     shutdownScanLog.push("shutdown-done");
-    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    await delay(1_500, undefined, { signal });
     const after = shutdownScanLog.slice(shutdownScanLog.indexOf("shutdown-start") + 1);
     assert.deepEqual(after.filter((entry) => entry === "status-start"), [], JSON.stringify(shutdownScanLog));
     assert.deepEqual(events.of("projects.changed"), []);
@@ -4049,7 +4076,7 @@ test("a restore that did not finish holds agent runs, setup and Git writes after
 let strayAgentOptions;
 let strayUnknown = 1;
 const STRAY_OWNER = "8a7b6c5d-4e3f-4a1b-9c8d-7e6f5a4b3c2d";
-test("a Git write that lost its process before a restart holds the worktree until its owner is released, then queued runs resume", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+test("a Git write that lost its process before a restart holds the worktree until its owner is released, then queued runs resume", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree, signal }) => {
   const target = { projectId: project.id, worktreePath: worktree.path };
   const events = captureEvents(runtime);
   writeFileSync(path.join(worktree.path, "notes.txt"), "work\n");
@@ -4080,12 +4107,108 @@ test("a Git write that lost its process before a restart holds the worktree unti
   // as the watcher does not see an index-only change in a linked worktree.
   // The marker's removal is also seen by the watcher in the same window.
   const rescanned = () => events.of("projects.changed").some((event) => event.payload.changedPaths.some((value) => sameWorktree(value, worktree)));
-  for (const deadline = Date.now() + 10_000; !rescanned(); await new Promise((resolve) => setTimeout(resolve, 50))) {
-    if (Date.now() > deadline) assert.fail("no project rescan followed the checkpoint change");
-  }
+  await waitUntil(rescanned, "a project rescan after the checkpoint change", signal, 10_000);
   const staged = await callRuntime(runtime, "POST", "/api/git/stage", { path: worktree.path, files: ["notes.txt"] });
   assert.equal(staged.statusCode, 200, staged.raw);
 }, { agentManagerFactory: (options) => createAgentManager(strayAgentOptions = options),
   subprocesses: { capacity: () => ({ active: strayUnknown, limit: 8, unknown: strayUnknown }), unknownOwnerStatus: () => strayUnknown ? [{ id: STRAY_OWNER }] : [],
     releaseUnknownOwner: async (id, { audit }) => { const outcome = { id, proven: true, reason: "test" }; await audit(outcome); strayUnknown = 0; return outcome; },
     run: (file, args, options) => execFileAsync(file, args, options) } }));
+
+let removalUnknown = 0;
+let removalAttempts = 0;
+let removalGate = null;
+let removalLoses = true;
+const REMOVAL_OWNER = "3c2d1e0f-9a8b-4c7d-8e6f-5a4b3c2d1e0f";
+test("a worktree removal that lost its Git process holds that worktree's restores, across a restart, until its owner is released", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree, restart, signal }) => {
+  const linked = path.join(path.dirname(realpathSync.native(worktree.path)), "repo-linked");
+  const notes = path.join(linked, "notes.txt");
+  for (const args of [["-C", worktree.path, "worktree", "add", "-b", "linked", linked]]) {
+    const result = spawnSync("git", args, { encoding: "utf8" });
+    if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+  }
+  writeFileSync(notes, "checkpointed\n");
+  spawnSync("git", ["-C", linked, "add", "notes.txt"]);
+  spawnSync("git", ["-C", linked, "commit", "-m", "notes"]);
+  const added = (await runtime.projects(true)).projects.find((item) => item.id === project.id)?.worktrees.find((item) => sameWorktree(item.path, { path: linked }));
+  assert.ok(added, "the linked worktree was not discovered");
+  const target = { projectId: project.id, worktreePath: added.path };
+  const removal = { projectId: project.id, worktreePath: added.path, confirmation: added.path };
+  const checkpoint = async (where) => {
+    const created = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints", where);
+    assert.equal(created.statusCode, 201, created.raw);
+    return created.body.checkpoint.id;
+  };
+  const restore = async (where, id, start = (request) => callRuntime(runtime, "POST", "/api/worktrees/checkpoints/restore", request)) => {
+    const preview = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints/preview", { ...where, id });
+    assert.equal(preview.statusCode, 200, preview.raw);
+    return { preview: preview.body, restored: start({ ...where, id, planDigest: preview.body.planDigest, paths: preview.body.entries.map((entry) => entry.path) }) };
+  };
+  const id = await checkpoint(target);
+
+  // A removal is refused before Git runs while a restore holds the worktree.
+  writeFileSync(notes, "changed\n");
+  let open;
+  removalGate = new Promise((resolve) => { open = resolve; });
+  try {
+    const { restored } = await restore(target, id);
+    await waitUntil(() => runtime.checkpoints.holding(realpathSync.native(linked)), "the restore to hold the worktree", signal);
+    const during = await callRuntime(runtime, "DELETE", "/api/worktrees", removal);
+    assert.deepEqual([during.statusCode, during.body.code, removalAttempts], [409, "CHECKPOINT_RESTORE_RUNNING", 0], during.raw);
+    open();
+    assert.equal((await restored).statusCode, 200);
+  } finally {
+    removalGate = null;
+    open();
+  }
+  assert.equal(readFileSync(notes, "utf8"), "checkpointed\n");
+
+  // Git removes nothing here, but Outright cannot tell.
+  await runtime.projects(true);
+  const lost = await callRuntime(runtime, "DELETE", "/api/worktrees", removal);
+  assert.deepEqual([lost.statusCode, removalAttempts], [503, 1], lost.raw);
+  writeFileSync(notes, "changed\n");
+  const refused = async () => {
+    const { preview, restored } = await restore(target, id);
+    assert.deepEqual(preview.blockers.map((item) => item.code), ["GIT_WRITE_UNCONFIRMED"], JSON.stringify(preview));
+    const response = await restored;
+    assert.deepEqual([response.statusCode, response.body.code], [409, "CHECKPOINT_WRITERS_ACTIVE"], response.raw);
+    assert.equal(readFileSync(notes, "utf8"), "changed\n");
+    const retried = await callRuntime(runtime, "DELETE", "/api/worktrees", removal);
+    assert.deepEqual([retried.statusCode, retried.body.code, removalAttempts], [409, "GIT_WRITE_UNCONFIRMED", 1], retried.raw);
+  };
+  await refused();
+  // Another worktree of the project is not held.
+  const other = path.join(worktree.path, "other.txt");
+  writeFileSync(other, "kept\n");
+  const otherTarget = { projectId: project.id, worktreePath: worktree.path };
+  const otherId = await checkpoint(otherTarget);
+  writeFileSync(other, "changed\n");
+  assert.equal((await (await restore(otherTarget, otherId)).restored).statusCode, 200);
+  assert.equal(readFileSync(other, "utf8"), "kept\n");
+
+  runtime = await restart();
+  await refused();
+  const released = await callRuntime(runtime, "POST", `/api/capacity/utility-owners/${REMOVAL_OWNER}/release`);
+  assert.equal(released.statusCode, 200, released.raw);
+  const after = await restore(target, id);
+  assert.deepEqual(after.preview.blockers, []);
+  assert.equal((await after.restored).statusCode, 200);
+  assert.equal(readFileSync(notes, "utf8"), "checkpointed\n");
+  // A removal whose Git process is accounted for leaves nothing held.
+  removalLoses = false;
+  await runtime.projects(true);
+  const removed = await callRuntime(runtime, "DELETE", "/api/worktrees", removal);
+  assert.deepEqual([removed.statusCode, removalAttempts, existsSync(linked), runtime.checkpoints.holding(linked)], [200, 2, false, null], removed.raw);
+}, { subprocesses: { capacity: () => ({ active: removalUnknown, limit: 8, unknown: removalUnknown }),
+  unknownOwnerStatus: () => removalUnknown ? [{ id: REMOVAL_OWNER }] : [],
+  releaseUnknownOwner: async (id, { audit }) => { const outcome = { id, proven: true, reason: "test" }; await audit(outcome); removalUnknown = 0; return outcome; },
+  run: async (file, args, options) => {
+    if (args.includes("worktree") && args.includes("remove")) removalAttempts += 1;
+    if (args.includes("worktree") && args.includes("remove") && removalLoses) {
+      removalUnknown = 1;
+      throw Object.assign(new Error("ownership unknown"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN" });
+    }
+    if (removalGate && args.includes("commit-tree")) await removalGate;
+    return execFileAsync(file, args, options);
+  } } }));
