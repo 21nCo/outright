@@ -46,6 +46,8 @@ export const WRITE_MARKER = "outright-git-write-unconfirmed";
 const ID_PATTERN = /^[0-9a-z]{6,12}-[0-9a-f]{8}$/;
 const OID_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 const REGULAR_MODE = /^100(?:644|755)$/;
+// `ls-files --debug -z` records: a path, then the stat data Git keeps for it, ending with the file's size on disk.
+const DEBUGGED = /([^\0]*)\0 {2}ctime: .*\n {2}mtime: .*\n {2}dev: .*\n {2}uid: .*\n {2}size: (\d+)\t.*\n/g;
 const EMPTY_TREES = { sha1: "4b825dc642cb6eb9a060e54bf8d69288fbee4904", sha256: "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321" };
 const EMPTY_BLOBS = { sha1: "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391", sha256: "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813" };
 // macOS refuses a link anywhere in the path (O_NOFOLLOW_ANY), elsewhere only at its end.
@@ -302,16 +304,16 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
   // own content comparisons (a command that writes an index compares the
   // entries as new as it), so no clean filter runs and a failing required
   // one cannot stop a capture or restore; whether Git tracks the
-  // executable bit and makes symbolic links; which files it writes with CRLF line
-  // endings ("all" text with core.autocrlf true; "text", those with a text attribute,
-  // with core.eol crlf or Windows' native default, unless core.autocrlf is input);
+  // executable bit and makes symbolic links; which files may have line endings
+  // converted on checkout or check-in ("all" text with core.autocrlf true or input;
+  // otherwise "text", those with a text or eol attribute, whatever core.eol says);
   // and whether a filter changes files on checkout.
   async function captureSettings(cwd) {
     let listed = "";
-    try { listed = await git(cwd, ["config", "-z", "--get-regexp", "^(filter\\..+\\.(clean|smudge|process|required)|core\\.(filemode|symlinks|autocrlf|eol))$"]); }
+    try { listed = await git(cwd, ["config", "-z", "--get-regexp", "^(filter\\..+\\.(clean|smudge|process|required)|core\\.(filemode|symlinks|autocrlf))$"]); }
     catch (error) { if (error.code !== 1) throw error; }
     const names = new Set();
-    const settings = { "core.filemode": "true", "core.symlinks": "true", "core.autocrlf": "false", "core.eol": "native" };
+    const settings = { "core.filemode": "true", "core.symlinks": "true", "core.autocrlf": "false" };
     let smudged = false;
     for (const record of listed.split("\0")) {
       const key = record.split("\n", 1)[0];
@@ -319,9 +321,9 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       if (filter) { names.add(filter[1]); smudged ||= ["smudge", "process"].includes(filter[2]); }
       else if (key in settings) settings[key] = record.slice(key.length + 1).trim().toLowerCase();
     }
-    const on = (key) => !/^(?:false|no|off|0)$/.test(settings[key]), autocrlf = settings["core.autocrlf"], eol = settings["core.eol"];
+    const on = (key) => !/^(?:false|no|off|0)$/.test(settings[key]);
     return { fileMode: on("core.filemode"), symlinks: on("core.symlinks"), smudged,
-      crlf: on("core.autocrlf") && autocrlf !== "input" ? "all" : autocrlf !== "input" && (eol === "crlf" || (process.platform === "win32" && eol === "native")) ? "text" : null,
+      crlf: on("core.autocrlf") ? "all" : "text",
       unfiltered: [...names].flatMap((name) => ["-c", `filter.${name}.clean=`, "-c", `filter.${name}.process=`, "-c", `filter.${name}.required=false`]) };
   }
 
@@ -335,23 +337,22 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     return found;
   }
 
-  // Tracked files Git converts on their way out can be unchanged to Git with bytes on disk that are not their index entry:
-  // line endings where Git writes CRLF (above, or an eol=crlf attribute), told apart by Git's own line-ending info without
-  // Outright reading the file, and files under ident, working-tree-encoding or, with a smudge or process driver configured,
+  // Tracked files Git converts on checkout or check-in can be unchanged to Git with bytes on disk that are not their index entry:
+  // line endings (above: CRLF written out, or CRLF normalized on add), told apart without reading files by a size on disk Git
+  // recorded that is not the blob's (racy or unrefreshed entries, size 0, are read too; a file missing on disk, as one outside
+  // a sparse checkout is, is not), and files under ident, working-tree-encoding or, with a smudge or process driver configured,
   // a filter attribute. `found` holds lstats of regular files within the per-file bound and, together, `files` and
   // `totalBytes`; other regular files (Git LFS content, for one) are `unheld`. A conversion no longer configured is not seen.
   // Residual (OUT-140): capture still runs Git once per batch of converted paths, so very large converted repos are slow.
-  async function converted(temporary, cwd, settings, listed) {
+  async function converted(temporary, cwd, settings, listed, viewTree) {
     const candidates = new Set(), found = new Map(), unheld = new Set();
     const list = (args) => temporary(args, { maxBuffer: 64 * 1024 * 1024, names: true }).catch((error) => {
       throw error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" ? checkpointError(413, "This worktree has too many files Git converts to take checkpoints", "CHECKPOINT_TOO_LARGE") : error;
     });
-    const crlf = settings.crlf === "all" ? [":(exclude,attr:-text)"] : [":(attr:eol=crlf)", ...settings.crlf ? [":(attr:text)", ":(attr:text=auto)"] : []];
-    for (const record of (await list(["ls-files", "--eol", "-z", "--", ...crlf])).split("\0")) {
-      // A file missing on disk (as one outside a sparse checkout is) has no line-ending info.
-      const [, index, worktree] = /^i\/(\S*)\s+w\/(\S+)/.exec(record) ?? [];
-      if (worktree && index !== worktree) candidates.add(record.slice(record.indexOf("\t") + 1));
-    }
+    const crlf = settings.crlf === "all" ? [":(exclude,attr:-text)"] : [":(exclude,attr:!text !eol)", ":(exclude,attr:-text)"];
+    const recorded = await list(["ls-files", "--debug", "-z", "--", ...crlf]);
+    const sizes = recorded ? new Map((await list(["ls-tree", "-r", "-l", "-z", viewTree])).split("\0").map((record) => [record.slice(record.indexOf("\t") + 1), record.split(/ +|\t/)[3]])) : new Map();
+    for (const [, relative, size] of recorded.matchAll(DEBUGGED)) if (sizes.get(relative) !== size) candidates.add(relative);
     const other = `:(exclude,attr:!ident !working-tree-encoding${settings.smudged ? " !filter" : ""})`;
     for (const relative of (await list(["ls-files", "-z", "--", other])).split("\0")) if (relative) candidates.add(relative);
     let bytes = 0;
@@ -480,7 +481,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     // What Git sees (`viewTree`, for counts and listings), then converted files Git sees unchanged as they are on disk:
     // a restore writes those bytes, but they are not changes and count against no budget (Git stores each content once).
     const viewTree = (await temporary(["write-tree"])).trim();
-    const conversions = await converted(temporary, cwd, settings, new Set(changedPaths));
+    const conversions = await converted(temporary, cwd, settings, new Set(changedPaths), viewTree);
     for (const [relative, info] of conversions.found) found.set(relative, info);
     await store([...conversions.found.keys()], false);
     let filesTree = viewTree;

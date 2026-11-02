@@ -575,6 +575,32 @@ test("a clean checkout Git converted is never refused or counted, has no read of
   await assert.rejects(lstat(path.join(repository, "s", "out1.txt")), { code: "ENOENT" });
 });
 
+for (const normalized of ["core.autocrlf input", "* text=auto"]) {
+  test(`a file Git normalized on its way in restores as it was on disk, not as its index entry (${normalized})`, async (t) => {
+    const { repository } = await fixture(t);
+    if (normalized === "* text=auto") await writeFile(path.join(repository, ".gitattributes"), "* text=auto\n");
+    else await git(repository, ["config", "core.autocrlf", "input"]);
+    await writeFile(path.join(repository, "n.txt"), "x\n");
+    await git(repository, ["add", "."]);
+    await git(repository, ["commit", "-qm", "normalized"]);
+    // CRLF on disk, added and normalized to the LF blob already committed, with stat data Git trusts: unchanged to Git.
+    await writeFile(path.join(repository, "n.txt"), "x\r\n");
+    await utimes(path.join(repository, "n.txt"), new Date(Date.now() - 10_000), new Date(Date.now() - 10_000));
+    await git(repository, ["add", "n.txt"]);
+    assert.equal(await status(repository), "");
+    assert.match(await git(repository, ["ls-files", "--eol", "n.txt"]), /^i\/lf\s+w\/crlf\s/);
+    const { checkpoints } = service();
+    const checkpoint = await checkpoints.capture(target(repository));
+    assert.deepEqual(checkpoint.counts, { staged: 0, unstaged: 0, untracked: 0 });
+    assert.deepEqual((await checkpoints.inspect(target(repository), checkpoint.id)).entries, []);
+    await writeFile(path.join(repository, "n.txt"), "edited\n");
+    const { preview } = await restoreAll(checkpoints, repository, checkpoint.id);
+    assert.deepEqual(preview.entries.map((entry) => entry.path), ["n.txt"]);
+    assert.equal(await readFile(path.join(repository, "n.txt"), "utf8"), "x\r\n");
+    assert.equal(await status(repository), "");
+  });
+}
+
 // Converted on checkout and made older than the index, so Git trusts their stat data and sees them unchanged.
 async function convertedCheckout(repository, names) {
   for (const name of names) await rm(path.join(repository, name));
