@@ -12,6 +12,7 @@ import { createTerminalManager } from "./terminal-manager.mjs";
 import { accountPin, createProviderAccounts } from "./provider-accounts.mjs";
 import { createGitService } from "./git-service.mjs";
 import { createWorktreeLifecycle } from "./worktree-lifecycle.mjs";
+import { createWorktreeCheckpoints, holdMessage } from "./worktree-checkpoints.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
 import { lifecycleProcesses, utilityProcesses } from "./subprocess-budget.mjs";
 import { createRuntimeEventHub, validateSocketMessage } from "./runtime-events.mjs";
@@ -138,18 +139,43 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   terminals = terminalManagerFactory({ database, publish, subprocesses, runtimeInstanceId, reattachEnabled: () => {
     try { return database.getSettings().terminalReattach === true; } catch { return false; }
   } });
-  const git = createGitService({ database, getProjects: () => latestScan?.projects ?? [], getConfig: () => loadOutrightConfig(configUrl), subprocesses });
+  // Stages, unstages and commits are refused while a checkpoint restore
+  // holds their worktree, and a restore waits for them.
+  const git = createGitService({ database, getProjects: () => latestScan?.projects ?? [], getConfig: () => loadOutrightConfig(configUrl), subprocesses,
+    admitWriter: (cwd) => checkpoints.admitWriter([cwd]) });
   // Setup and teardown never run beside agent work in the same worktree: the
   // agent manager holds queued runs while a worktree is held, including while
   // a step's processes are unconfirmed, and a run that waited launches when
   // the hold ends. Neither starts beside an unresolved interrupted run.
   const lifecycle = createWorktreeLifecycle({ database, subprocesses: lifecycleSubprocesses, publish: (event) => publish(event),
     agentWork: (paths) => agents?.hasWorktreeWork(paths) ?? false,
+    restoreHold: (paths) => paths.map((worktreePath) => checkpoints.holding(worktreePath)).find(Boolean) ?? null,
     interruptedRun: (paths) => paths.map((worktreePath) => database.findUnresolvedInterruptedRunForWorktree(worktreePath)).find(Boolean) ?? null,
     onRelease: () => { if (!shuttingDown) agents?.resumeQueued(); },
     onPersistError: (error) => {
       if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:worktree-lifecycle]", error);
     } });
+  // A restore replaces files and index entries, so it never runs beside
+  // agent work, setup or teardown, Git stages and commits, or an unresolved
+  // interrupted run in that worktree, and those wait for it, and for one
+  // that did not finish, until it is finished or its files are kept. Open
+  // terminals are listed for the user to confirm: Outright cannot tell
+  // whether a shell is writing; a new one waits for the restore. A change
+  // rescans projects, as an index-only restore is not seen by the watcher.
+  const checkpoints = createWorktreeCheckpoints({ database, subprocesses, publish: (event) => { publish(event); scheduleRescan(event.payload.worktreePath); },
+    writers: (paths) => {
+      const found = [];
+      if (agents?.hasWorktreeWork(paths)) found.push({ code: "WORKTREE_AGENT_ACTIVE", message: "an agent run is queued or running in this worktree" });
+      const hold = paths.map((worktreePath) => lifecycle.hold(worktreePath)).find(Boolean);
+      if (hold) found.push({ code: hold, message: hold === "WORKTREE_LIFECYCLE_BUSY" ? "worktree setup or teardown is running" : "setup or teardown processes here are not confirmed stopped" });
+      const interrupted = paths.map((worktreePath) => database.findUnresolvedInterruptedRunForWorktree(worktreePath)).find(Boolean);
+      if (interrupted) found.push({ code: "RUN_RECOVERY_REQUIRED", message: "an interrupted agent run here is not resolved", runId: interrupted.id });
+      return found;
+    },
+    terminals: (paths) => terminals.list({ saved: false })
+      .filter((terminal) => paths.includes(terminal.cwd) && !["exited", "ended"].includes(terminal.status))
+      .map((terminal) => ({ id: terminal.id, name: terminal.name })),
+    onRelease: () => { if (!shuttingDown) agents?.resumeQueued(); } });
   runtimeCapacity = function runtimeCapacity() {
     const capacity = database.capacity();
     return { ...capacity, activeProcesses: agents?.activeProcessCount() ?? 0,
@@ -178,7 +204,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       }
     },
     onProvidersChanged: (providers) => publish({ type: "providers.changed", payload: { providers } }),
-    worktreeHeld: (worktreePath) => Boolean(lifecycle.hold(worktreePath)), validateConversation: async (conversation) => {
+    worktreeHeld: (worktreePath) => Boolean(lifecycle.hold(worktreePath) || checkpoints.holding(worktreePath)), validateConversation: async (conversation) => {
     const target = await resolveWorktreeTarget(conversation);
     return () => {
       if (database.getConversation(conversation.id)?.archived) throw apiError(409, "Archived conversations cannot start agent runs", { code: "CONVERSATION_ARCHIVED" });
@@ -282,6 +308,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     if (typeof subprocesses.reconcileUnknown === "function") {
       void Promise.resolve().then(() => subprocesses.reconcileUnknown()).then(async (resolved) => {
         onRecovered(resolved);
+        if (resolved && !shuttingDown) checkpoints.reconcile();
         // A terminal proof may have been refused only because utility owners
         // occupied every helper slot. Retry it after capacity is reclaimed.
         if (resolved && !shuttingDown) await terminals.reconcileUnknown();
@@ -396,18 +423,21 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         || /(?:^|\/)\.git\/(?:objects|lfs|modules|worktrees)(?:\/|$)/.test(target),
       awaitWriteFinish: { stabilityThreshold: 250, pollInterval: 100 },
     });
-    watcher.on("all", (_eventName, changedPath) => {
-      clearTimeout(watcherTimer);
-      watcherTimer = setTimeout(async () => {
-        try {
-          const result = await projects(true);
-          publish({ type: "projects.changed", payload: { changedPath, projects: result.projects, scannedAt: result.scannedAt } });
-        } catch { /* The next manual refresh will surface scanner errors. */ }
-      }, 500);
-    });
+    watcher.on("all", (_eventName, changedPath) => scheduleRescan(changedPath));
     watcher.on("error", (error) => {
       if (process.env.OUTRIGHT_DEBUG === "1") console.warn("[outright:watcher]", error.message);
     });
+  }
+
+  function scheduleRescan(changedPath) {
+    clearTimeout(watcherTimer);
+    if (shuttingDown) return;
+    watcherTimer = setTimeout(async () => {
+      try {
+        const result = await projects(true);
+        publish({ type: "projects.changed", payload: { changedPath, projects: result.projects, scannedAt: result.scannedAt } });
+      } catch { /* The next manual refresh will surface scanner errors. */ }
+    }, 500);
   }
 
   function ensureDefaultSpaces(projectList) {
@@ -441,8 +471,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     publish({ type: "capacity.changed", payload: runtimeCapacity() });
     // A terminal proof may have waited only for this helper slot.
     if (!shuttingDown) void terminals.reconcileUnknown().catch(() => {});
-    // The last unconfirmed step may now be proven gone.
+    // The last unconfirmed step, or Git write, may now be proven gone.
     if (!shuttingDown && budget === lifecycleSubprocesses) void lifecycle.reconcile().catch(() => {});
+    if (!shuttingDown && budget === subprocesses) checkpoints.reconcile();
     return { released, capacity: runtimeCapacity() };
   }
 
@@ -788,6 +819,8 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         const lifecycleHold = lifecycle.hold(target.worktreePath) ?? lifecycle.hold(conversation.worktreePath);
         if (lifecycleHold === "WORKTREE_LIFECYCLE_BUSY") throw apiError(409, "Worktree setup or teardown is running; start work when it finishes", { code: lifecycleHold });
         if (lifecycleHold) throw apiError(409, "Setup or teardown processes in this worktree are not confirmed stopped; acknowledge them in Worktree setup first", { code: lifecycleHold });
+        const restoring = checkpoints.holding(target.worktreePath) ?? checkpoints.holding(conversation.worktreePath);
+        if (restoring) throw apiError(409, holdMessage(restoring, "start work"), { code: restoring });
         const { run, message: userMessage } = database.submitRun({ conversationId: conversation.id, worktreePath: conversation.worktreePath, ...runConfig, prompt }, prompt);
         publish({ type: "message.created", conversationId: conversation.id, payload: userMessage });
         return json(response, 202, await agents.schedule({ conversation: database.getConversation(conversation.id), run }));
@@ -1028,7 +1061,10 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         }
         await projects();
         const cwd = await git.requireWorktree(body.cwd);
-        return json(response, 201, await terminals.create({ ...body, cwd }));
+        // Never beside a checkpoint restore, which waits for it in turn.
+        const release = checkpoints.admitWriter([cwd], "terminal");
+        try { return json(response, 201, await terminals.create({ ...body, cwd })); }
+        finally { release(); }
       }
       const terminalMatch = url.pathname.match(/^\/api\/terminals\/([^/]+)$/);
       if (terminalMatch && request.method === "GET") { const terminal = terminals.get(terminalMatch[1]); return json(response, terminal ? 200 : 404, terminal ?? { error: "Terminal not found" }); }
@@ -1063,6 +1099,28 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (lifecycleMatch[1] === "cancel") return json(response, 200, { state: lifecycle.cancel(target) });
         if (lifecycleMatch[1] === "acknowledge") return json(response, 200, { state: lifecycle.acknowledge(target, acknowledgedRunId(body)) });
         return json(response, 202, { state: await lifecycle.setup(target, { acknowledgeUnconfirmed: acknowledgedRunId(body) }) });
+      }
+      const checkpointMatch = url.pathname.match(/^\/api\/worktrees\/checkpoints(?:\/(inspect|diff|preview|restore|recover))?$/);
+      if (checkpointMatch && request.method === "GET" && ["inspect", "diff", undefined].includes(checkpointMatch[1])) {
+        const target = await resolveLifecycleTarget({ projectId: url.searchParams.get("projectId"), worktreePath: requiredQuery(url, "path") });
+        if (checkpointMatch[1] === "inspect") return json(response, 200, await checkpoints.inspect(target, requiredQuery(url, "id")));
+        if (checkpointMatch[1] === "diff") {
+          return json(response, 200, await checkpoints.fileDiff(target, { id: requiredQuery(url, "id"), tree: requiredQuery(url, "tree"), file: requiredQuery(url, "file"),
+            side: url.searchParams.get("side") ?? "files" }));
+        }
+        return json(response, 200, await checkpoints.describe(target));
+      }
+      const checkpointAction = checkpointMatch && ((request.method === "POST" && !["inspect", "diff"].includes(checkpointMatch[1]))
+        || (request.method === "DELETE" && checkpointMatch[1] === undefined));
+      if (checkpointAction) {
+        const body = await readJson(request);
+        if (!body || typeof body !== "object" || Array.isArray(body)) throw apiError(400, "Worktree target is required");
+        const target = await resolveLifecycleTarget(body);
+        if (request.method === "DELETE") return json(response, 200, await checkpoints.remove(target, body.id));
+        if (checkpointMatch[1] === "preview") return json(response, 200, await checkpoints.preview(target, body.id, { resume: body.resume === true }));
+        if (checkpointMatch[1] === "restore") return json(response, 200, await checkpoints.restore(target, body));
+        if (checkpointMatch[1] === "recover") return json(response, 200, await checkpoints.recover(target, body.action));
+        return json(response, 201, { checkpoint: await checkpoints.capture(target, { label: body.label }) });
       }
 
       if (url.pathname === "/api/templates" && request.method === "GET") return json(response, 200, { templates: database.listTemplates() });
@@ -1163,7 +1221,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     let disposed = false;
     shutdownPromise = (async () => {
       const shutdownErrors = [];
-      const preliminaries = await Promise.allSettled([watcher?.close(), agents.shutdown(), accounts.close(), lifecycle.shutdown()]);
+      const preliminaries = await Promise.allSettled([watcher?.close(), agents.shutdown(), accounts.close(), lifecycle.shutdown(), checkpoints.shutdown()]);
       for (const result of preliminaries) if (result.status === "rejected") shutdownErrors.push(result.reason);
       // A failed agent shutdown may be the sole owner of an exited provider's
       // result while both SQLite and its recovery sidecar are unavailable.
@@ -1200,7 +1258,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     return shutdownPromise;
   }
 
-  return { attach, handleRequest, projects, publish, eventHub, database, agents, terminals, git, lifecycle, shutdown, withdrawReattach,
+  return { attach, handleRequest, projects, publish, eventHub, database, agents, terminals, git, lifecycle, checkpoints, shutdown, withdrawReattach,
     whenShutdownComplete: () => shutdownCompletion, whenRunRecoveryComplete: () => runRecovery.cycle };
   } catch (error) {
     runRecoveryController.abort();

@@ -3773,3 +3773,131 @@ test("unconfirmed setup processes hold agent work until acknowledged, and setup 
 }, { agentManagerFactory: (options) => createAgentManager(unconfirmedAgentOptions = options),
   lifecycleSubprocesses: { capacity: () => ({ active: 1, limit: 4, unknown: 1 }), reconcileUnknown: async () => 0, unknownOwnerStatus: () => [],
     run: async () => { throw Object.assign(new Error("ownership unknown"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN", cause: new Error("lost") }); } } }));
+
+let checkpointAgentOptions;
+let checkpointGate = null;
+test("a checkpoint restore is refused beside agent work and holds new runs and Git writes while it runs", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const target = { projectId: project.id, worktreePath: worktree.path };
+  const notes = path.join(worktree.path, "notes.txt");
+  writeFileSync(notes, "checkpointed\n");
+  const created = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints", { ...target, label: "Before agent" });
+  assert.equal(created.statusCode, 201, created.raw);
+  const { id } = created.body.checkpoint;
+  writeFileSync(notes, "agent changed this\n");
+  const preview = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints/preview", { ...target, id });
+  assert.deepEqual(preview.body.entries.map((entry) => entry.path), ["notes.txt"], preview.raw);
+  const request = { ...target, id, planDigest: preview.body.planDigest, paths: ["notes.txt"] };
+
+  const hasWorktreeWork = runtime.agents.hasWorktreeWork;
+  runtime.agents.hasWorktreeWork = (paths) => paths.includes(worktree.path);
+  const beside = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints/restore", request);
+  runtime.agents.hasWorktreeWork = hasWorktreeWork;
+  assert.deepEqual([beside.statusCode, beside.body.code, beside.body.blockers?.[0].code], [409, "CHECKPOINT_WRITERS_ACTIVE", "WORKTREE_AGENT_ACTIVE"], beside.raw);
+  assert.equal(readFileSync(notes, "utf8"), "agent changed this\n");
+
+  let release;
+  checkpointGate = new Promise((resolve) => { release = resolve; });
+  const restoring = callRuntime(runtime, "POST", "/api/worktrees/checkpoints/restore", request);
+  try {
+    for (const deadline = Date.now() + 15_000; !checkpointAgentOptions.worktreeHeld(worktree.path); await new Promise((resolve) => setTimeout(resolve, 10))) {
+      if (Date.now() > deadline) assert.fail("the restore never held the worktree");
+    }
+    // Provider discovery is not under test here.
+    runtime.agents.providerAvailable = async () => true;
+    const conversation = runtime.database.createConversation({ ...target, worktreeId: worktree.id, title: "During restore", provider: "codex" });
+    const during = await callRuntime(runtime, "POST", `/api/conversations/${conversation.id}/runs`, { prompt: "start during restore" });
+    assert.equal(during.body.code, "CHECKPOINT_RESTORE_RUNNING", during.raw);
+    assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+    for (const [route, body] of [["/api/git/stage", { path: worktree.path, files: ["notes.txt"] }], ["/api/git/unstage", { path: worktree.path, files: ["notes.txt"] }],
+      ["/api/git/commit", { path: worktree.path, message: "during restore" }], ["/api/terminals", { cwd: worktree.path }]]) {
+      const refused = await callRuntime(runtime, "POST", route, body);
+      assert.deepEqual([refused.statusCode, refused.body.code], [409, "CHECKPOINT_RESTORE_RUNNING"], `${route}: ${refused.raw}`);
+    }
+    const setup = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/setup", target);
+    assert.deepEqual([setup.statusCode, setup.body.code], [409, "CHECKPOINT_RESTORE_RUNNING"], setup.raw);
+    assert.deepEqual(runtime.terminals.list({ saved: false }), [], "a shell started that the restore never confirmed");
+  } finally {
+    checkpointGate = null;
+    release();
+  }
+  const restored = await restoring;
+  assert.equal(restored.statusCode, 200, restored.raw);
+  assert.equal(readFileSync(notes, "utf8"), "checkpointed\n");
+  assert.equal(checkpointAgentOptions.worktreeHeld(worktree.path), false);
+  const listed = await callRuntime(runtime, "GET", `/api/worktrees/checkpoints?projectId=${encodeURIComponent(project.id)}&path=${encodeURIComponent(worktree.path)}`);
+  assert.deepEqual(listed.body.checkpoints.map((checkpoint) => checkpoint.reason), ["before-restore", "manual"], listed.raw);
+}, { agentManagerFactory: (options) => createAgentManager(checkpointAgentOptions = options),
+  subprocesses: { capacity: () => ({ active: 0, limit: 8 }), run: async (file, args, options) => {
+    if (checkpointGate && args.includes("commit-tree")) await checkpointGate;
+    return execFileAsync(file, args, options);
+  } } }));
+
+let interruptedAgentOptions;
+test("a restore that did not finish holds agent runs, setup and Git writes after a restart until its files are kept", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const target = { projectId: project.id, worktreePath: worktree.path };
+  writeFileSync(path.join(worktree.path, "notes.txt"), "work\n");
+  // The marker an interrupted restore leaves in the Git directory is all a
+  // new runtime has.
+  writeFileSync(path.join(worktree.path, ".git", "outright-checkpoint-restore.json"), "{}");
+  assert.equal(interruptedAgentOptions.worktreeHeld(worktree.path), true);
+  runtime.agents.providerAvailable = async () => true;
+  const conversation = runtime.database.createConversation({ ...target, worktreeId: worktree.id, title: "After restart", provider: "codex" });
+  const run = await callRuntime(runtime, "POST", `/api/conversations/${conversation.id}/runs`, { prompt: "start after restart" });
+  assert.deepEqual([run.statusCode, run.body.code], [409, "CHECKPOINT_RESTORE_INTERRUPTED"], run.raw);
+  assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+  const setup = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/setup", target);
+  assert.deepEqual([setup.statusCode, setup.body.code], [409, "CHECKPOINT_RESTORE_INTERRUPTED"], setup.raw);
+  const stage = await callRuntime(runtime, "POST", "/api/git/stage", { path: worktree.path, files: ["notes.txt"] });
+  assert.deepEqual([stage.statusCode, stage.body.code], [409, "CHECKPOINT_RESTORE_INTERRUPTED"], stage.raw);
+  const listed = await callRuntime(runtime, "GET", `/api/worktrees/checkpoints?projectId=${encodeURIComponent(project.id)}&path=${encodeURIComponent(worktree.path)}`);
+  assert.equal(listed.body.restore?.status, "interrupted", listed.raw);
+
+  const kept = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints/recover", { ...target, action: "keep" });
+  assert.equal(kept.statusCode, 200, kept.raw);
+  assert.equal(interruptedAgentOptions.worktreeHeld(worktree.path), false);
+  const staged = await callRuntime(runtime, "POST", "/api/git/stage", { path: worktree.path, files: ["notes.txt"] });
+  assert.equal(staged.statusCode, 200, staged.raw);
+}, { agentManagerFactory: (options) => createAgentManager(interruptedAgentOptions = options),
+  subprocesses: { capacity: () => ({ active: 0, limit: 8 }), run: (file, args, options) => execFileAsync(file, args, options) } }));
+
+let strayAgentOptions;
+let strayUnknown = 1;
+const STRAY_OWNER = "8a7b6c5d-4e3f-4a1b-9c8d-7e6f5a4b3c2d";
+test("a Git write that lost its process before a restart holds the worktree until its owner is released, then queued runs resume", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const target = { projectId: project.id, worktreePath: worktree.path };
+  const events = captureEvents(runtime);
+  writeFileSync(path.join(worktree.path, "notes.txt"), "work\n");
+  const created = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints", target);
+  assert.equal(created.statusCode, 201, created.raw);
+  // What the previous runtime's stage left behind; the budget still holds its owner.
+  writeFileSync(path.join(worktree.path, ".git", "outright-git-write-unconfirmed"), "earlier\n");
+  assert.equal(strayAgentOptions.worktreeHeld(worktree.path), true);
+  const preview = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints/preview", { ...target, id: created.body.checkpoint.id });
+  assert.deepEqual(preview.body.blockers?.map((item) => item.code), ["GIT_WRITE_UNCONFIRMED"], preview.raw);
+  for (const [route, body] of [["/api/git/stage", { path: worktree.path, files: ["notes.txt"] }], ["/api/worktrees/lifecycle/setup", target],
+    ["/api/terminals", { cwd: worktree.path }]]) {
+    const refused = await callRuntime(runtime, "POST", route, body);
+    assert.deepEqual([refused.statusCode, refused.body.code], [409, "GIT_WRITE_UNCONFIRMED"], `${route}: ${refused.raw}`);
+  }
+  let resumed = 0;
+  runtime.agents.resumeQueued = () => { resumed += 1; };
+  events.clear();
+  const released = await callRuntime(runtime, "POST", `/api/capacity/utility-owners/${STRAY_OWNER}/release`);
+  assert.equal(released.statusCode, 200, released.raw);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(resumed, 1, "runs waiting for the worktree were not resumed");
+  assert.equal(strayAgentOptions.worktreeHeld(worktree.path), false);
+  assert.equal(existsSync(path.join(worktree.path, ".git", "outright-git-write-unconfirmed")), false);
+  assert.deepEqual(events.of("worktree.checkpoints").map((event) => event.payload.worktreePath), [worktree.path]);
+  // The Changes pane and the sidebar learn of a restore through a rescan,
+  // as the watcher does not see an index-only change in a linked worktree.
+  const rescanned = () => events.of("projects.changed").some((event) => event.payload.changedPath === worktree.path);
+  for (const deadline = Date.now() + 10_000; !rescanned(); await new Promise((resolve) => setTimeout(resolve, 50))) {
+    if (Date.now() > deadline) assert.fail("no project rescan followed the checkpoint change");
+  }
+  const staged = await callRuntime(runtime, "POST", "/api/git/stage", { path: worktree.path, files: ["notes.txt"] });
+  assert.equal(staged.statusCode, 200, staged.raw);
+}, { agentManagerFactory: (options) => createAgentManager(strayAgentOptions = options),
+  subprocesses: { capacity: () => ({ active: strayUnknown, limit: 8, unknown: strayUnknown }), unknownOwnerStatus: () => strayUnknown ? [{ id: STRAY_OWNER }] : [],
+    releaseUnknownOwner: async (id, { audit }) => { const outcome = { id, proven: true, reason: "test" }; await audit(outcome); strayUnknown = 0; return outcome; },
+    run: (file, args, options) => execFileAsync(file, args, options) } }));
