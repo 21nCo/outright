@@ -3217,6 +3217,12 @@ function captureEvents(runtime) {
     of: (type) => events.filter((event) => event.type === type), all: () => [...events], clear: () => { events.length = 0; } };
 }
 
+// Events name a worktree by its canonical path, which on Windows is not
+// Git's forward-slash spelling.
+function sameWorktree(value, worktree) {
+  try { return realpathSync.native(value) === realpathSync.native(worktree.path); } catch { return false; }
+}
+
 async function callRuntime(runtime, method, url, body) {
   const response = responseCapture();
   await runtime.handleRequest(requestStream(method, url, body), response);
@@ -3927,12 +3933,50 @@ test("a checkpoint change is named by its project rescan however many watcher pa
   const rescan = () => events.all().slice(checkpointAt).find(watched);
   await waitFor(rescan, "the rescan after the checkpoint change");
   const { changedPaths, changedPathsTruncated } = rescan().payload;
-  assert.ok(changedPaths.includes(worktree.path), `the checkpoint's worktree is missing from ${changedPaths.length} changed paths`);
+  assert.ok(changedPaths.some((value) => sameWorktree(value, worktree)), `the checkpoint's worktree is missing from ${changedPaths.length} changed paths`);
   assert.ok(changedPaths.length <= 65, `${changedPaths.length} changed paths`);
   // Unless a stalled event loop let an earlier rescan fire, the flood
   // exceeded the bound and the event says its list is incomplete.
   if (coalesced) assert.equal(changedPathsTruncated, true);
 }, { subprocesses: { capacity: () => ({ active: 0, limit: 8 }), run: (file, args, options) => execFileAsync(file, args, options) } }));
+
+// The scan the gate holds read Git status before the change.
+let heldScan = null;
+test("a checkpoint change is published from a project scan that started after it, not one already running", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const events = captureEvents(runtime);
+  let release;
+  const read = new Promise((resolve) => { heldScan = { read: resolve, released: new Promise((done) => { release = done; }) }; });
+  try {
+    const running = runtime.projects(true);
+    await read;
+    writeFileSync(path.join(worktree.path, "after-scan.txt"), "after\n");
+    events.clear();
+    await runtime.checkpoints.capture({ project, worktree, worktreePath: realpathSync.native(worktree.path) });
+    assert.equal(events.of("worktree.checkpoints").length, 1);
+    // The rescan's debounce ends while the earlier scan is still running.
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    release();
+    await running;
+    const named = () => events.of("projects.changed").find((event) => event.payload.changedPaths.some((value) => sameWorktree(value, worktree)));
+    for (const deadline = Date.now() + 20_000; !named(); await new Promise((resolve) => setTimeout(resolve, 25))) {
+      if (Date.now() > deadline) assert.fail("no project rescan followed the checkpoint change");
+    }
+    const scanned = named().payload.projects.find((item) => item.id === project.id)?.worktrees.find((item) => sameWorktree(item.path, worktree));
+    assert.ok(scanned?.changedFiles.some((file) => file.path === "after-scan.txt"), JSON.stringify(scanned?.changedFiles));
+  } finally {
+    heldScan = null;
+    release();
+  }
+}, { subprocesses: { capacity: () => ({ active: 0, limit: 8 }), run: async (file, args, options) => {
+  const result = await execFileAsync(file, args, options);
+  const gate = args.includes("--porcelain=v1") && heldScan;
+  if (gate) {
+    heldScan = null;
+    gate.read();
+    await gate.released;
+  }
+  return result;
+} } }));
 
 let interruptedAgentOptions;
 test("a restore that did not finish holds agent runs, setup and Git writes after a restart until its files are kept", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
@@ -3990,11 +4034,12 @@ test("a Git write that lost its process before a restart holds the worktree unti
   assert.equal(resumed, 1, "runs waiting for the worktree were not resumed");
   assert.equal(strayAgentOptions.worktreeHeld(worktree.path), false);
   assert.equal(existsSync(path.join(worktree.path, ".git", "outright-git-write-unconfirmed")), false);
-  assert.deepEqual(events.of("worktree.checkpoints").map((event) => event.payload.worktreePath), [worktree.path]);
+  const published = events.of("worktree.checkpoints").map((event) => event.payload.worktreePath);
+  assert.ok(published.length > 0 && published.every((value) => sameWorktree(value, worktree)), JSON.stringify(published));
   // The Changes pane and the sidebar learn of a restore through a rescan,
   // as the watcher does not see an index-only change in a linked worktree.
   // The marker's removal is also seen by the watcher in the same window.
-  const rescanned = () => events.of("projects.changed").some((event) => event.payload.changedPaths.includes(worktree.path));
+  const rescanned = () => events.of("projects.changed").some((event) => event.payload.changedPaths.some((value) => sameWorktree(value, worktree)));
   for (const deadline = Date.now() + 10_000; !rescanned(); await new Promise((resolve) => setTimeout(resolve, 50))) {
     if (Date.now() > deadline) assert.fail("no project rescan followed the checkpoint change");
   }

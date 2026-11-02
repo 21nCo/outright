@@ -122,11 +122,13 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
   let latestScan = null;
   let latestScanAt = 0;
   let inFlightScan = null;
+  let freshScan = null;
   let watcher = null;
   let watcherTimer = null;
   // The paths a pending rescan covers. A checkpoint's worktree is always
   // named, however many watcher paths share its window; a watcher path past
-  // the bound is dropped and the event says the list is incomplete.
+  // the bound is dropped and the event says the list is incomplete. The
+  // rescan publishes a scan that started after its last path was queued.
   const rescanPaths = new Set();
   let rescanTruncated = false;
   let shutdownPromise;
@@ -356,9 +358,15 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     throw apiError(400, "Destination is not a discovered project worktree");
   }
 
-  async function projects(force = false) {
+  // A `fresh` scan starts after the call: one already running may have read
+  // Git status before the caller's change, so it waits for that one to end.
+  async function projects(force = false, { fresh = false } = {}) {
     const timestamp = Date.now();
     if (!force && latestScan && timestamp - latestScanAt < 1500) return latestScan;
+    if (fresh && inFlightScan) {
+      freshScan ??= inFlightScan.catch(() => {}).then(() => { freshScan = null; return projects(true); });
+      return freshScan;
+    }
     if (!inFlightScan) {
       inFlightScan = loadOutrightConfig(configUrl)
         .then((config) => scanProjects(config, subprocesses))
@@ -452,7 +460,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       rescanPaths.clear();
       rescanTruncated = false;
       try {
-        const result = await projects(true);
+        const result = await projects(true, { fresh: true });
         publish({ type: "projects.changed", payload: { changedPath, changedPaths, changedPathsTruncated, projects: result.projects, scannedAt: result.scannedAt } });
       } catch { /* The next manual refresh will surface scanner errors. */ }
     }, 500);
