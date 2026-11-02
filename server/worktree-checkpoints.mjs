@@ -430,6 +430,8 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     const found = new Map();
     for (const relative of changedPaths) {
       const info = await reachable(relative) ? await lstat(path.join(cwd, relative)).catch(absent) : null;
+      // A FIFO, socket or device is never opened or read; its path is refused before anything is stored.
+      if (info && !info.isFile() && !info.isSymbolicLink() && !info.isDirectory()) throw checkpointError(409, `${relative} is not a file, link or directory; remove it ${when}`, "CHECKPOINT_UNSUPPORTED_FILE", { path: relative });
       if (info?.isFile()) count(relative, info.size);
       found.set(relative, info);
     }
@@ -661,7 +663,7 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
     const unheld = [...byPath.values()].filter((item) => item.unheld).map((item) => item.path);
     const [seen, was, held] = await Promise.all([current.viewTree ?? current.filesTree, checkpoint.view ?? checkpoint.commit, checkpoint.commit]
       .map((tree) => blobs(cwd, tree, unheld)));
-    const root = unheld.length ? await realpath(cwd) : cwd;
+    const root = await realpath(cwd);
     for (const relative of unheld) {
       if (seen.get(relative)?.oid !== was.get(relative)?.oid || seen.get(relative)?.mode !== was.get(relative)?.mode) continue;
       if (!unheldThen.has(relative) && !await holds(root, relative, held.get(relative))) continue;
@@ -669,6 +671,8 @@ export function createWorktreeCheckpoints({ database, subprocesses, publish = ()
       if (item.index) { item.file = null; delete item.unheld; } else byPath.delete(relative);
     }
     const entries = [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
+    // Windows enters no directory, and opens no name from one, whose whole path is over 258 characters, a new file's name beside it included.
+    for (const item of entries) if (process.platform === "win32" && item.file && Math.max(path.join(root, item.path).length, path.join(root, path.dirname(item.path)).length + 51) > 258) item.blocked = "Too long a path for Windows to restore here; restore it with Git";
     const group = new Map(entries.map((item) => [item.path, item.path]));
     const find = (value) => { while (group.get(value) !== value) value = group.get(value); return value; };
     for (const item of entries) {

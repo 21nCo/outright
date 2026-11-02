@@ -3,6 +3,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { chmod, link, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
+import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -1824,14 +1825,17 @@ test("a deletion empties the directories above it one level a turn, each step li
   await git(repository, ["config", "core.longpaths", "true"]);
   const { checkpoints } = service();
   const checkpoint = await checkpoints.capture(target(repository));
-  const depth = 60, deep = Array.from({ length: depth }, (_, index) => `d${index}`).join("/");
+  // On Windows, as deep as a restore goes there (a longer path is refused, as the next test shows).
+  let depth = 60;
+  while (process.platform === "win32" && !windowsFits(repository, depthPath(depth))) depth -= 1;
+  const deep = depthPath(depth);
   await mkdir(path.join(repository, deep), { recursive: true });
   await writeFile(path.join(repository, deep, "made.txt"), "made after\n");
   await mkdir(path.join(repository, "d0", "kept"));
   await writeFile(path.join(repository, "d0", "kept.txt"), "made after\n");
   const preview = await checkpoints.preview(target(repository), checkpoint.id);
-  assert.ok(preview.entries.some((entry) => entry.path === `${deep}/made.txt`), JSON.stringify({ path: path.join(repository, deep, "made.txt").length,
-    longpaths: (await git(repository, ["config", "--show-origin", "--get-all", "core.longpaths"])).trim(), untracked: await git(repository, ["ls-files", "--others"]), entries: preview.entries.map((entry) => entry.path) }));
+  assert.ok(preview.entries.some((entry) => entry.path === `${deep}/made.txt` && !entry.blocked), JSON.stringify({ path: path.join(repository, deep, "made.txt").length,
+    longpaths: (await git(repository, ["config", "--show-origin", "--get-all", "core.longpaths"])).trim(), untracked: await git(repository, ["ls-files", "--others"]), entries: preview.entries }));
   const original = process.chdir, events = [], steps = [], home = process.cwd();
   let entered = 0;
   process.chdir = (...args) => { entered += 1; return original.apply(process, args); };
@@ -1851,6 +1855,90 @@ test("a deletion empties the directories above it one level a turn, each step li
   assert.ok(Math.max(...steps) <= 2 * depth + 4, `${Math.max(...steps)} directory changes in one step of a deletion ${depth} levels deep`);
   assert.deepEqual((await readdir(path.join(repository, "d0"))).sort(), ["kept", "kept.txt"]);
   assert.equal(process.cwd(), home, "the process's directory changed");
+});
+
+const depthPath = (depth) => Array.from({ length: depth }, (_, index) => `d${index}`).join("/");
+// Windows enters no directory, and opens no name from one, over 258 characters; a restore writes a new file (51 characters
+// with its separator) beside the one it restores.
+const windowsFits = (root, directory) => Math.max(path.join(root, directory, "made.txt").length, path.join(root, directory).length + 51) <= 258;
+
+test("on Windows, a path too long to restore there is marked in the preview and refused before anything is recorded or changed", async (t) => {
+  const { repository } = await fixture(t);
+  await git(repository, ["config", "core.longpaths", "true"]);
+  const { checkpoints } = service();
+  const checkpoint = await checkpoints.capture(target(repository));
+  const deep = depthPath(60);
+  await mkdir(path.join(repository, deep), { recursive: true });
+  await writeFile(path.join(repository, deep, "made.txt"), "made after\n");
+  await writeFile(path.join(repository, "near.txt"), "made after\n");
+  assert.ok(!windowsFits(repository, deep), `${path.join(repository, deep).length} characters fit`);
+  // Elsewhere the service is told it runs on Windows, so the same rule is checked on every platform CI runs.
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  if (process.platform !== "win32") Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+  t.after(() => Object.defineProperty(process, "platform", platform));
+  const preview = await checkpoints.preview(target(repository), checkpoint.id);
+  assert.match(preview.entries.find((entry) => entry.path === `${deep}/made.txt`)?.blocked ?? "", /Too long a path for Windows/, JSON.stringify(preview.entries));
+  assert.equal(preview.entries.find((entry) => entry.path === "near.txt")?.blocked, undefined);
+  const refs = await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]), home = process.cwd();
+  await assert.rejects(checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: [`${deep}/made.txt`] }),
+    (error) => error.statusCode === 409 && error.details.code === "CHECKPOINT_SELECTION_INVALID" && error.message.includes(`${deep}/made.txt`));
+  assert.equal(await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]), refs, "a refused restore recorded a checkpoint");
+  await assert.rejects(readFile(path.join(repository, ".git", RESTORE_MARKER)), { code: "ENOENT" });
+  assert.equal(await readFile(path.join(repository, deep, "made.txt"), "utf8"), "made after\n");
+  assert.equal(checkpoints.holding(repository), null);
+  assert.equal(process.cwd(), home);
+  // The rest of the preview still restores.
+  await restoreAll(checkpoints, repository, checkpoint.id);
+  await assert.rejects(lstat(path.join(repository, "near.txt")), { code: "ENOENT" });
+  assert.equal(await readFile(path.join(repository, deep, "made.txt"), "utf8"), "made after\n");
+});
+
+const fifo = process.platform === "win32" && "Windows makes no FIFO";
+// A FIFO, and a socket where one can be made, in place of a tracked file; resolves to the paths made.
+async function specialFiles(repository) {
+  rmSync(path.join(repository, "a.txt"));
+  execFileSync("mkfifo", [path.join(repository, "a.txt")]);
+  rmSync(path.join(repository, "old.txt"));
+  const server = createServer();
+  const made = await new Promise((resolve) => server.once("error", () => resolve(false)).listen(path.join(repository, "old.txt"), () => resolve(true)));
+  // Closing the server removes its socket file, so it is left listening until the test ends.
+  return { paths: made ? ["a.txt", "old.txt"] : ["a.txt"], close: () => new Promise((resolve) => made ? server.close(resolve) : resolve()) };
+}
+
+test("a FIFO or socket in place of a tracked file is refused, never read, and nothing is stored", { skip: fifo }, async (t) => {
+  const { repository } = await fixture(t);
+  const { checkpoints } = service();
+  const special = await specialFiles(repository);
+  t.after(special.close);
+  assert.match(await status(repository), / M a\.txt/);
+  const refused = (relative) => (error) => error.statusCode === 409 && error.details.code === "CHECKPOINT_UNSUPPORTED_FILE" && error.details.path === relative;
+  await assert.rejects(checkpoints.capture(target(repository)), refused("a.txt"));
+  assert.ok((await lstat(path.join(repository, "a.txt"))).isFIFO());
+  if (special.paths.includes("old.txt")) {
+    rmSync(path.join(repository, "a.txt"));
+    await git(repository, ["checkout", "--", "a.txt"]);
+    await assert.rejects(checkpoints.capture(target(repository)), refused("old.txt"));
+    assert.ok((await lstat(path.join(repository, "old.txt"))).isSocket());
+  } else t.diagnostic("no socket could be made here");
+  assert.equal(await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]), "");
+});
+
+test("a restore whose checkpoint of the worktree meets a FIFO or socket refuses with files and refs unchanged", { skip: fifo }, async (t) => {
+  const { repository } = await fixture(t);
+  const { checkpoints } = service();
+  const checkpoint = await checkpoints.capture(target(repository));
+  await writeFile(path.join(repository, "new.txt"), "made after\n");
+  const preview = await checkpoints.preview(target(repository), checkpoint.id);
+  const special = await specialFiles(repository);
+  t.after(special.close);
+  const refs = await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]);
+  await assert.rejects(checkpoints.restore(target(repository), { id: checkpoint.id, planDigest: preview.planDigest, paths: ["new.txt"] }),
+    (error) => error.statusCode === 409 && error.details.code === "CHECKPOINT_UNSUPPORTED_FILE" && special.paths.includes(error.details.path));
+  assert.equal(await git(repository, ["for-each-ref", CHECKPOINT_REF_PREFIX]), refs);
+  assert.equal(await readFile(path.join(repository, "new.txt"), "utf8"), "made after\n");
+  assert.ok((await lstat(path.join(repository, "a.txt"))).isFIFO());
+  await assert.rejects(readFile(path.join(repository, ".git", RESTORE_MARKER)), { code: "ENOENT" });
+  assert.equal(checkpoints.holding(repository), null);
 });
 
 test("a restore leaves the process's directory as it was, and refuses or stops if that directory is removed", { skip: process.platform === "win32" && "Windows keeps a process's directory from being removed" }, async (t) => {
