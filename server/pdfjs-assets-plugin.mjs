@@ -11,6 +11,15 @@ export const PDFJS_ASSET_FOLDERS = Object.freeze(["cmaps", "standard_fonts", "wa
 const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const TYPES = { ".bcmap": "application/octet-stream", ".pfb": "application/octet-stream", ".ttf": "font/ttf", ".wasm": "application/wasm", ".js": "text/javascript", ".icc": "application/vnd.iccprofile" };
 
+// The headers a /pdfjs/<folder>/<name> asset is served with, the same in
+// development and from the build: its own type and no sniffing. Null for any
+// other address.
+export function pdfjsAssetHeaders(pathname) {
+  const [top, folder, name, ...rest] = pathname.split("/").filter(Boolean);
+  if (top !== "pdfjs" || rest.length || !PDFJS_ASSET_FOLDERS.includes(folder) || !SAFE_NAME.test(name ?? "")) return null;
+  return { "Content-Type": TYPES[path.extname(name)] ?? "application/octet-stream", "X-Content-Type-Options": "nosniff" };
+}
+
 export function pdfjsAssetsPlugin() {
   const base = path.dirname(createRequire(import.meta.url).resolve("pdfjs-dist/package.json"));
   const assets = () => PDFJS_ASSET_FOLDERS.flatMap((folder) => readdirSync(path.join(base, folder))
@@ -20,12 +29,12 @@ export function pdfjsAssetsPlugin() {
     name: "outright-pdfjs-assets",
     configureServer(server) {
       server.middlewares.use("/pdfjs", (request, response, next) => {
-        const [folder, name, ...rest] = new URL(request.url, "http://local").pathname.split("/").filter(Boolean);
-        if (rest.length || !PDFJS_ASSET_FOLDERS.includes(folder) || !SAFE_NAME.test(name ?? "")) { next(); return; }
+        const pathname = `/pdfjs${new URL(request.url, "http://local").pathname}`;
+        const headers = pdfjsAssetHeaders(pathname);
+        if (!headers) { next(); return; }
         let body;
-        try { body = readFileSync(path.join(base, folder, name)); } catch { next(); return; }
-        response.setHeader("Content-Type", TYPES[path.extname(name)] ?? "application/octet-stream");
-        response.setHeader("X-Content-Type-Options", "nosniff");
+        try { body = readFileSync(path.join(base, ...pathname.split("/").slice(2))); } catch { next(); return; }
+        for (const [header, value] of Object.entries(headers)) response.setHeader(header, value);
         response.end(body);
       });
     },

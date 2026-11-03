@@ -220,12 +220,25 @@ export function parseInline(text, counter = { left: Infinity }) {
     last.at = at;
     return at;
   };
+  // A code span closes on a backtick run of exactly the opener's length,
+  // never on part of a longer run; cached like closerAt.
+  const codeClosers = new Map();
+  const codeCloserAt = (run, from) => {
+    let last = codeClosers.get(run);
+    if (last && from >= last.from && (last.at < 0 || from <= last.at)) return last.at;
+    let at = find(run, from);
+    while (at >= 0 && (text[at - 1] === "`" || text[at + run.length] === "`")) at = find(run, at + 1);
+    if (!last) codeClosers.set(run, last = { from, at });
+    last.from = from;
+    last.at = at;
+    return at;
+  };
   const destinations = new Map();
   const destinationAt = (labelEnd) => {
     if (!destinations.has(labelEnd)) destinations.set(labelEnd, scanDestination(text, labelEnd + 1, stats));
     return destinations.get(labelEnd);
   };
-  return inline(text, 0, text.length, { find, closerAt, destinationAt, counter, stats }, 0);
+  return inline(text, 0, text.length, { find, closerAt, codeCloserAt, destinationAt, counter, stats }, 0);
 }
 
 const DESTINATION_WINDOW = 2049;
@@ -273,7 +286,7 @@ function canClose(text, delimiter, at) {
 }
 
 function inline(text, start, end, context, depth) {
-  const { find, closerAt, destinationAt, counter, stats } = context;
+  const { find, closerAt, codeCloserAt, destinationAt, counter, stats } = context;
   const nodes = [];
   // Pending text: pieces already taken, then the run from `runStart` to
   // `index`, which is copied only when something else interrupts it.
@@ -323,9 +336,11 @@ function inline(text, start, end, context, depth) {
     }
     if (character === "`") {
       let runEnd = index + 1;
-      while (runEnd < end && runEnd - index < 32 && text[runEnd] === "`") runEnd += 1;
+      while (runEnd < end && text[runEnd] === "`") runEnd += 1;
+      // A run longer than 32 backticks opens nothing and stays text.
+      if (runEnd - index > 32) { index = runEnd; continue; }
       const run = text.slice(index, runEnd);
-      const close = find(run, runEnd);
+      const close = codeCloserAt(run, runEnd);
       if (close >= 0 && close < end) { push({ type: "code", value: text.slice(runEnd, close).replace(/\n/g, " ").replace(/^ (.+) $/, "$1") }, close + run.length); continue; }
       index = runEnd;
       continue;

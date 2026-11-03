@@ -113,7 +113,10 @@ export function formatBytes(bytes) {
 export function normalizeTypedPath(value) {
   const typed = String(value ?? "");
   if (!typed.trim()) return "";
-  return typed.replace(/^(?:\.\/|\/)+/, "").replace(/\/+$/, "").replace(/\/{2,}/g, "/");
+  // Runs of "/" are collapsed before one trailing "/" is dropped, so no
+  // pattern backtracks across a long run (linear in the typed length).
+  const collapsed = typed.replace(/^(?:\.\/|\/)+/, "").replace(/\/{2,}/g, "/");
+  return collapsed.endsWith("/") ? collapsed.slice(0, -1) : collapsed;
 }
 
 export function ancestorsOf(file) {
@@ -121,11 +124,13 @@ export function ancestorsOf(file) {
   return parts.slice(0, -1).map((_, index) => parts.slice(0, index + 1).join("/"));
 }
 
-// Text is compared as text, so a write the file's version cannot see (a
+// Text is compared as text (and size), so a write the file's version cannot see (a
 // timestamp of coarse resolution) is still shown. An image or PDF is kept
 // only on the same version, which raw also checks before serving bytes.
 export function samePreview(shown, next) {
   if (shown.previewType !== next.previewType || (shown.link?.target ?? null) !== (next.link?.target ?? null)) return false;
-  if (typeof shown.text === "string" || typeof next.text === "string") return shown.text === next.text;
+  // The size is shown too: a byte order mark added or removed leaves the
+  // decoded text alike but changes it.
+  if (typeof shown.text === "string" || typeof next.text === "string") return shown.text === next.text && shown.size === next.size;
   return shown.version === next.version && shown.size === next.size && shown.limit === next.limit && shown.reason === next.reason;
 }

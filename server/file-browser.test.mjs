@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { closeSync, constants, existsSync, mkdirSync, openSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
+import { open } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
@@ -353,6 +354,91 @@ test("a file whose ancestor is swapped around each check by name is refused, and
   assert.equal((await refusal(plain.preview(root, "docs/inner/guide.md"))).code, "PREVIEW_UNAVAILABLE");
   // With nothing swapped, a proven location previews normally.
   assert.equal((await createFileBrowser().preview(root, "docs/inner/guide.md")).text, "# Inside\n");
+});
+
+// Open descriptors as the operating system lists them for this process.
+function openDescriptors() { return readdirSync(process.platform === "linux" ? "/proc/self/fd" : "/dev/fd").length; }
+
+// Whether this host can read through a handle on the root (Linux /proc,
+// macOS 11+ /.vol): probed, not inferred from the platform name.
+async function rootAnchored(t) {
+  const { root } = fixture(t);
+  return createFileBrowser().list(root).then(() => true, (error) => error.details?.code !== "LISTING_UNAVAILABLE");
+}
+
+test("a root whose parent is renamed and replaced, without links, never serves another directory's names or bytes", posixOnly, async (t) => {
+  if (!(await rootAnchored(t))) { t.skip("this host cannot read through a root handle (OUT-144)"); return; }
+  const base = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-root-swap-")));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const parent = path.join(base, "p");
+  const root = path.join(parent, "wt");
+  const put = (top, relative, content) => { const target = path.join(base, top, "wt", ...relative.split("/")); mkdirSync(path.dirname(target), { recursive: true }); writeFileSync(target, content); };
+  put("p", "a.md", "# Inside\n");
+  put("p", "docs/guide.md", "# Guide\n");
+  put("p", "logo.png", PNG);
+  put("impostor", "a.md", "# PRIVATE\n");
+  put("impostor", "secret.txt", "PRIVATE");
+  put("impostor", "docs/guide.md", "# PRIVATE\n");
+  put("impostor", "docs/secret-name.txt", "PRIVATE");
+  put("impostor", "logo.png", Buffer.concat([PNG, Buffer.from("PRIVATE")]));
+  let moved = false;
+  let swaps = 0;
+  const swap = () => { if (moved) return; renameSync(parent, path.join(base, "p-old")); renameSync(path.join(base, "impostor"), parent); moved = true; swaps += 1; };
+  const restore = () => { if (!moved) return; renameSync(parent, path.join(base, "impostor")); renameSync(path.join(base, "p-old"), parent); moved = false; };
+  const before = openDescriptors();
+  for (const hook of ["beforeRoot", "beforeOpen", "beforeInspect"]) {
+    const files = createFileBrowser({ hooks: { [hook]: swap } });
+    const operations = {
+      "list root": () => files.list(root, { showHidden: true }),
+      "list docs": () => files.list(root, { directory: "docs" }),
+      preview: () => files.preview(root, "a.md"),
+      raw: async () => { const { request, response, body } = capture(); await files.raw(root, "logo.png", null, request, response); return body().toString("latin1"); },
+    };
+    for (const [name, operation] of Object.entries(operations)) {
+      const counted = swaps;
+      const outcome = await operation().then((value) => ({ served: JSON.stringify(value) }), (error) => ({ status: error.statusCode, code: error.details?.code }));
+      const swapped = swaps > counted;
+      restore();
+      if (swapped) assert.deepEqual(outcome, { status: 409, code: "PATH_CHANGED" }, `${hook} ${name}: ${JSON.stringify(outcome)}`);
+      assert.doesNotMatch(JSON.stringify(outcome), /PRIVATE|secret/, `${hook} ${name}`);
+    }
+  }
+  // beforeInspect runs only for files: preview and raw swapped there.
+  assert.equal(swaps, 4 + 4 + 2);
+  assert.equal(openDescriptors(), before, "a refused request left a descriptor open");
+  // A folder inside the root renamed away and replaced by another folder is
+  // either refused or read from the root as it now is, never from elsewhere.
+  mkdirSync(path.join(base, "elsewhere"));
+  writeFileSync(path.join(base, "elsewhere", "moved-in.md"), "# Moved in\n");
+  const docs = path.join(root, "docs");
+  const replaceDocs = () => { renameSync(docs, path.join(base, "docs-away")); renameSync(path.join(base, "elsewhere"), docs); };
+  const listing = await createFileBrowser({ hooks: { beforeOpen: replaceDocs } }).list(root, { directory: "docs" }).then((value) => value.entries.map((entry) => entry.name), (error) => error.details?.code);
+  assert.ok(listing === "PATH_CHANGED" || JSON.stringify(listing) === JSON.stringify(["moved-in.md"]), `intermediate swap: ${JSON.stringify(listing)}`);
+  // Unswapped, the same requests serve the worktree as before.
+  const plain = createFileBrowser();
+  assert.deepEqual((await plain.list(root)).entries.map((entry) => entry.name), ["docs", "a.md", "logo.png"]);
+  assert.equal((await plain.preview(root, "a.md")).text, "# Inside\n");
+  assert.equal(openDescriptors(), before);
+});
+
+test("an opened file whose status cannot be read is closed before the error is reported", previewable, async (t) => {
+  const { root, write } = fixture(t);
+  write("a.md", "# A\n");
+  const probe = await open(path.join(root, "a.md"), "r");
+  const FileHandle = probe.constructor;
+  await probe.close();
+  const { stat: original } = FileHandle.prototype;
+  let failing = false;
+  // The status read right after the file is opened fails once.
+  t.after(() => { FileHandle.prototype.stat = original; });
+  FileHandle.prototype.stat = function stat(...args) {
+    if (failing && args[0]?.bigint) { failing = false; return Promise.reject(Object.assign(new Error("injected"), { code: "EIO" })); }
+    return original.apply(this, args);
+  };
+  const before = openDescriptors();
+  const files = createFileBrowser({ hooks: { afterOpen: () => { failing = true; } } });
+  assert.deepEqual(await refusal(files.preview(root, "a.md")).then((error) => [error.status, error.code]), [500, "READ_FAILED"]);
+  assert.equal(openDescriptors(), before, "the opened file was left open");
 });
 
 test("a name with a drive-like prefix is browsable outside Windows, where only real outside paths are refused", { skip: process.platform === "win32" && "a drive prefix is a real location on Windows" }, async (t) => {

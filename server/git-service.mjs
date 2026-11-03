@@ -186,7 +186,7 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
 
   async function openInEditor(worktreePath, filePath, editor) {
     const cwd = await requireWorktree(worktreePath);
-    const target = filePath ? await requireChildPath(cwd, filePath) : cwd;
+    const target = filePath ? await requireCanonicalChild(cwd, filePath) : cwd;
     const configured = editor || database.getSettings().editor;
     const commands = {
       zed: ["zed", [target]],
@@ -296,6 +296,27 @@ function parsePorcelain(output) {
 }
 async function validateFiles(cwd, files) { if (!Array.isArray(files) || !files.length) throw httpError(400, "At least one file is required"); for (const file of files) await requireChildPath(cwd, file); return files; }
 async function requireChildPath(root, child) { const resolved = path.resolve(root, child); if (!isWithin(root, resolved)) throw httpError(403, "File path escapes the worktree"); return resolved; }
+// The editor opens what a path leads to, so a link inside the worktree (the
+// file or any folder above it) that leads out is refused like a path that
+// does. A name that does not exist yet is checked through its nearest
+// existing folder. The canonical path is what the editor is given.
+async function requireCanonicalChild(root, child) {
+  let existing = await requireChildPath(root, child);
+  const rest = [];
+  for (;;) {
+    let real;
+    try { real = await realpath(existing); }
+    catch (error) {
+      if (!["ENOENT", "ENOTDIR"].includes(error?.code) || existing === root) throw httpError(403, "File path cannot be checked inside the worktree");
+      rest.unshift(path.basename(existing));
+      existing = path.dirname(existing);
+      continue;
+    }
+    const target = path.join(real, ...rest);
+    if (!isWithin(root, target)) throw httpError(403, "File path leads outside the worktree");
+    return target;
+  }
+}
 // Containment by path segment: "..large.log" or "..cache/x" is a child, while
 // ".." and "../x" (or another drive on Windows) are not.
 function isWithin(root, target) {

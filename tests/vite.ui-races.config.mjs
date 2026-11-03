@@ -2,7 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
-import { defineConfig } from "vite";
+import { defineConfig, normalizePath } from "vite";
 import { pdfjsAssetsPlugin } from "../server/pdfjs-assets-plugin.mjs";
 import { manualChunks } from "../server/vite-chunks.mjs";
 
@@ -79,10 +79,13 @@ const fixtureRawFiles = {
 // with the viewer is therefore kept in a chunk of its own, as the app's
 // entry chunk is in the app's build; the viewer's chunk stays as the app
 // has it.
+// Rollup's module IDs use "/" on every platform, so the source folder is
+// compared in that form (path.join would give "\\" on Windows).
 const VIEWER_ONLY = ["/src/components/PdfPreview.jsx", "/src/lib/pdf-canvas.js", "/src/lib/pdf-worker.js"];
+const SOURCE = `${normalizePath(path.join(root, "src"))}/`;
 function fixtureChunks(id) {
   const chunk = manualChunks(id);
-  if (chunk || id.includes("node_modules") || !id.startsWith(path.join(root, "src"))) return chunk;
+  if (chunk || id.includes("node_modules") || !normalizePath(id).startsWith(SOURCE)) return chunk;
   return VIEWER_ONLY.some((file) => id.endsWith(file)) ? undefined : "app";
 }
 

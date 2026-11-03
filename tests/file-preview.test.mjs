@@ -112,6 +112,19 @@ test("a wide table repeated over many rows is reported over budget instead of re
   assert.equal(parseMarkdownPreview("- a\n".repeat(MARKDOWN_NODE_BUDGET)).overBudget, true);
 });
 
+test("a code span closes only on a backtick run of the opener's exact length", () => {
+  const code = (text) => parseInline(text).map((node) => node.type === "code" ? `<${node.value}>` : node.value).join("");
+  assert.deepEqual(["`a `` b`", "``a ` b``", "`` `x` ``", "```a``b```", "`a``", "``a`"].map(code),
+    ["<a `` b>", "<a ` b>", "<`x`>", "<a``b>", "`a``", "``a`"]);
+  // A run longer than 32 backticks stays text, and scanning stays linear.
+  const long = "`".repeat(40);
+  assert.equal(code(`x ${long} y ${long}`), `x ${long} y ${long}`);
+  const started = performance.now();
+  parseInline(`${"`".repeat(31)} a `.repeat(3000));
+  parseInline(`${"`a".repeat(50_000)}\`\``);
+  assert.ok(performance.now() - started < 500, `took ${Math.round(performance.now() - started)} ms`);
+});
+
 test("headings, list items and links parse as before after the linear rewrite", () => {
   const blocks = parseMarkdown(["# foo #", "## bar#", "### ###", "#", "#nope", "-   spaced item", "1)  numbered", "[a [b] c](x) [ok](y \"T\")"].join("\n\n"));
   assert.deepEqual(blocks.slice(0, 4).map((block) => [block.type, block.level, block.children.map((node) => node.value).join("")]),
@@ -170,6 +183,11 @@ test("tree rows follow open folders lazily and keyboard moves stay within them",
   // it never opens a different sibling ("a\\b.md" is not "a/b.md").
   assert.deepEqual([" notes.md", "report.md ", "a\\b.md", "docs/ x .md"].map(normalizeTypedPath), [" notes.md", "report.md ", "a\\b.md", "docs/ x .md"]);
   assert.deepEqual(["", "   ", null].map(normalizeTypedPath), ["", "", ""]);
+  // Long runs of "/" are linear: 40,000 inside a path normalize at once.
+  const slashes = "/".repeat(40_000);
+  const started = performance.now();
+  assert.deepEqual([normalizeTypedPath(`a${slashes}b`), normalizeTypedPath(`a${slashes}b${slashes}`)], ["a/b", "a/b"]);
+  assert.ok(performance.now() - started < 200, `normalizing took ${Math.round(performance.now() - started)} ms`);
   // A Markdown link resolves to the exact name it encodes.
   assert.deepEqual(["a%5Cb.md", "%20notes.md", "report.md%20"].map((url) => linkTarget(url, "README.md")),
     [{ kind: "file", path: "a\\b.md" }, { kind: "file", path: " notes.md" }, { kind: "file", path: "report.md " }]);
@@ -243,6 +261,9 @@ test("a refresh keeps text only when the text is the same, and an image or PDF o
   // The same version with other text is a change the version could not see.
   assert.equal(samePreview(markdown, { ...markdown, text: "# New\n" }), false);
   assert.equal(samePreview(markdown, { ...markdown, version: "v2" }), true);
+  // A byte order mark added or removed decodes to the same text at a new size.
+  assert.equal(samePreview(markdown, { ...markdown, size: markdown.size + 3, version: "v2" }), false);
+  assert.equal(samePreview({ ...markdown, size: markdown.size + 3 }, markdown), false);
   assert.equal(samePreview(markdown, { ...markdown, link: { target: "docs/notes.md" } }), false);
   assert.equal(samePreview(markdown, { ...markdown, previewType: "text" }), false);
   const pdf = { previewType: "pdf", mimeType: "application/pdf", size: 900, version: "v1", link: null };
