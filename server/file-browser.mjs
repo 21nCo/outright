@@ -173,6 +173,8 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
   // arrival order, leave the queue if their client goes away, and are
   // refused only when the queue is full.
   function acquireRawSlot(response) {
+    // A client that left during the checks above takes neither a slot nor a place.
+    if (response.destroyed || response.closed) return Promise.reject(fileError(499, "The preview request was closed", "CLIENT_CLOSED"));
     if (rawStreams < limits.maxRawStreams) { rawStreams += 1; return Promise.resolve(); }
     if (waiting.length >= limits.maxRawQueue) return Promise.reject(fileError(429, "Too many previews are loading; retry shortly", "PREVIEW_BUSY"));
     return new Promise((resolve, reject) => {
@@ -244,7 +246,13 @@ async function openFile(root, relative, hooks, handlePaths) {
   const logical = path.join(root, ...relative.split("/"));
   let linkInfo;
   try { linkInfo = await lstat(logical); } catch (error) { throw fileSystemError(error, relative, "File"); }
-  const { real } = await resolveInside(root, relative);
+  let real;
+  try { ({ real } = await resolveInside(root, relative)); }
+  catch (error) {
+    // The name exists, so a missing target means the link itself is broken.
+    if (error.details?.code === "MISSING" && linkInfo.isSymbolicLink()) throw fileError(404, `${relative} is a link to a file that does not exist`, "BROKEN_LINK");
+    throw error;
+  }
   let info;
   await hooks.beforeInspect?.(real);
   try { info = await lstat(real); } catch (error) { throw fileSystemError(error, relative, "File"); }
@@ -333,6 +341,7 @@ async function linkTarget(root, logical) {
 // Accepts a relative path with "/" separators ("\\" too on Windows). An
 // absolute path, a parent segment, or Git's own metadata is refused before
 // the file system is touched.
+// A refused path is PATH_OUTSIDE; OUTSIDE_WORKTREE means a link leads out.
 function relativePath(value, limits, allowRoot) {
   if (value === undefined || value === null || value === "") {
     if (allowRoot) return "";
@@ -342,10 +351,10 @@ function relativePath(value, limits, allowRoot) {
     throw fileError(400, "The file path is invalid", "PATH_INVALID");
   }
   if (path.isAbsolute(value) || path.posix.isAbsolute(value) || /^[A-Za-z]:/.test(value)) {
-    throw fileError(403, "Paths must be relative to the worktree", "OUTSIDE_WORKTREE");
+    throw fileError(403, "Paths must be relative to the worktree", "PATH_OUTSIDE");
   }
   const segments = value.split(process.platform === "win32" ? /[\\/]/ : "/").filter((segment) => segment && segment !== ".");
-  if (segments.includes("..")) throw fileError(403, "Paths must stay inside the worktree", "OUTSIDE_WORKTREE");
+  if (segments.includes("..")) throw fileError(403, "Paths must stay inside the worktree", "PATH_OUTSIDE");
   if (excludedSegments(segments)) throw fileError(403, "Git metadata is not browsable", "EXCLUDED");
   if (!segments.length && !allowRoot) throw fileError(400, "A file path is required", "PATH_INVALID");
   return segments.join("/");

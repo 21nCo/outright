@@ -63,7 +63,7 @@ test("a folder lists only its own entries, folders first, hiding dotfiles and ne
     assert.equal((await refusal(files.preview(root, target))).code, "EXCLUDED", target);
   }
   // Any parent segment is refused, even one that would land back inside.
-  assert.equal((await refusal(files.preview(root, "src/../README.md"))).code, "OUTSIDE_WORKTREE");
+  assert.equal((await refusal(files.preview(root, "src/../README.md"))).code, "PATH_OUTSIDE");
   assert.equal((await refusal(files.list(root, { directory: ".git" }))).code, "EXCLUDED");
 });
 
@@ -115,8 +115,10 @@ test("paths that leave the worktree are refused, and links are listed with where
   assert.deepEqual([followed.previewType, followed.text, followed.link], ["markdown", "# Guide\n", { target: "docs/guide.md" }]);
   assert.deepEqual((await files.list(root, { directory: "docs-link" })).entries.map((entry) => entry.path), ["docs-link/guide.md"]);
   for (const [request, code] of [[() => files.preview(root, "escape.txt"), "OUTSIDE_WORKTREE"], [() => files.list(root, { directory: "escape-dir" }), "OUTSIDE_WORKTREE"],
-    [() => files.preview(root, "../outside.txt"), "OUTSIDE_WORKTREE"], [() => files.preview(root, path.join(base, "outside.txt")), "OUTSIDE_WORKTREE"],
-    [() => files.preview(root, "broken.txt"), "MISSING"], [() => files.preview(root, "loop-a"), "LINK_LOOP"], [() => files.preview(root, "docs\0x"), "PATH_INVALID"],
+    // A typed path that leaves the root is not a link that leads out, and a
+    // broken link is not a file that was deleted.
+    [() => files.preview(root, "../outside.txt"), "PATH_OUTSIDE"], [() => files.preview(root, path.join(base, "outside.txt")), "PATH_OUTSIDE"],
+    [() => files.preview(root, "broken.txt"), "BROKEN_LINK"], [() => files.preview(root, "loop-a"), "LINK_LOOP"], [() => files.preview(root, "docs\0x"), "PATH_INVALID"],
     [() => files.preview(root, ""), "PATH_INVALID"], [() => files.preview(root, "docs"), "IS_DIRECTORY"], [() => files.list(root, { directory: "docs/guide.md" }), "NOT_DIRECTORY"],
     [() => files.preview(root, "docs/missing.md"), "MISSING"], [() => files.list(root, { directory: "gone" }), "MISSING"]]) {
     assert.equal((await refusal(request())).code, code, request.toString());
@@ -389,5 +391,34 @@ test("raw requests beyond the stream limit wait their turn, and only a full queu
   const results = await settled;
   assert.deepEqual(results.map((result) => result.status), ["fulfilled", "fulfilled", "fulfilled", "fulfilled", "rejected"]);
   assert.deepEqual(requests.slice(0, 4).map(({ body }) => body().equals(PNG)), [true, true, true, true]);
+  assert.deepEqual(files.rawStats(), { active: 0, waiting: 0 });
+});
+
+test("a raw request whose client left before its turn takes no slot and no place in the queue", previewable, async (t) => {
+  const { root, write } = fixture(t);
+  write("logo.png", PNG);
+  const files = createFileBrowser({ limits: { ...FILE_BROWSER_LIMITS, maxRawStreams: 1, maxRawQueue: 1 } });
+  let release;
+  const holder = capture(undefined, new Promise((resolve) => { release = resolve; }));
+  const held = files.raw(root, "logo.png", null, holder.request, holder.response);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(files.rawStats(), { active: 1, waiting: 0 });
+  // Gone while it was being authorized: refused before it can queue.
+  const gone = capture();
+  gone.response.destroy();
+  assert.equal((await refusal(files.raw(root, "logo.png", null, gone.request, gone.response))).code, "CLIENT_CLOSED");
+  assert.deepEqual(files.rawStats(), { active: 1, waiting: 0 });
+  // So a live request still gets the one queue place.
+  const live = capture();
+  const queued = files.raw(root, "logo.png", null, live.request, live.response);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(files.rawStats(), { active: 1, waiting: 1 });
+  release();
+  await Promise.all([held, queued]);
+  assert.equal(live.body().equals(PNG), true);
+  // A free slot is not taken by a closed response either.
+  const late = capture();
+  late.response.destroy();
+  assert.equal((await refusal(files.raw(root, "logo.png", null, late.request, late.response))).code, "CLIENT_CLOSED");
   assert.deepEqual(files.rawStats(), { active: 0, waiting: 0 });
 });

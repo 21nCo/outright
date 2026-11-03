@@ -52,7 +52,9 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
   if (state.status === "error") {
     const [Icon, text, action] = {
       MISSING: [FileX, `${file} no longer exists. It may have been moved or deleted.`, <Button key="refresh" variant="outline" size="xs" onClick={() => onRefreshFolder?.(file)}><ArrowsClockwise />Refresh folder</Button>],
+      BROKEN_LINK: [LinkBreak, `${file} is a broken link: the file it points to does not exist.`, <Button key="refresh" variant="outline" size="xs" onClick={() => onRefreshFolder?.(file)}><ArrowsClockwise />Refresh folder</Button>],
       OUTSIDE_WORKTREE: [LinkBreak, `${file} links outside this worktree, so it is not previewed.`, null],
+      PATH_OUTSIDE: [Prohibit, `${file} is not a path inside this worktree. Use a path relative to the worktree root, without "..".`, null],
       LINK_LOOP: [LinkBreak, `${file} is a link that points back to itself.`, null],
       EXCLUDED: [Prohibit, "Git metadata is not shown in Files.", null],
       UNREADABLE: [Prohibit, `${file} cannot be read with your permissions.`, null],

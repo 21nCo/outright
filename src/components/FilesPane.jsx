@@ -224,9 +224,9 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, conversat
     moveFocus(rows[target].id);
   };
 
-  const openPath = useCallback((value) => {
-    const file = normalizeTypedPath(value);
-    if (!file) return;
+  // Opens an exact worktree path, such as a resolved Markdown link target.
+  const openPath = useCallback((file) => {
+    if (typeof file !== "string" || !file) return;
     const ancestors = ancestorsOf(file);
     setExpanded((current) => new Set([...current, ...ancestors]));
     for (const directory of ancestors) if (!foldersRef.current.has(directory)) void loadFolder(directory);
@@ -276,7 +276,7 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, conversat
         <Button variant="ghost" size="icon-sm" aria-label="Refresh files" onClick={refresh}><ArrowsClockwise className={root?.status === "loading" ? "spin" : ""} /></Button>
       </div>
     </header>
-    <form className="files-jump" role="search" aria-label="Go to file" onSubmit={(event) => { event.preventDefault(); openPath(jump); }}>
+    <form className="files-jump" role="search" aria-label="Go to file" onSubmit={(event) => { event.preventDefault(); openPath(normalizeTypedPath(jump)); }}>
       <Input ref={jumpRef} aria-label="Go to file path" placeholder="Go to file… (⌘P)" value={jump} onChange={(event) => setJump(event.target.value)} spellCheck={false} autoComplete="off" />
     </form>
     <span className="sr-only" role="status" aria-live="polite">{announcement}</span>

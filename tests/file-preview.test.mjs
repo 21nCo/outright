@@ -154,7 +154,14 @@ test("tree rows follow open folders lazily and keyboard moves stay within them",
   assert.equal(treeKeyTarget(rows, 0, "End"), 5);
   assert.equal(treeKeyTarget(rows, 0, "a"), 5);
   assert.equal(treeKeyTarget(rows, 5, "ArrowDown"), 5);
-  assert.deepEqual([normalizeTypedPath(" ./src//b.js/ "), normalizeTypedPath("/README.md"), ancestorsOf("a/b/c.md")], ["src/b.js", "README.md", ["a", "a/b"]]);
+  assert.deepEqual([normalizeTypedPath("./src//b.js/"), normalizeTypedPath("/README.md"), ancestorsOf("a/b/c.md")], ["src/b.js", "README.md", ["a", "a/b"]]);
+  // Spaces and backslashes belong to POSIX names: a typed path keeps them, so
+  // it never opens a different sibling ("a\\b.md" is not "a/b.md").
+  assert.deepEqual([" notes.md", "report.md ", "a\\b.md", "docs/ x .md"].map(normalizeTypedPath), [" notes.md", "report.md ", "a\\b.md", "docs/ x .md"]);
+  assert.deepEqual(["", "   ", null].map(normalizeTypedPath), ["", "", ""]);
+  // A Markdown link resolves to the exact name it encodes.
+  assert.deepEqual(["a%5Cb.md", "%20notes.md", "report.md%20"].map((url) => linkTarget(url, "README.md")),
+    [{ kind: "file", path: "a\\b.md" }, { kind: "file", path: " notes.md" }, { kind: "file", path: "report.md " }]);
 });
 
 test("folders named like object properties are ordinary folders", () => {

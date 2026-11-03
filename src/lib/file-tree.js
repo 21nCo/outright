@@ -85,10 +85,14 @@ export function formatBytes(bytes) {
   return `${value >= 10 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
 }
 
-// A typed path, as the runtime names it. Leading "./" and "/" and trailing
-// slashes are dropped; the runtime still refuses anything outside the root.
+// A typed path, as the runtime names it. Only separators are tidied: leading
+// "./" and "/", trailing and repeated slashes. Spaces and backslashes are part
+// of a POSIX name, so they are kept and never select a different file. The
+// runtime still refuses anything outside the root.
 export function normalizeTypedPath(value) {
-  return String(value ?? "").trim().replace(/\\/g, "/").replace(/^(?:\.\/|\/)+/, "").replace(/\/+$/, "").replace(/\/{2,}/g, "/");
+  const typed = String(value ?? "");
+  if (!typed.trim()) return "";
+  return typed.replace(/^(?:\.\/|\/)+/, "").replace(/\/+$/, "").replace(/\/{2,}/g, "/");
 }
 
 export function ancestorsOf(file) {

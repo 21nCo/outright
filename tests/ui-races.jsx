@@ -8987,10 +8987,13 @@ async function filesPaneRegression() {
     "6 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Contents 7 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj",
     "7 0 obj<</Length 41>>stream", "BT /F1 18 Tf 20 40 Td (Second PDF) Tj ET", "endstream endobj",
     "trailer<</Root 1 0 R>>", "%%EOF"].join("\n"));
-  const markdown = "# Fixture notes\n\n<script>window.outrightFilesInjected = 1</script>\n<img src=x onerror=\"window.outrightFilesInjected = 2\">\n\n[unsafe](javascript:window.outrightFilesInjected=3) [site](https://example.com) [guide](docs/guide.md)\n\n![logo](logo.png) ![tracker](https://tracker.example/p.png) ![gone image](gone.png)\n";
+  const markdown = "# Fixture notes\n\n<script>window.outrightFilesInjected = 1</script>\n<img src=x onerror=\"window.outrightFilesInjected = 2\">\n\n[unsafe](javascript:window.outrightFilesInjected=3) [site](https://example.com) [guide](docs/guide.md) [backslash](a%5Cb.md)\n\n![logo](logo.png) ![tracker](https://tracker.example/p.png) ![gone image](gone.png)\n";
   const previews = {
     "notes.md": { previewType: "markdown", text: markdown, size: markdown.length },
     "docs/guide.md": { previewType: "markdown", text: "# Guide\n", size: 8 },
+    // "a\\b.md" is one name in the root; "a/b.md" is a different file.
+    "a\\b.md": { previewType: "markdown", text: "# Backslash name\n", size: 17 },
+    "a/b.md": { previewType: "markdown", text: "# Wrong sibling\n", size: 16 },
     "slow.md": { previewType: "markdown", text: "# Slow answer\n", size: 14 },
     "report.pdf": { previewType: "pdf", mimeType: "application/pdf", size: pdf.length },
     "huge.log": { previewType: "oversized", limit: 1024 * 1024, size: 3 * 1024 * 1024 },
@@ -9027,6 +9030,8 @@ async function filesPaneRegression() {
       const file = parameters.file;
       if (previewUnavailable) return response({ error: "File previews are unavailable on this file system", code: "PREVIEW_UNAVAILABLE" }, 501);
       if (file === "escape.txt") return response({ error: "escape.txt links outside this worktree", code: "OUTSIDE_WORKTREE" }, 403);
+      if (file.startsWith("../")) return response({ error: "Paths must stay inside the worktree", code: "PATH_OUTSIDE" }, 403);
+      if (file === "dangling.md") return response({ error: "dangling.md is a link to a file that does not exist", code: "BROKEN_LINK" }, 404);
       if (!previews[file]) return response({ error: `${file} no longer exists`, code: "MISSING" }, 404);
       return response({ path: file, name: file.split("/").at(-1), modifiedAt: "2026-11-03T00:00:00Z", version: "v1", link: null, ...previews[file] });
     }
@@ -9163,6 +9168,13 @@ async function filesPaneRegression() {
     await until(() => preview().querySelector(".markdown-link"), "the rendered view did not return");
     preview().querySelector(".markdown-link").click();
     await until(() => preview()?.querySelector("h1")?.textContent === "Guide" && row("guide.md")?.getAttribute("aria-selected") === "true", "a relative link did not open its file in the tree");
+    // A link opens the exact name it encodes, never a rewritten one.
+    row("notes.md").click();
+    await until(() => preview()?.querySelector(".markdown-preview h1")?.textContent === "Fixture notes", "the Markdown preview did not return");
+    [...preview().querySelectorAll(".markdown-link")].find((button) => button.textContent === "backslash").click();
+    await until(() => preview()?.querySelector("h1")?.textContent === "Backslash name", `a link to a\\b.md did not open that file: ${preview()?.querySelector("h1")?.textContent}`);
+    const linkedFiles = requests.filter((request) => request.route === "/api/files/preview").map((request) => request.file);
+    assert(linkedFiles.includes("a\\b.md") && !linkedFiles.includes("a/b.md"), `a Markdown link was rewritten to another file: ${JSON.stringify(linkedFiles)}`);
 
     // A PDF closed while its viewer loads starts no worker that outlives it.
     row("report.pdf").click();
@@ -9199,6 +9211,15 @@ async function filesPaneRegression() {
     const listedDocs = listed("docs").length;
     [...preview().querySelectorAll("button")].find((button) => button.textContent === "Refresh folder").click();
     await until(() => listed("docs").length === listedDocs + 1, "Refresh folder did not reread the missing file's folder");
+    // A typed path out of the root and a broken link each name their own cause.
+    setControlValue(jump, "../secret.md");
+    jump.form.requestSubmit();
+    await until(() => /\.\.\/secret\.md is not a path inside this worktree/.test(preview()?.querySelector('[role="alert"]')?.textContent ?? ""), "a typed path outside the worktree was not explained as such");
+    assert(!/links outside/.test(preview().textContent), "a typed path outside the worktree was described as a link");
+    setControlValue(jump, "dangling.md");
+    jump.form.requestSubmit();
+    await until(() => /dangling\.md is a broken link/.test(preview()?.querySelector('[role="alert"]')?.textContent ?? ""), "a broken link was not explained as one");
+    assert(!/no longer exists/.test(preview().textContent), "a broken link was described as a deleted file");
 
     // Hidden files are a control, and turning them on rereads open folders.
     const toggle = host.querySelector('.files-pane button[aria-label="Show hidden files"]');

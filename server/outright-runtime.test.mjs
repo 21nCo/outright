@@ -3828,7 +3828,7 @@ test("file routes browse only a discovered project worktree and serve previews f
   const otherProject = await callRuntime(runtime, "GET", at("/api/files", { projectId: "another-project", path: worktree.path }));
   assert.equal(otherProject.statusCode, 400, otherProject.raw);
   const escaping = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: worktree.path, dir: ".." }));
-  assert.deepEqual([escaping.statusCode, escaping.body.code], [403, "OUTSIDE_WORKTREE"]);
+  assert.deepEqual([escaping.statusCode, escaping.body.code], [403, "PATH_OUTSIDE"]);
 }));
 
 let checkpointAgentOptions;
