@@ -5,6 +5,7 @@ import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { App } from "../src/App.jsx";
 import { ChangesPane } from "../src/components/ChangesPane.jsx";
+import { FilesPane } from "../src/components/FilesPane.jsx";
 import { WindowedMessages } from "../src/components/WindowedMessages.jsx";
 import { WindowedDiff, diffFindTop, diffRowsHeight } from "../src/components/WindowedDiff.jsx";
 import { CommandPalette } from "../src/components/CommandPalette.jsx";
@@ -40,8 +41,8 @@ const response = (body, status = 200) => new Response(JSON.stringify(body), { st
 const frame = () => new Promise((resolve) => scheduleLayoutTick(resolve));
 async function settle() { await frame(); await frame(); }
 function terminalReady(name) { return host.querySelector('.terminal-tabs[aria-busy="false"] [role="tab"][aria-selected="true"]')?.textContent === name; }
-async function until(check, label) {
-  const deadline = performance.now() + 5000;
+async function until(check, label, timeoutMs = 5000) {
+  const deadline = performance.now() + timeoutMs;
   while (!check()) {
     // A hidden page paints no frames, so frame-driven focus cannot settle.
     if (performance.now() > deadline) throw new Error(`Timed out: ${label}; page ${document.visibilityState}`);
@@ -8128,6 +8129,7 @@ async function paneMinimumContentRegression() {
     if (url.pathname === "/api/git/status") return response({ branch: "main", files, stagedCount: 0 });
     if (url.pathname === "/api/git/diff") return response({ diff });
     if (url.pathname === "/api/context") return response({ instructionFiles: [], skills: [], pullRequest: null });
+    if (url.pathname === "/api/files") return response({ directory: "", entries: Array.from({ length: 12 }, (_, index) => ({ name: `entry-${index}.md`, path: `entry-${index}.md`, kind: "file", hidden: false })), nextCursor: null, total: 12, hiddenCount: 0, truncated: false });
     return response({});
   };
   const saved = (focused, layout) => localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, worktrees: { "/fixture/A": { savedAt: 1, layout: { version: 1, focused, root: layout } } } }));
@@ -8163,6 +8165,14 @@ async function paneMinimumContentRegression() {
     context: () => {
       const content = host.querySelector("#pane-context .context-pane-content");
       assert(content.clientHeight >= 100 && content.clientWidth >= 200, `The context content is ${content.clientWidth}x${content.clientHeight}`);
+    },
+    files: () => {
+      const tree = host.querySelector('#pane-files [role="tree"]');
+      assert(tree.clientHeight >= 90 && tree.clientWidth >= 200, `The file tree is ${tree.clientWidth}x${tree.clientHeight}`);
+      assert(host.querySelector("#pane-files .file-preview").clientHeight >= 90, "The file preview has no room at the Files minimum");
+      inside(tree, "files", "The file tree");
+      inside(host.querySelector('#pane-files input[aria-label="Go to file path"]'), "files", "Go to file");
+      inside(host.querySelector('#pane-files button[aria-label="Show hidden files"]'), "files", "The hidden-files control");
     },
   };
   const near = (value, expected, label) => assert(Math.abs(value - expected) <= 1, `${label}: ${value} instead of ${expected}`);
@@ -8203,6 +8213,18 @@ async function paneMinimumContentRegression() {
     usable.conversation();
     usable.context();
     usable.changes();
+
+    // Restored at the narrowest and shortest Files.
+    root.render(null);
+    await settle();
+    saved("conversation", { type: "split", axis: "row", ratio: 0.95, first: leaf("conversation"),
+      second: { type: "split", axis: "column", ratio: 0.95, first: leaf("terminal"), second: leaf("files") } });
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector('#pane-files [role="treeitem"]') && host.querySelector("#pane-conversation .message-text"), "restored minimum Files layout");
+    await settle();
+    near(paneRect("files").width, 280, "The restored Files width");
+    near(paneRect("files").height, 340, "The restored Files height");
+    usable.files();
   } finally {
     root.render(null);
     await settle();
@@ -8936,6 +8958,183 @@ function visibleFocus(element) {
   const rect = element.getBoundingClientRect();
   return rect.width > 0 && rect.height > 0 && getComputedStyle(element).visibility === "visible"
     && rect.left < window.innerWidth && rect.right > 0;
+}
+
+// Files: lazy folder loading, keyboard tree navigation, paging, hidden-file
+// control, previews that never run their content, and explicit missing,
+// outside, oversized and unsupported states. A slow answer for an earlier
+// file never replaces a later choice.
+async function filesPaneRegression() {
+  root.render(null);
+  await settle();
+  const project = { id: "A", name: "Review A", path: "/fixture/A" };
+  const worktree = { id: "A", name: "A", path: "/fixture/A", branch: "main" };
+  const many = Array.from({ length: 250 }, (_, index) => ({ name: `item-${String(index).padStart(3, "0")}.txt`, path: `many/item-${String(index).padStart(3, "0")}.txt`, kind: "file", hidden: false }));
+  const entry = (name, kind = "file", extra = {}) => ({ name, path: name, kind, hidden: name.startsWith("."), ...extra });
+  const rootEntries = (hidden) => [entry("docs", "directory"), entry("many", "directory"), ...(hidden ? [entry(".env")] : []), entry("app.bin"),
+    entry("escape.txt", "symlink", { target: { state: "outside" } }), entry("huge.log"), entry("notes.md"), entry("report.pdf"), entry("slow.md")];
+  const pdf = new TextEncoder().encode(["%PDF-1.4", "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj", "2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj",
+    "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj",
+    "4 0 obj<</Length 40>>stream", "BT /F1 18 Tf 20 40 Td (Hello PDF) Tj ET", "endstream endobj", "5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj",
+    "trailer<</Root 1 0 R>>", "%%EOF"].join("\n"));
+  const markdown = "# Fixture notes\n\n<script>window.outrightFilesInjected = 1</script>\n<img src=x onerror=\"window.outrightFilesInjected = 2\">\n\n[unsafe](javascript:window.outrightFilesInjected=3) [site](https://example.com) [guide](docs/guide.md)\n\n![logo](logo.png) ![tracker](https://tracker.example/p.png)\n";
+  const previews = {
+    "notes.md": { previewType: "markdown", text: markdown, size: markdown.length },
+    "docs/guide.md": { previewType: "markdown", text: "# Guide\n", size: 8 },
+    "slow.md": { previewType: "markdown", text: "# Slow answer\n", size: 14 },
+    "report.pdf": { previewType: "pdf", mimeType: "application/pdf", size: pdf.length },
+    "huge.log": { previewType: "oversized", limit: 1024 * 1024, size: 3 * 1024 * 1024 },
+    "app.bin": { previewType: "unsupported", reason: "Binary files have no preview", size: 7 },
+  };
+  const requests = [];
+  const gates = new Map();
+  route = async (url) => {
+    const parameters = Object.fromEntries(url.searchParams);
+    requests.push({ ...parameters, route: url.pathname });
+    if (gates.has(`${url.pathname}:${parameters.dir ?? parameters.file}`)) await gates.get(`${url.pathname}:${parameters.dir ?? parameters.file}`).promise;
+    if (url.pathname === "/api/files") {
+      const hidden = parameters.hidden === "true";
+      if (!parameters.dir) return response({ directory: "", entries: rootEntries(hidden), nextCursor: null, total: rootEntries(hidden).length, hiddenCount: 1, truncated: false });
+      if (parameters.dir === "docs") return response({ directory: "docs", entries: [{ name: "guide.md", path: "docs/guide.md", kind: "file", hidden: false }], nextCursor: null, total: 1, hiddenCount: 0, truncated: false });
+      if (parameters.dir === "many") return response(parameters.cursor ? { entries: many.slice(200), nextCursor: null, total: 250, hiddenCount: 0, truncated: false }
+        : { entries: many.slice(0, 200), nextCursor: "page-2", total: 250, hiddenCount: 0, truncated: false });
+    }
+    if (url.pathname === "/api/files/preview") {
+      const file = parameters.file;
+      if (file === "escape.txt") return response({ error: "escape.txt links outside this worktree", code: "OUTSIDE_WORKTREE" }, 403);
+      if (!previews[file]) return response({ error: `${file} no longer exists`, code: "MISSING" }, 404);
+      return response({ path: file, name: file.split("/").at(-1), modifiedAt: "2026-11-03T00:00:00Z", version: "v1", link: null, ...previews[file] });
+    }
+    if (url.pathname === "/api/files/raw" && parameters.file === "report.pdf") return new Response(pdf, { headers: { "Content-Type": "application/pdf", "Content-Length": String(pdf.length) } });
+    return response({ error: "unexpected" }, 404);
+  };
+  delete window.outrightFilesInjected;
+  const errors = [];
+  root.render(<TooltipProvider><FilesPane project={project} worktree={worktree} settings={{ editor: "zed" }} onError={(error) => errors.push(error)} /></TooltipProvider>);
+  const tree = () => host.querySelector('.files-pane [role="tree"]');
+  const row = (label) => [...(tree()?.querySelectorAll('[role="treeitem"]') ?? [])].find((item) => item.querySelector(".tree-label")?.textContent === label);
+  const preview = () => host.querySelector(".files-pane .file-preview");
+  const listed = (dir) => requests.filter((request) => request.route === "/api/files" && (request.dir ?? "") === dir);
+  try {
+    await until(() => row("docs"), "the worktree root was not listed");
+    // Lazy: only the root is read until a folder opens.
+    assert(requests.length === 1 && listed("").length === 1, `the first render read more than the root: ${JSON.stringify(requests)}`);
+    assert(!row(".env"), "a dotfile was shown before hidden files were turned on");
+    assert(tree().querySelectorAll('[role="treeitem"][tabindex="0"]').length === 1, "the tree does not have exactly one tab stop");
+    const docs = row("docs");
+    assert(docs.getAttribute("aria-expanded") === "false" && docs.getAttribute("aria-level") === "1" && docs.getAttribute("aria-setsize") === "8", "a folder row lacks its tree state");
+    docs.focus();
+    const docsGate = deferred();
+    gates.set("/api/files:docs", docsGate);
+    pressKey(docs, "ArrowRight");
+    await until(() => row("Loading…"), "an opening folder did not show that it was loading");
+    assert(row("docs").getAttribute("aria-expanded") === "true", "the opened folder is not marked expanded");
+    docsGate.resolve();
+    gates.delete("/api/files:docs");
+    await until(() => row("guide.md"), "the opened folder's entries were not listed");
+    assert(row("guide.md").getAttribute("aria-level") === "2", "a nested entry is not one level deeper");
+    pressKey(document.activeElement, "ArrowDown");
+    await until(() => document.activeElement === row("guide.md"), "ArrowDown did not move to the first child");
+    pressKey(document.activeElement, "ArrowLeft");
+    await until(() => document.activeElement === row("docs"), "ArrowLeft did not return to the parent folder");
+    pressKey(document.activeElement, "ArrowLeft");
+    await until(() => !row("guide.md") && row("docs").getAttribute("aria-expanded") === "false", "ArrowLeft did not collapse the open folder");
+    pressKey(document.activeElement, "End");
+    await until(() => document.activeElement === row("slow.md"), "End did not reach the last row");
+    pressKey(document.activeElement, "Home");
+    await until(() => document.activeElement === row("docs"), "Home did not reach the first row");
+    pressKey(document.activeElement, "n");
+    await until(() => document.activeElement === row("notes.md"), "type-ahead did not find the next matching row");
+
+    // A large folder pages on request.
+    row("many").focus();
+    pressKey(row("many"), "Enter");
+    await until(() => row("Load 50 more of 50"), "the first page of a large folder did not offer the rest");
+    assert(row("item-000.txt").getAttribute("aria-setsize") === "250", "rows in a paged folder do not announce the folder's full size");
+    row("Load 50 more of 50").focus();
+    pressKey(document.activeElement, "Enter");
+    await until(() => row("item-249.txt") && !tree().querySelector(".tree-more"), "Load more did not append the next page");
+    assert(listed("many").at(-1).cursor === "page-2", "Load more did not send the folder's cursor");
+    pressKey(row("many"), "Enter");
+    await until(() => !row("item-000.txt"), "the large folder did not collapse");
+
+    // A slow preview for an earlier choice never replaces a later one.
+    const slowGate = deferred();
+    gates.set("/api/files/preview:slow.md", slowGate);
+    row("slow.md").click();
+    await until(() => preview()?.getAttribute("aria-busy") === "true", "the slow preview did not show it was loading");
+    row("notes.md").click();
+    await until(() => preview()?.querySelector(".markdown-preview h1")?.textContent === "Fixture notes", "the Markdown preview did not render");
+    slowGate.resolve();
+    gates.delete("/api/files/preview:slow.md");
+    await remainsTrue(() => preview()?.querySelector("h1")?.textContent === "Fixture notes", 150, "a late answer for an earlier file replaced the current preview");
+    assert(row("notes.md").getAttribute("aria-selected") === "true", "the previewed file is not the selected row");
+
+    // The preview never runs what the file contains.
+    const rendered = preview().querySelector(".markdown-preview");
+    assert(!rendered.querySelector("script") && !rendered.querySelector('img[src="x"]'), "raw HTML in Markdown became elements");
+    assert(rendered.textContent.includes("<script>window.outrightFilesInjected = 1</script>"), "raw HTML was not shown as text");
+    assert(!rendered.querySelector('a[href^="javascript"]') && rendered.querySelector(".markdown-inert-link")?.textContent === "unsafe", "a javascript: link stayed clickable");
+    const external = rendered.querySelector('a[href="https://example.com"]');
+    assert(external?.target === "_blank" && /noopener/.test(external.rel) && /noreferrer/.test(external.rel), "an external link does not open isolated");
+    assert(!rendered.querySelector('img[src*="tracker.example"]') && rendered.querySelector(".markdown-image-placeholder"), "a remote image was loaded");
+    const image = rendered.querySelector('img[alt="logo"]');
+    assert(new URL(image.src).searchParams.get("file") === "logo.png", `a relative image did not load through the raw route: ${image?.src}`);
+    await until(() => image.complete && image.naturalWidth === 1, "the relative image did not load");
+    await remainsTrue(() => window.outrightFilesInjected === undefined, 100, "content from the previewed file ran");
+    [...preview().querySelectorAll("button")].find((button) => button.textContent === "Source").click();
+    await until(() => preview().querySelector(".file-text")?.textContent === markdown, "Source did not show the file's text");
+    [...preview().querySelectorAll("button")].find((button) => button.textContent === "Preview").click();
+    await until(() => preview().querySelector(".markdown-link"), "the rendered view did not return");
+    preview().querySelector(".markdown-link").click();
+    await until(() => preview()?.querySelector("h1")?.textContent === "Guide" && row("guide.md")?.getAttribute("aria-selected") === "true", "a relative link did not open its file in the tree");
+
+    // A PDF is drawn by the viewer, with its text beside the page.
+    row("report.pdf").click();
+    await until(() => preview()?.querySelector(".pdf-toolbar [role=status]")?.textContent === "Page 1 of 1", "the PDF did not open", 15_000);
+    await until(() => preview().querySelector(".pdf-text p")?.textContent.includes("Hello PDF"), "the PDF page text was not offered");
+    const canvas = preview().querySelector(".pdf-frame canvas");
+    assert(canvas.width > 0 && canvas.getAttribute("aria-label") === "Page 1 of 1 of report.pdf", "the PDF page was not drawn with a label");
+
+    // Explicit states for what cannot be shown.
+    row("huge.log").click();
+    await until(() => /3\.0 MB, over the 1\.0 MB preview limit/.test(preview()?.textContent ?? ""), "an oversized file did not state its limit");
+    assert([...preview().querySelectorAll("button")].some((button) => button.textContent === "Open in zed"), "an oversized file offered no way to open it");
+    row("app.bin").click();
+    await until(() => /has no preview\. Binary files have no preview/.test(preview()?.textContent ?? ""), "an unsupported file was not explained");
+    row("escape.txt").click();
+    await until(() => /links outside this worktree/.test(preview()?.querySelector('[role="alert"]')?.textContent ?? ""), "a link outside the worktree was not refused visibly");
+    assert(row("escape.txt").querySelector(".tree-note")?.textContent === "links outside the worktree", "the outside link was not marked in the tree");
+    const jump = host.querySelector('.files-pane input[aria-label="Go to file path"]');
+    setControlValue(jump, "./docs/gone.md");
+    jump.form.requestSubmit();
+    await until(() => /docs\/gone\.md no longer exists/.test(preview()?.querySelector('[role="alert"]')?.textContent ?? ""), "a missing file did not say so");
+    await until(() => row("guide.md"), "Go to file did not open the file's folder");
+    const listedDocs = listed("docs").length;
+    [...preview().querySelectorAll("button")].find((button) => button.textContent === "Refresh folder").click();
+    await until(() => listed("docs").length === listedDocs + 1, "Refresh folder did not reread the missing file's folder");
+
+    // Hidden files are a control, and turning them on rereads open folders.
+    const toggle = host.querySelector('.files-pane button[aria-label="Show hidden files"]');
+    assert(toggle.getAttribute("aria-pressed") === "false", "the hidden-files control does not report its state");
+    toggle.click();
+    await until(() => row(".env") && toggle.getAttribute("aria-pressed") === "true", "turning on hidden files did not show the dotfile");
+    assert(listed("").at(-1).hidden === "true" && listed("docs").at(-1).hidden === "true", "hidden files were not requested for every open folder");
+    // A run's completion rereads open folders, even when other events follow it at once.
+    const rootReads = listed("").length;
+    const show = (runtimeEvent) => root.render(<TooltipProvider><FilesPane project={project} worktree={worktree} settings={{ editor: "zed" }} runtimeEvent={runtimeEvent} onError={(error) => errors.push(error)} /></TooltipProvider>);
+    show({ type: "run.completed", payload: { runId: "run-1" } });
+    await settle();
+    show({ type: "run.event", payload: { type: "message.delta" } });
+    await until(() => listed("").length > rootReads && listed("docs").length > listedDocs + 2, "a completed run did not refresh the open folders");
+    assert(!errors.length, `the pane reported errors: ${errors.map((error) => error.message).join("; ")}`);
+  } finally {
+    localStorage.removeItem("outright.files.show-hidden");
+    delete window.outrightFilesInjected;
+    root.render(null);
+    await settle();
+  }
+  return true;
 }
 
 async function recoveryActionsRegression() {
@@ -10108,6 +10307,7 @@ try {
     ["pane layout replacement", paneLayoutReplacementRegression, "a separator drag on a replaced layout is discarded unsaved and focus on any removed pane chrome moves to the shown pane", "responsive transition requires the CDP viewport bridge"],
     ["pane drag isolation", paneDragChatTabRegression, "pane title drags never reorder chat tabs, even after an unfinished tab drag"],
     ["responsive focus", responsiveFocusRegression, "narrow drawer and one-at-a-time panes contain and restore focus", "responsive transition requires the CDP viewport bridge"],
+    ["files pane", filesPaneRegression, "folders load lazily and page, the tree is keyboard navigable, hidden files are a control, previews never run their content, and missing, outside, oversized and unsupported files say so"],
     ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],
   ];
   // The harness runs every step with reduced motion, as hosted macOS and

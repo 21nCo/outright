@@ -3803,6 +3803,28 @@ async function within(promise, what, signal, ms = 15_000) {
   } finally { settled.abort(); }
 }
 
+test("file routes browse only a discovered project worktree and serve previews from it", withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  writeFileSync(path.join(worktree.path, "README.md"), "# Fixture\n");
+  mkdirSync(path.join(worktree.path, "docs"));
+  const at = (route, parameters) => `${route}?${new URLSearchParams(parameters)}`;
+  const listed = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: worktree.path }));
+  assert.equal(listed.statusCode, 200, listed.raw);
+  assert.deepEqual(listed.body.entries.map((entry) => [entry.name, entry.kind]), [["docs", "directory"], ["README.md", "file"]]);
+  const preview = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "README.md" }));
+  assert.deepEqual([preview.statusCode, preview.body.previewType, preview.body.text], [200, "markdown", "# Fixture\n"]);
+  const missing = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "gone.md" }));
+  assert.deepEqual([missing.statusCode, missing.body.code], [404, "MISSING"]);
+  const outsider = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-undiscovered-")));
+  try {
+    const undiscovered = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: outsider }));
+    assert.equal(undiscovered.statusCode, 403, undiscovered.raw);
+  } finally { rmSync(outsider, { recursive: true, force: true }); }
+  const otherProject = await callRuntime(runtime, "GET", at("/api/files", { projectId: "another-project", path: worktree.path }));
+  assert.equal(otherProject.statusCode, 400, otherProject.raw);
+  const escaping = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: worktree.path, dir: ".." }));
+  assert.deepEqual([escaping.statusCode, escaping.body.code], [403, "OUTSIDE_WORKTREE"]);
+}));
+
 let checkpointAgentOptions;
 let checkpointGate = null;
 test("a checkpoint restore is refused beside agent work and holds new runs and Git writes while it runs", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree, signal }) => {

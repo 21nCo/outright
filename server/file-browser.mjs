@@ -1,0 +1,315 @@
+import { constants } from "node:fs";
+import { lstat, open, opendir, realpath, stat } from "node:fs/promises";
+import path from "node:path";
+import { pipeline } from "node:stream/promises";
+
+// Read-only browsing of one discovered worktree. Every path is relative to
+// the worktree's canonical root, and is resolved on each request. A path or
+// link that resolves outside the root, or into Git's own metadata, is refused.
+// Listings are lazy (one directory per request), scan a bounded number of
+// entries, and page by the last returned sort key, so a directory that
+// changes between pages neither repeats nor skips the entries that remain.
+// Previews never render active content: text and Markdown return as text,
+// and only verified image and PDF bytes are served raw, sandboxed.
+export const FILE_BROWSER_LIMITS = Object.freeze({
+  pageSize: 200,
+  maxPageSize: 500,
+  maxScanEntries: 10_000,
+  maxPathLength: 4096,
+  sampleBytes: 8192,
+  textBytes: 1024 * 1024,
+  imageBytes: 20 * 1024 * 1024,
+  pdfBytes: 50 * 1024 * 1024,
+  maxRawStreams: 4,
+});
+
+const MARKDOWN = new Set([".md", ".markdown", ".mdown", ".mkd"]);
+const IMAGES = Object.freeze({
+  ".png": ["image/png", (bytes) => startsWith(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+  ".jpg": ["image/jpeg", (bytes) => startsWith(bytes, [0xff, 0xd8, 0xff])],
+  ".jpeg": ["image/jpeg", (bytes) => startsWith(bytes, [0xff, 0xd8, 0xff])],
+  ".gif": ["image/gif", (bytes) => ascii(bytes, 0, 6) === "GIF87a" || ascii(bytes, 0, 6) === "GIF89a"],
+  ".webp": ["image/webp", (bytes) => ascii(bytes, 0, 4) === "RIFF" && ascii(bytes, 8, 12) === "WEBP"],
+  ".avif": ["image/avif", (bytes) => ascii(bytes, 4, 8) === "ftyp" && /^avi[fs]$/.test(ascii(bytes, 8, 12))],
+  ".bmp": ["image/bmp", (bytes) => ascii(bytes, 0, 2) === "BM"],
+  ".ico": ["image/x-icon", (bytes) => startsWith(bytes, [0x00, 0x00, 0x01, 0x00])],
+  // SVG can carry script. It is only ever shown through <img>, which runs
+  // none, and its raw response is sandboxed should it be opened directly.
+  ".svg": ["image/svg+xml", (bytes) => !bytes.includes(0) && /<svg[\s>]/i.test(bytes.toString("utf8"))],
+});
+// A raw response cannot run script, load anything, or be embedded by
+// another site, even if it is opened as a top-level page.
+const RAW_HEADERS = Object.freeze({
+  "Cache-Control": "no-store",
+  "X-Content-Type-Options": "nosniff",
+  "Content-Security-Policy": "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox",
+  "Cross-Origin-Resource-Policy": "same-origin",
+  "Content-Disposition": "inline",
+});
+const OPEN_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+
+export function createFileBrowser({ limits = FILE_BROWSER_LIMITS } = {}) {
+  let rawStreams = 0;
+
+  async function list(root, { directory = "", cursor, limit, showHidden = false } = {}) {
+    const relative = relativePath(directory, limits, true);
+    const pageSize = pageLimit(limit, limits);
+    const after = parseCursor(cursor);
+    const real = relative ? (await resolveInside(root, relative)).real : root;
+    let entries;
+    try { entries = await opendir(real, { encoding: "buffer", bufferSize: 256 }); }
+    catch (error) { throw fileSystemError(error, relative, "Folder"); }
+    const visible = [];
+    let hiddenCount = 0;
+    let scanned = 0;
+    let truncated = false;
+    try {
+      for await (const entry of entries) {
+        if (++scanned > limits.maxScanEntries) { truncated = true; break; }
+        const name = entry.name.toString("utf8");
+        if (name.toLowerCase() === ".git") continue;
+        const hidden = name.startsWith(".");
+        if (hidden) hiddenCount += 1;
+        if (hidden && !showHidden) continue;
+        // A name that is not UTF-8 cannot be named again in a request.
+        const readable = Buffer.from(name, "utf8").equals(entry.name);
+        visible.push({ name, hidden, readable, kind: direntKind(entry), group: entry.isDirectory() ? 0 : 1 });
+      }
+    } catch (error) { throw fileSystemError(error, relative, "Folder"); }
+    visible.sort(compareEntries);
+    const remaining = after ? visible.filter((item) => compareEntries(item, after) > 0) : visible;
+    const page = remaining.slice(0, pageSize);
+    const listed = await Promise.all(page.map(async (item) => {
+      const entryPath = relative ? `${relative}/${item.name}` : item.name;
+      let { kind } = item;
+      // Some file systems report no type with the name.
+      if (kind === "unknown" && item.readable) kind = await lstat(path.join(real, item.name)).then(statKind, () => "other");
+      const result = { name: item.name, path: item.readable ? entryPath : null, kind, hidden: item.hidden };
+      if (kind === "symlink" && item.readable) result.target = await linkTarget(root, path.join(root, ...entryPath.split("/")));
+      return result;
+    }));
+    const last = page.at(-1);
+    return {
+      directory: relative,
+      entries: listed,
+      nextCursor: remaining.length > page.length && last ? encodeCursor(last) : null,
+      total: visible.length,
+      hiddenCount,
+      truncated,
+      scanLimit: limits.maxScanEntries,
+    };
+  }
+
+  async function preview(root, file) {
+    const relative = relativePath(file, limits, false);
+    const opened = await openFile(root, relative);
+    try { return describe(relative, opened, await classify(relative, opened, limits, true)); }
+    finally { await opened.handle?.close(); }
+  }
+
+  async function raw(root, file, version, request, response) {
+    const site = request.headers?.["sec-fetch-site"];
+    if (site && site !== "same-origin" && site !== "none") throw fileError(403, "File previews are only served to Outright", "CROSS_SITE");
+    const relative = relativePath(file, limits, false);
+    if (rawStreams >= limits.maxRawStreams) throw fileError(429, "Too many previews are loading; retry shortly", "PREVIEW_BUSY");
+    rawStreams += 1;
+    let opened;
+    try {
+      opened = await openFile(root, relative);
+      const kind = await classify(relative, opened, limits, false);
+      if (kind.previewType !== "image" && kind.previewType !== "pdf") {
+        throw fileError(415, "Only verified image and PDF previews are served as files", "NOT_RAW_PREVIEW");
+      }
+      if (version && version !== fileVersion(opened.info)) throw fileError(409, "The file changed after it was previewed", "FILE_CHANGED");
+      response.statusCode = 200;
+      for (const [name, value] of Object.entries(RAW_HEADERS)) response.setHeader(name, value);
+      response.setHeader("Content-Type", kind.mimeType);
+      response.setHeader("Content-Length", String(opened.info.size));
+      const stream = opened.handle.createReadStream({ start: 0, end: opened.info.size - 1, autoClose: false });
+      // Headers are sent; a failure now can only end the response.
+      try { await pipeline(stream, response); }
+      catch (error) { if (!response.destroyed) response.destroy(error); }
+    } finally {
+      rawStreams -= 1;
+      await opened?.handle?.close();
+    }
+  }
+
+  return { list, preview, raw };
+}
+
+function describe(relative, opened, kind) {
+  const { info, link } = opened;
+  return {
+    path: relative,
+    name: relative.split("/").at(-1),
+    size: info.size,
+    modifiedAt: info.mtime.toISOString(),
+    version: fileVersion(info),
+    link,
+    ...kind,
+  };
+}
+
+async function classify(relative, { handle, info }, limits, withText) {
+  if (!handle) return { previewType: "unsupported", reason: "This is not a regular file" };
+  const extension = path.extname(relative).toLowerCase();
+  const sample = await readBytes(handle, Math.min(info.size, limits.sampleBytes));
+  const image = IMAGES[extension];
+  if (image) {
+    if (!image[1](sample)) return { previewType: "unsupported", reason: `The contents are not a ${extension.slice(1).toUpperCase()} image` };
+    if (info.size > limits.imageBytes) return { previewType: "oversized", limit: limits.imageBytes };
+    return { previewType: "image", mimeType: image[0] };
+  }
+  if (extension === ".pdf") {
+    if (!sample.subarray(0, 1024).includes("%PDF-")) return { previewType: "unsupported", reason: "The contents are not a PDF document" };
+    if (info.size > limits.pdfBytes) return { previewType: "oversized", limit: limits.pdfBytes };
+    return { previewType: "pdf", mimeType: "application/pdf" };
+  }
+  if (sample.includes(0)) return { previewType: "unsupported", reason: "Binary files have no preview" };
+  if (info.size > limits.textBytes) return { previewType: "oversized", limit: limits.textBytes };
+  const previewType = MARKDOWN.has(extension) ? "markdown" : "text";
+  if (!withText) return { previewType };
+  const bytes = info.size > sample.length ? await readBytes(handle, info.size) : sample;
+  let text;
+  try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch { return { previewType: "unsupported", reason: "The contents are not UTF-8 text" }; }
+  if (text.includes("\0")) return { previewType: "unsupported", reason: "Binary files have no preview" };
+  return { previewType, text };
+}
+
+// Opens the canonical target, never a link. A target that is not a regular
+// file is described without being opened, so a FIFO cannot block a read.
+async function openFile(root, relative) {
+  const logical = path.join(root, ...relative.split("/"));
+  let linkInfo;
+  try { linkInfo = await lstat(logical); } catch (error) { throw fileSystemError(error, relative, "File"); }
+  const { real } = await resolveInside(root, relative);
+  let info;
+  try { info = await stat(real); } catch (error) { throw fileSystemError(error, relative, "File"); }
+  const link = linkInfo.isSymbolicLink() ? { target: toPosix(path.relative(root, real)) } : null;
+  if (info.isDirectory()) throw fileError(409, `${relative} is a folder`, "IS_DIRECTORY");
+  if (!info.isFile()) return { handle: null, info, link };
+  let handle;
+  try { handle = await open(real, OPEN_FLAGS); } catch (error) { throw fileSystemError(error, relative, "File"); }
+  const opened = await handle.stat();
+  // The file at the canonical path must be the one that was checked.
+  if (!opened.isFile() || opened.ino !== info.ino || opened.dev !== info.dev) {
+    await handle.close();
+    throw fileError(409, "The file changed while it was being opened; retry", "FILE_CHANGED");
+  }
+  return { handle, info: opened, link };
+}
+
+async function resolveInside(root, relative) {
+  let real;
+  try { real = await realpath(path.join(root, ...relative.split("/"))); }
+  catch (error) { throw fileSystemError(error, relative, "Path"); }
+  if (!isWithin(root, real)) throw fileError(403, `${relative} links outside this worktree`, "OUTSIDE_WORKTREE");
+  if (excludedSegments(path.relative(root, real).split(path.sep))) throw fileError(403, "Git metadata is not browsable", "EXCLUDED");
+  return { real };
+}
+
+async function linkTarget(root, logical) {
+  let real;
+  try { real = await realpath(logical); }
+  catch (error) { return { state: ["ENOENT", "ENOTDIR", "ELOOP"].includes(error.code) ? "missing" : "unreadable" }; }
+  if (!isWithin(root, real) || excludedSegments(path.relative(root, real).split(path.sep))) return { state: "outside" };
+  try {
+    const info = await stat(real);
+    return { state: info.isDirectory() ? "directory" : info.isFile() ? "file" : "other", path: toPosix(path.relative(root, real)) };
+  } catch { return { state: "missing" }; }
+}
+
+// Accepts a relative path with "/" separators ("\\" too on Windows). An
+// absolute path, a parent segment, or Git's own metadata is refused before
+// the file system is touched.
+function relativePath(value, limits, allowRoot) {
+  if (value === undefined || value === null || value === "") {
+    if (allowRoot) return "";
+    throw fileError(400, "A file path is required", "PATH_INVALID");
+  }
+  if (typeof value !== "string" || value.length > limits.maxPathLength || value.includes("\0")) {
+    throw fileError(400, "The file path is invalid", "PATH_INVALID");
+  }
+  if (path.isAbsolute(value) || path.posix.isAbsolute(value) || /^[A-Za-z]:/.test(value)) {
+    throw fileError(403, "Paths must be relative to the worktree", "OUTSIDE_WORKTREE");
+  }
+  const segments = value.split(process.platform === "win32" ? /[\\/]/ : "/").filter((segment) => segment && segment !== ".");
+  if (segments.includes("..")) throw fileError(403, "Paths must stay inside the worktree", "OUTSIDE_WORKTREE");
+  if (excludedSegments(segments)) throw fileError(403, "Git metadata is not browsable", "EXCLUDED");
+  if (!segments.length && !allowRoot) throw fileError(400, "A file path is required", "PATH_INVALID");
+  return segments.join("/");
+}
+
+function excludedSegments(segments) { return segments.some((segment) => segment.toLowerCase() === ".git"); }
+
+function pageLimit(value, limits) {
+  if (value === undefined || value === null || value === "") return limits.pageSize;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) throw fileError(400, "The page size is invalid", "PAGE_INVALID");
+  return Math.min(parsed, limits.maxPageSize);
+}
+
+function encodeCursor(entry) { return Buffer.from(JSON.stringify([entry.group, entry.name]), "utf8").toString("base64url"); }
+function parseCursor(value) {
+  if (!value) return null;
+  try {
+    const [group, name] = JSON.parse(Buffer.from(String(value), "base64url").toString("utf8"));
+    if ((group === 0 || group === 1) && typeof name === "string") return { group, name };
+  } catch { /* Reported below. */ }
+  throw fileError(400, "The folder page cursor is invalid", "CURSOR_INVALID");
+}
+
+// Folders first, then a case-insensitive name order with an exact tie-break,
+// so the order is total and a cursor names one position.
+function compareEntries(left, right) {
+  if (left.group !== right.group) return left.group - right.group;
+  const a = left.name.toLowerCase();
+  const b = right.name.toLowerCase();
+  if (a !== b) return a < b ? -1 : 1;
+  if (left.name === right.name) return 0;
+  return left.name < right.name ? -1 : 1;
+}
+
+function direntKind(entry) {
+  if (entry.isDirectory()) return "directory";
+  if (entry.isFile()) return "file";
+  if (entry.isSymbolicLink()) return "symlink";
+  return entry.isFIFO() || entry.isSocket() || entry.isCharacterDevice() || entry.isBlockDevice() ? "other" : "unknown";
+}
+function statKind(info) { return info.isDirectory() ? "directory" : info.isFile() ? "file" : info.isSymbolicLink() ? "symlink" : "other"; }
+
+async function readBytes(handle, length) {
+  const buffer = Buffer.alloc(length);
+  let offset = 0;
+  while (offset < length) {
+    const { bytesRead } = await handle.read(buffer, offset, length - offset, offset);
+    if (!bytesRead) break;
+    offset += bytesRead;
+  }
+  return buffer.subarray(0, offset);
+}
+
+function fileVersion(info) { return `${info.size.toString(36)}-${Math.trunc(info.mtimeMs).toString(36)}-${info.ino.toString(36)}`; }
+function startsWith(bytes, prefix) { return bytes.length >= prefix.length && prefix.every((value, index) => bytes[index] === value); }
+function ascii(bytes, start, end) { return bytes.length >= end ? bytes.toString("latin1", start, end) : ""; }
+function toPosix(value) { return value.split(path.sep).join("/"); }
+function isWithin(root, target) { const relative = path.relative(root, target); return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative)); }
+
+function fileSystemError(error, relative, noun) {
+  const name = relative || "The worktree root";
+  if (error?.statusCode) return error;
+  if (error?.code === "ENOENT") return fileError(404, `${name} no longer exists`, "MISSING");
+  if (error?.code === "ENOTDIR") return fileError(noun === "Folder" ? 409 : 404, noun === "Folder" ? `${name} is not a folder` : `${name} no longer exists`, noun === "Folder" ? "NOT_DIRECTORY" : "MISSING");
+  if (error?.code === "ELOOP") return fileError(409, `${name} is a link that loops`, "LINK_LOOP");
+  if (error?.code === "EACCES" || error?.code === "EPERM") return fileError(403, `${name} cannot be read`, "UNREADABLE");
+  return fileError(500, `${noun} ${name} could not be read`, "READ_FAILED");
+}
+
+function fileError(statusCode, message, code) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.details = { code };
+  return error;
+}

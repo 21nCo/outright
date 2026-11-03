@@ -18,6 +18,8 @@ export default defineConfig({
           if (id.includes("@xterm/")) return "terminal";
           if (id.includes("@phosphor-icons/")) return "icons";
           if (id.includes("@base-ui/")) return "base-ui";
+          // Loaded only when a PDF is previewed.
+          if (id.includes("pdfjs-dist")) return "pdf";
           if (id.includes("node_modules")) return "vendor";
         },
       },
