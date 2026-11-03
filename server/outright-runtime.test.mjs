@@ -3808,8 +3808,12 @@ test("file routes browse only a discovered project worktree and serve previews f
   mkdirSync(path.join(worktree.path, "docs"));
   const at = (route, parameters) => `${route}?${new URLSearchParams(parameters)}`;
   const listed = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: worktree.path }));
-  assert.equal(listed.statusCode, 200, listed.raw);
-  assert.deepEqual(listed.body.entries.map((entry) => [entry.name, entry.kind]), [["docs", "directory"], ["README.md", "file"]]);
+  // Windows has no handle-bound folder path, so its folders are refused.
+  if (process.platform === "win32") assert.deepEqual([listed.statusCode, listed.body.code], [501, "LISTING_UNAVAILABLE"], listed.raw);
+  else {
+    assert.equal(listed.statusCode, 200, listed.raw);
+    assert.deepEqual(listed.body.entries.map((entry) => [entry.name, entry.kind]), [["docs", "directory"], ["README.md", "file"]]);
+  }
   const preview = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "README.md" }));
   assert.deepEqual([preview.statusCode, preview.body.previewType, preview.body.text], [200, "markdown", "# Fixture\n"]);
   const missing = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "gone.md" }));

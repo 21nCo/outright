@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
@@ -9,6 +9,9 @@ import { FILE_BROWSER_LIMITS, createFileBrowser } from "./file-browser.mjs";
 
 const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da63f8ffff3f0005fe02fea7d6a4a70000000049454e44ae426082", "hex");
 const posixOnly = { skip: process.platform === "win32" && "symlinks and FIFOs need POSIX semantics" };
+// Windows has no handle-bound folder path, so folders are refused there
+// (see the fail-closed test below).
+const listable = { skip: process.platform === "win32" && "folders are not listed without a handle-bound path" };
 
 function fixture(t) {
   const base = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-files-")));
@@ -37,7 +40,7 @@ function capture(headers = { "sec-fetch-site": "same-origin" }, gate = Promise.r
   return { request: { headers }, response, body: () => Buffer.concat(chunks) };
 }
 
-test("a folder lists only its own entries, folders first, hiding dotfiles and never Git metadata", async (t) => {
+test("a folder lists only its own entries, folders first, hiding dotfiles and never Git metadata", listable, async (t) => {
   const { root, write } = fixture(t);
   write("README.md", "# Hello\n");
   write("b.txt", "b");
@@ -63,7 +66,7 @@ test("a folder lists only its own entries, folders first, hiding dotfiles and ne
   assert.equal((await refusal(files.list(root, { directory: ".git" }))).code, "EXCLUDED");
 });
 
-test("a large folder pages without repeats or gaps while it changes, and stops scanning at its bound", async (t) => {
+test("a large folder pages without repeats or gaps while it changes, and stops scanning at its bound", listable, async (t) => {
   const { root, write } = fixture(t);
   for (let index = 0; index < 450; index += 1) write(`many/file-${String(index).padStart(3, "0")}.txt`, "");
   const files = createFileBrowser();
@@ -223,7 +226,45 @@ test("a folder replaced by a link after it was resolved is never read through, f
   assert.equal((await plain.preview(root, "docs/inner/guide.md")).text, "# Inside\n");
 });
 
-test("names that merely begin with two dots are inside the worktree", async (t) => {
+test("a folder swapped for a link after it was checked is read through its handle, and without a handle-bound path is never listed", posixOnly, async (t) => {
+  const { base, root, write } = fixture(t);
+  write("docs/inner/guide.md", "# Inside\n");
+  mkdirSync(path.join(base, "outside", "inner"), { recursive: true });
+  writeFileSync(path.join(base, "outside", "inner", "secret-name.txt"), "");
+  let swapped = 0;
+  // Replaces the checked folder's parent with a link to an outside tree of
+  // the same shape just before the entries are read; the restore puts it back
+  // before any later check by name.
+  const swap = () => {
+    swapped += 1;
+    renameSync(path.join(root, "docs"), path.join(root, "docs-moved"));
+    symlinkSync(path.join(base, "outside"), path.join(root, "docs"));
+  };
+  const restore = () => {
+    if (!existsSync(path.join(root, "docs-moved"))) return;
+    unlinkSync(path.join(root, "docs"));
+    renameSync(path.join(root, "docs-moved"), path.join(root, "docs"));
+  };
+  const names = (listing) => listing.entries.map((entry) => entry.name);
+  // Through /proc/self/fd (Linux) or /.vol (macOS) the opened folder is read.
+  const bound = createFileBrowser({ hooks: { beforeRead: swap, afterRead: restore } });
+  assert.deepEqual(names(await bound.list(root, { directory: "docs/inner" })), ["guide.md"]);
+  assert.equal(swapped, 1);
+  // Without one the folder could only be read by name, and a name checked
+  // before and after reading passes while the swap is undone in between; so
+  // the folder is not listed at all.
+  const byName = createFileBrowser({ handlePaths: false, hooks: { beforeRead: swap, afterRead: restore } });
+  const outcome = await byName.list(root, { directory: "docs/inner" }).then(names, (error) => [error.statusCode, error.details?.code, error.message]);
+  restore();
+  assert.deepEqual(outcome.slice(0, 2), [501, "LISTING_UNAVAILABLE"], `listed by name: ${outcome}`);
+  assert.match(outcome[2], /Folder listing is unavailable on this file system/);
+  assert.equal(swapped, 1);
+  assert.equal((await refusal(byName.list(root))).code, "LISTING_UNAVAILABLE");
+  // Files are still read from their held descriptor.
+  assert.equal((await byName.preview(root, "docs/inner/guide.md")).text, "# Inside\n");
+});
+
+test("names that merely begin with two dots are inside the worktree", listable, async (t) => {
   const { root, write } = fixture(t);
   write("..notes.md", "# Dots\n");
   write("..cache/entry.txt", "cached");

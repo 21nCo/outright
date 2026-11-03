@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { MARKDOWN_NODE_BUDGET, linkTarget, parseInline, parseMarkdown, parseMarkdownPreview } from "../src/lib/markdown.js";
+import { PDF_CANVAS_LIMITS, pdfCanvasSize } from "../src/lib/pdf-canvas.js";
 import { ancestorsOf, normalizeTypedPath, treeKeyTarget, visibleRows } from "../src/lib/file-tree.js";
 
 const types = (nodes) => nodes.map((node) => node.type);
@@ -128,4 +129,34 @@ test("folders named like object properties are ordinary folders", () => {
   assert.deepEqual(visibleRows(folders, new Set(names)).map((row) => row.type), names.flatMap(() => ["entry", "loading"]));
   for (const name of names) folders.set(name, { status: "loaded", entries: [{ name: "inner.txt", path: `${name}/inner.txt`, kind: "file" }], total: 1, nextCursor: null });
   assert.deepEqual(visibleRows(folders, new Set(names)).filter((row) => row.level === 2).map((row) => row.entry.path), names.map((name) => `${name}/inner.txt`));
+});
+
+test("a PDF page canvas stays within its per-side and total pixel budget, or the page is reported too large", () => {
+  const within = (size, label) => {
+    assert(!size.tooLarge, `${label} was refused`);
+    assert(size.canvasWidth <= PDF_CANVAS_LIMITS.maxSide && size.canvasHeight <= PDF_CANVAS_LIMITS.maxSide, `${label} is ${size.canvasWidth}x${size.canvasHeight}`);
+    assert(size.canvasWidth * size.canvasHeight <= PDF_CANVAS_LIMITS.maxPixels, `${label} has ${size.canvasWidth * size.canvasHeight} pixels`);
+    assert(size.canvasWidth >= 1 && size.canvasHeight >= 1);
+    return size;
+  };
+  // An ordinary page fits the pane at the display's density.
+  const letter = within(pdfCanvasSize({ width: 612, height: 792 }, 802, 2), "a letter page");
+  assert.deepEqual([letter.cssWidth, letter.canvasWidth], [800, 1600]);
+  // The largest page (14,400 pt) shrinks below a quarter to fit the pane,
+  // where a 0.25 floor drew 7,200 px a side.
+  const huge = within(pdfCanvasSize({ width: 14_400, height: 14_400 }, 800, 2), "a 14,400 pt page");
+  assert(huge.cssWidth <= 800 && huge.scale < 0.25, `a huge page drew at ${huge.scale}`);
+  // UserUnit 2 doubles the page size pdf.js reports at scale 1.
+  within(pdfCanvasSize({ width: 28_800, height: 28_800 }, 800, 2), "a UserUnit 2 page");
+  // A tall, narrow page no longer passes the per-side canvas limit.
+  const tall = within(pdfCanvasSize({ width: 200, height: 14_400 }, 800, 2), "a tall, narrow page");
+  assert(tall.cssHeight <= PDF_CANVAS_LIMITS.maxSide, `a tall page is ${tall.cssHeight} CSS px high`);
+  // A very high density display and a wide pane lower the drawing density,
+  // not the size on screen.
+  const dense = within(pdfCanvasSize({ width: 612, height: 792 }, 6000, 8), "a page at density 8");
+  assert(dense.cssWidth === 2448 && dense.canvasWidth < 2448 * 8, `density 8 gave ${JSON.stringify(dense)}`);
+  // Pages that cannot be drawn legibly in any budget are refused, not drawn.
+  assert.deepEqual(pdfCanvasSize({ width: 1, height: 14_400 * 75_000 }, 800, 2), { tooLarge: true });
+  assert.deepEqual(pdfCanvasSize({ width: 0, height: 792 }, 800, 2), { tooLarge: true });
+  assert.deepEqual(pdfCanvasSize({ width: Number.NaN, height: 792 }, 800, 2), { tooLarge: true });
 });

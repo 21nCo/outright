@@ -9184,6 +9184,77 @@ async function filesPaneRegression() {
   return true;
 }
 
+// ⌘P (Ctrl+P elsewhere) shows Files and puts the cursor in Go to file with
+// its text selected, whether Files was closed, already open, or a tab in the
+// compact layout.
+async function filesQuickOpenRegression() {
+  if (!window.__fixtureSetViewport) return false;
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [{ id: "group", name: "Regression fixture" }], memberships: { A: "group", B: "group" } }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    if (url.pathname === "/api/terminals") return response({ terminals: [] });
+    if (url.pathname === "/api/files") return response({ directory: "", entries: [{ name: "README.md", path: "README.md", kind: "file", hidden: false }], nextCursor: null, total: 1, hiddenCount: 0, truncated: false });
+    return response({});
+  };
+  const jump = () => host.querySelector('#pane-files input[aria-label="Go to file path"]');
+  const quickOpen = (label) => {
+    const target = document.activeElement ?? document.body;
+    const shortcut = new KeyboardEvent("keydown", { key: "p", metaKey: true, bubbles: true, cancelable: true });
+    target.dispatchEvent(shortcut);
+    assert(shortcut.defaultPrevented, `${label}: the browser's print shortcut was not replaced`);
+  };
+  const focusedAndSelected = (label) => until(() => {
+    const input = jump();
+    return input && document.activeElement === input && input.selectionStart === 0 && input.selectionEnd === input.value.length;
+  }, `${label}: Go to file was not focused with its text selected`);
+  try {
+    await window.__fixtureSetViewport(1280);
+    await until(() => window.innerWidth === 1280, "wide quick-open viewport");
+    window.dispatchEvent(new Event("resize"));
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    const composer = () => host.querySelector('textarea[aria-label="Message the agent"]');
+    await until(() => composer(), "the workspace did not render");
+    assert(!host.querySelector("#pane-files"), "Files was open before the shortcut");
+
+    // Files closed: the shortcut opens it beside the conversation.
+    composer().focus();
+    quickOpen("closed");
+    await focusedAndSelected("Files closed");
+    assert(host.querySelector("#pane-conversation"), "opening Files replaced the conversation");
+    await until(() => host.querySelector('#pane-files [role="treeitem"]'), "Files did not list the worktree");
+
+    // Files already open: typed text is selected again for replacement.
+    setControlValue(jump(), "docs/guide.md");
+    composer().focus();
+    quickOpen("open");
+    await focusedAndSelected("Files already open");
+    assert(jump().value === "docs/guide.md", "the shortcut cleared Go to file");
+
+    // Compact layout: Files becomes the shown tab.
+    composer().focus();
+    await window.__fixtureSetViewport(390);
+    await until(() => host.querySelector('.pane-switcher [role="tab"]'), "the compact pane tabs did not appear");
+    const conversationTab = host.querySelector("#pane-tab-conversation");
+    conversationTab.click();
+    await until(() => conversationTab.getAttribute("aria-selected") === "true", "the conversation tab was not shown");
+    composer().focus();
+    quickOpen("compact");
+    await until(() => host.querySelector("#pane-tab-files")?.getAttribute("aria-selected") === "true", "the shortcut did not show the Files tab");
+    await focusedAndSelected("compact layout");
+    const rect = jump().getBoundingClientRect();
+    assert(rect.width > 0 && rect.height > 0 && rect.right <= window.innerWidth + 1, `Go to file is not visible in the compact layout: ${JSON.stringify(rect.toJSON())}`);
+  } finally {
+    await window.__fixtureSetViewport(1280);
+    root.render(null);
+    await settle();
+  }
+  return true;
+}
+
 async function recoveryActionsRegression() {
   root.render(null);
   await settle();
@@ -10355,6 +10426,7 @@ try {
     ["pane drag isolation", paneDragChatTabRegression, "pane title drags never reorder chat tabs, even after an unfinished tab drag"],
     ["responsive focus", responsiveFocusRegression, "narrow drawer and one-at-a-time panes contain and restore focus", "responsive transition requires the CDP viewport bridge"],
     ["files pane", filesPaneRegression, "folders load lazily and page, the tree is keyboard navigable, hidden files are a control, previews never run their content, and missing, outside, oversized and unsupported files say so"],
+    ["files quick open", filesQuickOpenRegression, "Cmd/Ctrl+P shows Files and focuses Go to file with its text selected, from a closed, open or compact Files pane", "the compact layout requires the CDP viewport bridge"],
     ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],
   ];
   // The harness runs every step with reduced motion, as hosted macOS and

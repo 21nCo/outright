@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { CaretLeft, CaretRight, SpinnerGap, WarningCircle } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
+import { pdfCanvasSize } from "@/lib/pdf-canvas";
 
 const MAX_PAGE_TEXT = 100_000;
 
@@ -57,17 +58,21 @@ export default function PdfPreview({ url, name }) {
     (async () => {
       const pdfPage = await pdfState.pdf.getPage(page);
       if (cancelled) return;
-      const base = pdfPage.getViewport({ scale: 1 });
-      const scale = Math.max(0.25, Math.min(4, (width - 2) / base.width));
-      const ratio = window.devicePixelRatio || 1;
-      const viewport = pdfPage.getViewport({ scale: scale * ratio });
+      // The canvas is sized within a pixel budget before it is allocated.
+      const size = pdfCanvasSize(pdfPage.getViewport({ scale: 1 }), width, window.devicePixelRatio || 1);
       const canvas = canvasRef.current;
-      canvas.width = Math.floor(viewport.width);
-      canvas.height = Math.floor(viewport.height);
-      canvas.style.width = `${Math.floor(viewport.width / ratio)}px`;
-      canvas.style.height = `${Math.floor(viewport.height / ratio)}px`;
-      render = pdfPage.render({ canvas, canvasContext: canvas.getContext("2d"), viewport });
-      await render.promise;
+      if (size.tooLarge) {
+        canvas.width = 0;
+        canvas.height = 0;
+        setPageError("This page is too large to draw. Its text is below.");
+      } else {
+        canvas.width = size.canvasWidth;
+        canvas.height = size.canvasHeight;
+        canvas.style.width = `${size.cssWidth}px`;
+        canvas.style.height = `${size.cssHeight}px`;
+        render = pdfPage.render({ canvas, canvasContext: canvas.getContext("2d"), viewport: pdfPage.getViewport({ scale: size.scale }) });
+        await render.promise;
+      }
       const content = await pdfPage.getTextContent();
       if (!cancelled) setPageText(content.items.map((item) => item.str ?? "").join(" ").replace(/\s+/g, " ").trim().slice(0, MAX_PAGE_TEXT));
     })().catch((error) => {

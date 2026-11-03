@@ -58,9 +58,11 @@ const NOFOLLOW = NOFOLLOW_ANY || (constants.O_NOFOLLOW ?? 0);
 const FILE_FLAGS = constants.O_RDONLY | NOFOLLOW | (constants.O_NONBLOCK ?? 0);
 const DIRECTORY_FLAGS = constants.O_RDONLY | NOFOLLOW | (constants.O_DIRECTORY ?? 0);
 
-// `hooks.beforeOpen(real)` runs between resolving a path and opening it; it
-// exists so tests can replace a path component at exactly that moment.
-export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {} } = {}) {
+// `hooks.beforeOpen(real)` runs between resolving a path and opening it, and
+// `hooks.beforeRead` and `hooks.afterRead` around reading a folder's entries;
+// they exist so tests can replace a path component at exactly those moments.
+// `handlePaths: false` simulates a system with no handle-bound folder path.
+export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, handlePaths = true } = {}) {
   let rawStreams = 0;
   const waiting = [];
 
@@ -69,13 +71,14 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {} } =
     const pageSize = pageLimit(limit, limits);
     const after = parseCursor(cursor);
     const real = relative ? (await resolveInside(root, relative)).real : root;
-    const folder = await openVerified(root, real, relative, true, hooks);
+    const folder = await openVerified(root, real, relative, true, hooks, handlePaths);
     try { return await listOpened(root, relative, folder, { pageSize, after, showHidden }); }
     finally { await folder.handle.close(); }
   }
 
   async function listOpened(root, relative, folder, { pageSize, after, showHidden }) {
     let entries;
+    await hooks.beforeRead?.(folder.readPath);
     try { entries = await opendir(folder.readPath, { encoding: "buffer", bufferSize: 256 }); }
     catch (error) { throw fileSystemError(error, relative, "Folder"); }
     const visible = [];
@@ -95,9 +98,7 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {} } =
         visible.push({ name, hidden, readable, kind: direntKind(entry), group: entry.isDirectory() ? 0 : 1 });
       }
     } catch (error) { throw fileSystemError(error, relative, "Folder"); }
-    // Where the folder could only be read by name, it must still be the one
-    // that was opened and checked.
-    await folder.confirm?.();
+    await hooks.afterRead?.(folder.readPath);
     visible.sort(compareEntries);
     const remaining = after ? visible.filter((item) => compareEntries(item, after) > 0) : visible;
     const page = remaining.slice(0, pageSize);
@@ -124,7 +125,7 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {} } =
 
   async function preview(root, file) {
     const relative = relativePath(file, limits, false);
-    const opened = await openFile(root, relative, hooks);
+    const opened = await openFile(root, relative, hooks, handlePaths);
     try { return describe(relative, opened, await classify(relative, opened, limits, true)); }
     finally { await opened.handle?.close(); }
   }
@@ -136,7 +137,7 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {} } =
     await acquireRawSlot(response);
     let opened;
     try {
-      opened = await openFile(root, relative, hooks);
+      opened = await openFile(root, relative, hooks, handlePaths);
       const kind = await classify(relative, opened, limits, false);
       if (kind.previewType !== "image" && kind.previewType !== "pdf") {
         throw fileError(415, "Only verified image and PDF previews are served as files", "NOT_RAW_PREVIEW");
@@ -227,7 +228,7 @@ async function classify(relative, { handle, info }, limits, withText) {
 
 // Opens the canonical target, never a link. A target that is not a regular
 // file is described without being opened, so a FIFO cannot block a read.
-async function openFile(root, relative, hooks) {
+async function openFile(root, relative, hooks, handlePaths) {
   const logical = path.join(root, ...relative.split("/"));
   let linkInfo;
   try { linkInfo = await lstat(logical); } catch (error) { throw fileSystemError(error, relative, "File"); }
@@ -238,7 +239,7 @@ async function openFile(root, relative, hooks) {
   if (info.isSymbolicLink()) throw pathChanged();
   if (info.isDirectory()) throw fileError(409, `${relative} is a folder`, "IS_DIRECTORY");
   if (!info.isFile()) return { handle: null, info, link };
-  const { handle } = await openVerified(root, real, relative, false, hooks);
+  const { handle } = await openVerified(root, real, relative, false, hooks, handlePaths);
   const opened = await handle.stat();
   // The file at the canonical path must be the one that was checked.
   if (!opened.isFile() || opened.ino !== info.ino || opened.dev !== info.dev) {
@@ -253,9 +254,12 @@ async function openFile(root, relative, hooks) {
 // it was resolved. macOS refuses a link anywhere in the path; Linux reads the
 // descriptor's own location from /proc. A folder is then read through that
 // descriptor (/proc/self/fd/N, or the volume's file-ID path /.vol/dev/ino on
-// macOS), never by name again. Elsewhere the name is checked again after
-// opening and after reading, which narrows the race but cannot close it.
-async function openVerified(root, real, relative, directory, hooks) {
+// macOS), never by name again. Node cannot read a folder from a descriptor,
+// so where neither path exists (Windows, a macOS volume without /.vol, Linux
+// without /proc) a folder is not listed at all: a name checked before and
+// after reading could still point elsewhere while it is read. A file is read
+// from its held descriptor, whose identity is compared with the checked path.
+async function openVerified(root, real, relative, directory, hooks, handlePaths) {
   const noun = directory ? "Folder" : "File";
   await hooks.beforeOpen?.(real);
   let handle;
@@ -267,26 +271,24 @@ async function openVerified(root, real, relative, directory, hooks) {
   }
   try {
     const procPath = `/proc/self/fd/${handle.fd}`;
-    if (process.platform === "linux") {
+    if (handlePaths && process.platform === "linux") {
       const location = await readlink(procPath).catch(() => null);
       if (location !== null) {
         if (!isWithin(root, location) || excludedSegments(path.relative(root, location).split(path.sep))) throw pathChanged();
         return { handle, readPath: procPath };
       }
     }
-    if (NOFOLLOW_ANY) {
-      if (!directory) return { handle };
+    if (NOFOLLOW_ANY && !directory) return { handle };
+    if (handlePaths && NOFOLLOW_ANY) {
       const info = await handle.stat({ bigint: true });
       const volumePath = `/.vol/${info.dev}/${info.ino}`;
       const usable = await stat(volumePath, { bigint: true }).then((found) => found.ino === info.ino && found.dev === info.dev, () => false);
       if (usable) return { handle, readPath: volumePath };
     }
-    const confirm = async () => {
-      const [again, now, held] = await Promise.all([realpath(real).catch(() => null), stat(real).catch(() => null), handle.stat()]);
-      if (again !== real || !now || now.ino !== held.ino || now.dev !== held.dev) throw pathChanged();
-    };
-    await confirm();
-    return { handle, readPath: real, confirm: directory ? confirm : null };
+    if (directory) throw fileError(501, "Folder listing is unavailable on this file system, because a folder cannot be read through the handle Outright checked. Go to file still opens a file by its path", "LISTING_UNAVAILABLE");
+    const [again, now, held] = await Promise.all([realpath(real).catch(() => null), stat(real).catch(() => null), handle.stat()]);
+    if (again !== real || !now || now.ino !== held.ino || now.dev !== held.dev) throw pathChanged();
+    return { handle };
   } catch (error) {
     await handle.close();
     throw error;
