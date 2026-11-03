@@ -9,9 +9,10 @@ import { FILE_BROWSER_LIMITS, createFileBrowser } from "./file-browser.mjs";
 
 const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da63f8ffff3f0005fe02fea7d6a4a70000000049454e44ae426082", "hex");
 const posixOnly = { skip: process.platform === "win32" && "symlinks and FIFOs need POSIX semantics" };
-// Windows has no handle-bound folder path, so folders are refused there
-// (see the fail-closed test below).
+// Windows cannot prove where an opened descriptor is, so folders and files
+// are refused there (see the fail-closed tests below; OUT-144).
 const listable = { skip: process.platform === "win32" && "folders are not listed without a handle-bound path" };
+const previewable = { skip: process.platform === "win32" && "files are not previewed without a descriptor-bound location" };
 
 function fixture(t) {
   const base = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-files-")));
@@ -122,7 +123,7 @@ test("paths that leave the worktree are refused, and links are listed with where
   }
 });
 
-test("previews return text only for UTF-8 text, verify image and PDF contents, and state their limits", async (t) => {
+test("previews return text only for UTF-8 text, verify image and PDF contents, and state their limits", previewable, async (t) => {
   const { root, write } = fixture(t);
   write("notes.md", "# Notes\n<script>alert(1)</script>\n");
   write("page.html", "<html><script>alert(1)</script></html>");
@@ -161,7 +162,7 @@ test("a FIFO is described without being opened, so a preview never blocks on it"
   assert.equal(described.previewType, "unsupported");
 });
 
-test("raw bytes are served only for verified images and PDFs, sandboxed, same-site, and for the previewed version", async (t) => {
+test("raw bytes are served only for verified images and PDFs, sandboxed, same-site, and for the previewed version", previewable, async (t) => {
   const { root, write } = fixture(t);
   write("logo.png", PNG);
   write("notes.md", "# Notes\n");
@@ -260,8 +261,42 @@ test("a folder swapped for a link after it was checked is read through its handl
   assert.match(outcome[2], /Folder listing is unavailable on this file system/);
   assert.equal(swapped, 1);
   assert.equal((await refusal(byName.list(root))).code, "LISTING_UNAVAILABLE");
-  // Files are still read from their held descriptor.
-  assert.equal((await byName.preview(root, "docs/inner/guide.md")).text, "# Inside\n");
+});
+
+test("a file whose ancestor is swapped around each check by name is refused, and without a descriptor-bound location is never read", posixOnly, async (t) => {
+  const { base, root, write } = fixture(t);
+  write("docs/inner/guide.md", "# Inside\n");
+  write("docs/inner/logo.png", PNG);
+  const privatePng = Buffer.concat([PNG, Buffer.from("private")]);
+  mkdirSync(path.join(base, "outside", "inner"), { recursive: true });
+  writeFileSync(path.join(base, "outside", "inner", "guide.md"), "# Private\n");
+  writeFileSync(path.join(base, "outside", "inner", "logo.png"), privatePng);
+  const docs = path.join(root, "docs");
+  const moved = path.join(root, "docs-moved");
+  const swap = () => { if (existsSync(moved)) return; renameSync(docs, moved); symlinkSync(path.join(base, "outside"), docs); };
+  const restore = () => { if (!existsSync(moved)) return; unlinkSync(docs); renameSync(moved, docs); };
+  // The ancestor is a link to the outside tree when the file is inspected
+  // and opened, and is put back for any later look by name.
+  const hooks = { beforeInspect: swap, afterOpen: restore };
+  const run = async (files) => {
+    const outcomes = {};
+    const { request, response, body } = capture();
+    for (const [name, operation] of [["preview", () => files.preview(root, "docs/inner/guide.md")], ["raw", () => files.raw(root, "docs/inner/logo.png", null, request, response)]]) {
+      outcomes[name] = await operation().then((value) => ({ served: name === "raw" ? body().toString("latin1") : value.text }), (error) => ({ status: error.statusCode, code: error.details?.code }));
+      restore();
+    }
+    return outcomes;
+  };
+  // Where the opened descriptor's location is proven, the outside file is refused.
+  const bound = await run(createFileBrowser({ hooks }));
+  for (const name of ["preview", "raw"]) assert.deepEqual(bound[name], { status: 409, code: "PATH_CHANGED" }, `${name}: ${JSON.stringify(bound[name])}`);
+  // Where it cannot be proven, nothing is read at all.
+  const unbound = await run(createFileBrowser({ handlePaths: false, hooks }));
+  for (const name of ["preview", "raw"]) assert.deepEqual(unbound[name], { status: 501, code: "PREVIEW_UNAVAILABLE" }, `${name}: ${JSON.stringify(unbound[name])}`);
+  const plain = createFileBrowser({ handlePaths: false });
+  assert.equal((await refusal(plain.preview(root, "docs/inner/guide.md"))).code, "PREVIEW_UNAVAILABLE");
+  // With nothing swapped, a proven location previews normally.
+  assert.equal((await createFileBrowser().preview(root, "docs/inner/guide.md")).text, "# Inside\n");
 });
 
 test("names that merely begin with two dots are inside the worktree", listable, async (t) => {
@@ -274,7 +309,7 @@ test("names that merely begin with two dots are inside the worktree", listable, 
   assert.deepEqual((await files.list(root, { directory: "..cache" })).entries.map((entry) => entry.path), ["..cache/entry.txt"]);
 });
 
-test("raw requests beyond the stream limit wait their turn, and only a full queue is refused", async (t) => {
+test("raw requests beyond the stream limit wait their turn, and only a full queue is refused", previewable, async (t) => {
   const { root, write } = fixture(t);
   write("logo.png", PNG);
   const files = createFileBrowser({ limits: { ...FILE_BROWSER_LIMITS, maxRawStreams: 2, maxRawQueue: 3 } });

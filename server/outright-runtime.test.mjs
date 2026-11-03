@@ -3808,14 +3808,16 @@ test("file routes browse only a discovered project worktree and serve previews f
   mkdirSync(path.join(worktree.path, "docs"));
   const at = (route, parameters) => `${route}?${new URLSearchParams(parameters)}`;
   const listed = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: worktree.path }));
-  // Windows has no handle-bound folder path, so its folders are refused.
+  // Windows has no handle-bound folder path, so its folders are refused (OUT-144).
   if (process.platform === "win32") assert.deepEqual([listed.statusCode, listed.body.code], [501, "LISTING_UNAVAILABLE"], listed.raw);
   else {
     assert.equal(listed.statusCode, 200, listed.raw);
     assert.deepEqual(listed.body.entries.map((entry) => [entry.name, entry.kind]), [["docs", "directory"], ["README.md", "file"]]);
   }
   const preview = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "README.md" }));
-  assert.deepEqual([preview.statusCode, preview.body.previewType, preview.body.text], [200, "markdown", "# Fixture\n"]);
+  // Nor can it prove where an opened file is, so files are not previewed.
+  if (process.platform === "win32") assert.deepEqual([preview.statusCode, preview.body.code], [501, "PREVIEW_UNAVAILABLE"], preview.raw);
+  else assert.deepEqual([preview.statusCode, preview.body.previewType, preview.body.text], [200, "markdown", "# Fixture\n"]);
   const missing = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "gone.md" }));
   assert.deepEqual([missing.statusCode, missing.body.code], [404, "MISSING"]);
   const outsider = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-undiscovered-")));

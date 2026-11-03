@@ -5,7 +5,7 @@
 //
 // Parsing is linear in the input: no pattern has two adjacent quantifiers
 // that can match the same text, each closer search remembers where the next
-// closer is, and pending text is joined once rather than copied per line.
+// closer is, and pending text is kept as ranges of the source, copied once.
 // Rendering is bounded too: a document that would produce more than
 // MARKDOWN_NODE_BUDGET elements (a wide table repeated over many rows, say)
 // is reported as over budget rather than parsed further.
@@ -23,9 +23,10 @@ const DELIMITER_CELL = /^:?-+:?$/;
 class OverBudget extends Error {}
 
 // Blocks for the preview. A document over the node budget returns no blocks
-// and `overBudget`, and is shown as source instead.
-export function parseMarkdownPreview(source, budget = MARKDOWN_NODE_BUDGET) {
-  const counter = { left: budget };
+// and `overBudget`, and is shown as source instead. `stats`, if given, has
+// `steps`, `scanned` and `pieces` counts added to it, measuring the work done.
+export function parseMarkdownPreview(source, budget = MARKDOWN_NODE_BUDGET, stats = null) {
+  const counter = { left: budget, stats };
   try { return { blocks: parseBlocks(splitLines(source), 0, counter), overBudget: false }; }
   catch (error) {
     if (error instanceof OverBudget) return { blocks: [], overBudget: true };
@@ -77,6 +78,7 @@ function parseBlocks(lines, depth, counter) {
   let index = 0;
   while (index < lines.length) {
     const line = lines[index];
+    if (counter.stats) counter.stats.steps += 1;
     if (!line.trim()) { index += 1; continue; }
     spend(counter, 1);
     const fence = FENCE.exec(line);
@@ -183,18 +185,39 @@ function cells(line) {
 const PUNCTUATION = /[!-/:-@[-`{-~]/;
 const SPECIAL = /[\\`\n[!<*_~]/g;
 const WORD = /[\p{L}\p{N}]/u;
+const SPACE = /\s/;
+const AUTOLINK = /<((?:https?|mailto):[^\s<>]{1,2048})>/iy;
+const DOUBLE = { "*": "**", _: "__", "~": "~~" };
 
 // `find(needle, from)` is text.indexOf(needle, from), remembering the last
 // answer per needle: a later search that starts between the remembered start
-// and its result has the same result. Searches move forward, so the total
-// scanning per needle is linear.
+// and its result has the same result. `closerAt(delimiter, from)` is the
+// first position at or after `from` where the delimiter can close, cached
+// the same way. Text is visited in order, so the total scanning per needle
+// is linear. A counter's `stats`, when given, counts the characters
+// searched, the scanner's steps and the text pieces copied.
 export function parseInline(text, counter = { left: Infinity }) {
+  const stats = counter.stats ?? null;
   const found = new Map();
   const find = (needle, from) => {
-    const last = found.get(needle);
+    let last = found.get(needle);
     if (last && from >= last.from && (last.at < 0 || from <= last.at)) return last.at;
     const at = text.indexOf(needle, from);
-    found.set(needle, { from, at });
+    if (stats) stats.scanned += (at < 0 ? text.length : at + needle.length) - from;
+    if (!last) found.set(needle, last = { from, at });
+    last.from = from;
+    last.at = at;
+    return at;
+  };
+  const closers = new Map();
+  const closerAt = (delimiter, from) => {
+    let last = closers.get(delimiter);
+    if (last && from >= last.from && (last.at < 0 || from <= last.at)) return last.at;
+    let at = find(delimiter, from);
+    while (at >= 0 && !canClose(text, delimiter, at)) at = find(delimiter, at + 1);
+    if (!last) closers.set(delimiter, last = { from, at });
+    last.from = from;
+    last.at = at;
     return at;
   };
   const destinations = new Map();
@@ -202,19 +225,40 @@ export function parseInline(text, counter = { left: Infinity }) {
     if (!destinations.has(labelEnd)) destinations.set(labelEnd, /^\(\s*<?([^\s<>()]*)>?(?:\s+"([^"\n]*)")?\s*\)/.exec(text.slice(labelEnd + 1, labelEnd + 2050)));
     return destinations.get(labelEnd);
   };
-  return inline(text, 0, text.length, { find, destinationAt, counter }, 0);
+  return inline(text, 0, text.length, { find, closerAt, destinationAt, counter, stats }, 0);
+}
+
+// A closing delimiter follows a non-space; a closing "_" is not followed by
+// a letter or digit.
+function canClose(text, delimiter, at) {
+  return !SPACE.test(text[at - 1]) && !(delimiter[0] === "_" && WORD.test(text[at + delimiter.length] ?? ""));
 }
 
 function inline(text, start, end, context, depth) {
-  const { find, destinationAt, counter } = context;
+  const { find, closerAt, destinationAt, counter, stats } = context;
   const nodes = [];
-  // Pending text, as pieces joined once, so long paragraphs stay linear.
+  // Pending text: pieces already taken, then the run from `runStart` to
+  // `index`, which is copied only when something else interrupts it.
   const parts = [];
-  const flush = () => { if (parts.length) { spend(counter, 1); nodes.push({ type: "text", value: parts.join("") }); parts.length = 0; } };
-  const push = (node) => { flush(); spend(counter, 1); nodes.push(node); };
+  let index = start;
+  let runStart = start;
+  const take = () => {
+    if (index > runStart) { parts.push(text.slice(runStart, index)); if (stats) stats.pieces += 1; }
+    runStart = index;
+  };
+  const flush = () => {
+    take();
+    if (!parts.length) return;
+    spend(counter, 1);
+    nodes.push({ type: "text", value: parts.length === 1 ? parts[0] : parts.join("") });
+    parts.length = 0;
+  };
+  // Emits a node in place of the text up to `next`.
+  const push = (node, next) => { flush(); spend(counter, 1); nodes.push(node); index = next; runStart = next; };
   // Removes trailing spaces and tabs from the pending text; returns how many
   // trailing spaces there were (two or more make a hard line break).
   const trimPending = () => {
+    take();
     let spaces = 0;
     while (parts.length) {
       const last = parts[parts.length - 1];
@@ -226,27 +270,33 @@ function inline(text, start, end, context, depth) {
     }
     return spaces;
   };
-  let index = start;
   while (index < end) {
-    // Plain text up to the next character that can start something is copied at once.
+    if (stats) stats.steps += 1;
+    // Plain text up to the next character that can start something stays in the run.
     SPECIAL.lastIndex = index;
     const next = SPECIAL.exec(text);
     const plainEnd = next ? Math.min(next.index, end) : end;
-    if (plainEnd > index) { parts.push(text.slice(index, plainEnd)); index = plainEnd; continue; }
+    if (plainEnd > index) { index = plainEnd; continue; }
     const character = text[index];
     if (character === "\\" && index + 1 < end) {
-      if (text[index + 1] === "\n") { push({ type: "break" }); index += 2; continue; }
-      if (PUNCTUATION.test(text[index + 1])) { parts.push(text[index + 1]); index += 2; continue; }
+      if (text[index + 1] === "\n") { push({ type: "break" }, index + 2); continue; }
+      // The backslash is dropped and the punctuation it escapes is text.
+      if (PUNCTUATION.test(text[index + 1])) { take(); runStart = index + 1; index += 2; continue; }
     }
     if (character === "`") {
-      const run = /^`+/.exec(text.slice(index, Math.min(end, index + 32)))[0];
-      const close = find(run, index + run.length);
-      if (close >= 0 && close < end) { push({ type: "code", value: text.slice(index + run.length, close).replace(/\n/g, " ").replace(/^ (.+) $/, "$1") }); index = close + run.length; continue; }
-      parts.push(run); index += run.length; continue;
+      let runEnd = index + 1;
+      while (runEnd < end && runEnd - index < 32 && text[runEnd] === "`") runEnd += 1;
+      const run = text.slice(index, runEnd);
+      const close = find(run, runEnd);
+      if (close >= 0 && close < end) { push({ type: "code", value: text.slice(runEnd, close).replace(/\n/g, " ").replace(/^ (.+) $/, "$1") }, close + run.length); continue; }
+      index = runEnd;
+      continue;
     }
     if (character === "\n") {
-      if (trimPending() >= 2) push({ type: "break" }); else if (parts.length || nodes.length) parts.push(" ");
+      if (trimPending() >= 2) { push({ type: "break" }, index + 1); continue; }
+      if (parts.length || nodes.length) parts.push(" ");
       index += 1;
+      runStart = index;
       continue;
     }
     if ((character === "[" || (character === "!" && text[index + 1] === "[")) && depth < MAX_DEPTH) {
@@ -258,32 +308,29 @@ function inline(text, start, end, context, depth) {
         const destination = destinationAt(labelEnd);
         if (destination && labelEnd + 1 + destination[0].length <= end) {
           const label = { url: destination[1], title: destination[2] ?? "" };
-          if (image) push({ type: "image", alt: text.slice(labelStart, labelEnd), ...label });
-          else push({ type: "link", ...label, children: inline(text, labelStart, labelEnd, context, depth + 1) });
-          index = labelEnd + 1 + destination[0].length;
+          const after = labelEnd + 1 + destination[0].length;
+          if (image) push({ type: "image", alt: text.slice(labelStart, labelEnd), ...label }, after);
+          else push({ type: "link", ...label, children: inline(text, labelStart, labelEnd, context, depth + 1) }, after);
           continue;
         }
       }
     }
     if (character === "<") {
-      const auto = /^<((?:https?|mailto):[^\s<>]+)>/i.exec(text.slice(index, Math.min(end, index + 2050)));
-      if (auto) { push({ type: "link", url: auto[1], title: "", children: [{ type: "text", value: auto[1] }] }); index += auto[0].length; continue; }
+      AUTOLINK.lastIndex = index;
+      const auto = AUTOLINK.exec(text);
+      if (auto && index + auto[0].length <= end) { push({ type: "link", url: auto[1], title: "", children: [{ type: "text", value: auto[1] }] }, index + auto[0].length); continue; }
     }
-    const delimiter = ["**", "__", "~~"].find((value) => text.startsWith(value, index)) ?? (character === "*" || character === "_" ? character : null);
-    if (delimiter && depth < MAX_DEPTH && text[index + delimiter.length] && !/\s/.test(text[index + delimiter.length])
-      && !(delimiter[0] === "_" && WORD.test(text[index - 1] ?? ""))) {
-      let close = find(delimiter, index + delimiter.length);
-      // A bounded number of rejected closers keeps "*a *a *a…" linear.
-      for (let tries = 0; close >= 0 && close < end && (/\s/.test(text[close - 1]) || (delimiter[0] === "_" && WORD.test(text[close + delimiter.length] ?? ""))); tries += 1) {
-        close = tries < 16 ? find(delimiter, close + 1) : -1;
-      }
-      if (close > index + delimiter.length && close < end) {
-        push({ type: delimiter === "~~" ? "delete" : delimiter.length === 2 ? "strong" : "emphasis", children: inline(text, index + delimiter.length, close, context, depth + 1) });
-        index = close + delimiter.length;
+    if ((character === "*" || character === "_" || character === "~") && depth < MAX_DEPTH) {
+      const delimiter = text[index + 1] === character ? DOUBLE[character] : character === "~" ? null : character;
+      const opens = delimiter && text[index + delimiter.length] && !SPACE.test(text[index + delimiter.length])
+        && !(character === "_" && WORD.test(text[index - 1] ?? ""));
+      const close = opens ? closerAt(delimiter, index + delimiter.length) : -1;
+      if (close > index + delimiter?.length && close < end) {
+        const type = delimiter === "~~" ? "delete" : delimiter.length === 2 ? "strong" : "emphasis";
+        push({ type, children: inline(text, index + delimiter.length, close, context, depth + 1) }, close + delimiter.length);
         continue;
       }
     }
-    parts.push(character);
     index += 1;
   }
   flush();

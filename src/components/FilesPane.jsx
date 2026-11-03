@@ -8,11 +8,14 @@ import { api, query } from "@/lib/runtime-api";
 
 const HIDDEN_KEY = "outright.files.show-hidden";
 const REFRESH_EVENTS = new Set(["run.completed", "run.failed", "run.stopped"]);
+// The runtime's default and largest folder page sizes.
+const PAGE_SIZE = 200;
+const MAX_PAGE_SIZE = 500;
 
 // Browses one worktree. The pane is keyed by the worktree, so nothing it
 // loaded can appear for another one; each folder's request is fenced by a
 // token, so a reload or a hidden-file change supersedes answers in flight.
-export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen, onQuickOpenHandled, onError }) {
+export function FilesPane({ project, worktree, settings, runtimeEvent, conversationIds, quickOpen, onQuickOpenHandled, onError }) {
   const [showHidden, setShowHidden] = useState(() => localStorage.getItem(HIDDEN_KEY) === "true");
   const [folders, setFolders] = useState(() => new Map());
   const [expanded, setExpanded] = useState(() => new Set());
@@ -28,14 +31,18 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen
   const treeRef = useRef(null);
   const jumpRef = useRef(null);
   const aliveRef = useRef(true);
-  useLayoutEffect(() => { foldersRef.current = folders; expandedRef.current = expanded; hiddenRef.current = showHidden; });
+  // A new onError function is not a reason to read anything again.
+  const onErrorRef = useRef(onError);
+  useLayoutEffect(() => { foldersRef.current = folders; expandedRef.current = expanded; hiddenRef.current = showHidden; onErrorRef.current = onError; });
   useEffect(() => () => { aliveRef.current = false; }, []);
 
   const reportable = (error) => error.status === 429 || (error.status >= 500 && error.payload?.code !== "LISTING_UNAVAILABLE");
 
-  // Reads a folder's first page. Each read starts a new listing generation:
-  // an older first page or a "load more" from an older listing is dropped.
-  const loadFolder = useCallback(async (directory) => {
+  // Reads a folder's first page, or with `keep`, as many pages as it takes
+  // to list that many entries again, installed together. Each read starts a
+  // new listing generation: an older read or a "load more" from an older
+  // listing is dropped. The shown entries stay until the new ones arrive.
+  const loadFolder = useCallback(async (directory, { keep = 0 } = {}) => {
     if (typeof directory !== "string") return;
     const generation = (tokensRef.current.get(directory) ?? 0) + 1;
     tokensRef.current.set(directory, generation);
@@ -43,16 +50,23 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen
     setFolders((current) => withFolder(current, directory, { ...current.get(directory), status: "loading", loadingMore: false, moreError: "" }));
     const fresh = () => aliveRef.current && tokensRef.current.get(directory) === generation;
     try {
-      const page = await api(query("/api/files", { projectId: project.id, path: worktree.path, dir: directory, hidden: hidden ? "true" : undefined }));
+      const read = (cursor) => api(query("/api/files", { projectId: project.id, path: worktree.path, dir: directory, cursor, hidden: hidden ? "true" : undefined,
+        limit: keep > PAGE_SIZE ? Math.min(keep, MAX_PAGE_SIZE) : undefined }));
+      const page = await read();
+      let entries = page.entries;
+      while (fresh() && page.nextCursor && entries.length < keep) {
+        Object.assign(page, await read(page.nextCursor));
+        entries = [...entries, ...page.entries];
+      }
       if (!fresh()) return;
-      setFolders((current) => withFolder(current, directory, { status: "loaded", generation, hidden, entries: page.entries,
+      setFolders((current) => withFolder(current, directory, { status: "loaded", generation, hidden, entries,
         nextCursor: page.nextCursor, total: page.total, hiddenCount: page.hiddenCount, truncated: page.truncated, scanLimit: page.scanLimit }));
     } catch (error) {
       if (!fresh()) return;
-      if (reportable(error)) onError(error);
+      if (reportable(error)) onErrorRef.current(error);
       setFolders((current) => withFolder(current, directory, { status: "error", error: { message: error.message, code: error.payload?.code ?? "" } }));
     }
-  }, [project.id, worktree.path, onError]);
+  }, [project.id, worktree.path]);
 
   // Reads the next page of the listing that is shown, with that listing's
   // cursor and hidden-file policy. It never supersedes a first-page read.
@@ -70,19 +84,22 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen
         nextCursor: page.nextCursor, total: page.total, hiddenCount: page.hiddenCount, truncated: page.truncated, scanLimit: page.scanLimit }) : current);
     } catch (error) {
       if (!fresh()) return;
-      if (reportable(error)) onError(error);
+      if (reportable(error)) onErrorRef.current(error);
       setFolders((current) => installed(current) ? withFolder(current, directory, { ...current.get(directory), loadingMore: false, moreError: error.message }) : current);
     }
-  }, [project.id, worktree.path, onError]);
+  }, [project.id, worktree.path]);
 
-  // Reloads the root and every open folder from their first page.
-  const reloadAll = useCallback(() => {
+  // Reloads the root and every open folder. A refresh keeps as many entries
+  // as each folder had loaded; a hidden-file change starts from page one.
+  const reloadAll = useCallback(({ keepPages = false } = {}) => {
     for (const directory of foldersRef.current.keys()) {
       if (directory && !expandedRef.current.has(directory)) tokensRef.current.set(directory, (tokensRef.current.get(directory) ?? 0) + 1);
     }
+    const loaded = foldersRef.current;
     setFolders((current) => new Map([...current].filter(([directory]) => !directory || expandedRef.current.has(directory))));
-    for (const directory of ["", ...expandedRef.current]) void loadFolder(directory);
+    for (const directory of ["", ...expandedRef.current]) void loadFolder(directory, { keep: keepPages ? loaded.get(directory)?.entries?.length ?? 0 : 0 });
   }, [loadFolder]);
+  const refresh = useCallback(() => { reloadAll({ keepPages: true }); setRefreshKey((value) => value + 1); }, [reloadAll]);
 
   useEffect(() => { void loadFolder(""); }, [loadFolder]);
   const listedHiddenRef = useRef(showHidden);
@@ -95,16 +112,18 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen
 
   const lastEventRef = useRef(runtimeEvent);
   const refreshTimerRef = useRef(null);
+  const conversationsRef = useRef(conversationIds);
+  useLayoutEffect(() => { conversationsRef.current = conversationIds; });
   useEffect(() => {
     if (!runtimeEvent || runtimeEvent === lastEventRef.current) return;
     lastEventRef.current = runtimeEvent;
-    const type = runtimeEvent.type === "run.event" ? runtimeEvent.payload?.type : runtimeEvent.type;
-    if (!REFRESH_EVENTS.has(type)) return;
-    // An agent run may have changed files; one refresh covers a burst, and
-    // later events of other kinds do not cancel it.
+    // Only a run in one of this worktree's conversations may have changed its files.
+    if (runtimeEvent.type !== "run.event" || !REFRESH_EVENTS.has(runtimeEvent.payload?.type)
+      || !conversationsRef.current?.includes(runtimeEvent.conversationId)) return;
+    // One refresh covers a burst, and later events of other kinds do not cancel it.
     clearTimeout(refreshTimerRef.current);
-    refreshTimerRef.current = setTimeout(() => { reloadAll(); setRefreshKey((value) => value + 1); }, 400);
-  }, [runtimeEvent, reloadAll]);
+    refreshTimerRef.current = setTimeout(refresh, 400);
+  }, [runtimeEvent, refresh]);
   useEffect(() => () => clearTimeout(refreshTimerRef.current), []);
 
   const rows = useMemo(() => visibleRows(folders, expanded), [folders, expanded]);
@@ -251,10 +270,10 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen
 
   return <section className="files-pane">
     <header className="pane-toolbar">
-      <div><strong>{worktree.name}</strong><span>{root?.status === "loaded" ? `${root.total} items${root.hiddenCount && !showHidden ? `, ${root.hiddenCount} hidden` : ""}` : "Files"}</span></div>
+      <div><strong>{worktree.name}</strong><span>{root?.entries ? `${root.total} items${root.hiddenCount && !showHidden ? `, ${root.hiddenCount} hidden` : ""}` : "Files"}</span></div>
       <div className="files-actions">
         <Button variant={showHidden ? "secondary" : "ghost"} size="icon-sm" aria-pressed={showHidden} aria-label="Show hidden files" title={showHidden ? "Hide dotfiles" : "Show dotfiles"} onClick={() => setShowHidden((value) => !value)}>{showHidden ? <Eye /> : <EyeSlash />}</Button>
-        <Button variant="ghost" size="icon-sm" aria-label="Refresh files" onClick={() => { reloadAll(); setRefreshKey((value) => value + 1); }}><ArrowsClockwise className={root?.status === "loading" ? "spin" : ""} /></Button>
+        <Button variant="ghost" size="icon-sm" aria-label="Refresh files" onClick={refresh}><ArrowsClockwise className={root?.status === "loading" ? "spin" : ""} /></Button>
       </div>
     </header>
     <form className="files-jump" role="search" aria-label="Go to file" onSubmit={(event) => { event.preventDefault(); openPath(jump); }}>

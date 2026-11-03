@@ -48,11 +48,13 @@ test("only http(s) and mailto links leave a preview; relative links stay inside 
 
 // Each input is close to the 1 MiB text preview limit. A quadratic step
 // takes tens of seconds on any of them; linear parsing takes milliseconds.
-test("adversarial Markdown near the preview size limit parses in linear time", () => {
+test("adversarial Markdown near the preview size limit parses with linear work and well within a frame budget", () => {
   const size = 1024 * 1024 - 64;
   const fill = (unit, tail = "") => unit.repeat(Math.floor((size - tail.length) / unit.length)) + tail;
   const inputs = {
     "unclosed emphasis": fill("*a "), "open brackets": fill("["), "backticks": fill("`"), "underscores": fill("_a "), "strong runs": fill("**"), "quotes": fill("> "),
+    "unclosed strikethrough": fill("~~a "), "mixed openers": fill("*a _b ~~c `d [e **f "), "escapes": fill("\\*"), "hard breaks": fill("a  \n"),
+    "autolink openers": fill("<http:"), "angle brackets": fill("<"),
     "brackets before a rejected link": `${fill("[", "]x](t)")}`,
     "brackets before an unclosed destination": `${fill("[", `](${"a".repeat(2000)} x`)}`,
     "rejected closers": fill("[a]x](t) "),
@@ -66,10 +68,16 @@ test("adversarial Markdown near the preview size limit parses in linear time", (
     "many short lines": fill("# h\n| a |\n- b\n> c\n"),
   };
   for (const [name, source] of Object.entries(inputs)) {
+    const stats = { steps: 0, scanned: 0, pieces: 0 };
     const started = performance.now();
-    parseMarkdownPreview(source);
+    parseMarkdownPreview(source, undefined, stats);
     const elapsed = performance.now() - started;
-    assert.ok(elapsed < 1500, `${name} took ${Math.round(elapsed)}ms`);
+    // The work is counted, so the bound holds however loaded the machine is;
+    // the clock only catches a pattern that backtracks outside the count.
+    assert.ok(stats.steps > 0 && stats.steps + stats.scanned <= 8 * source.length, `${name}: ${stats.steps} steps and ${stats.scanned} characters searched for ${source.length}`);
+    // Text is copied in runs, not a piece per character that starts nothing.
+    assert.ok(stats.pieces <= source.length / 2, `${name}: ${stats.pieces} text pieces for ${source.length} characters`);
+    assert.ok(elapsed < 4000, `${name} took ${Math.round(elapsed)}ms`);
   }
 });
 

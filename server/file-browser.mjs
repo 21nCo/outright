@@ -54,14 +54,17 @@ const RAW_HEADERS = Object.freeze({
 // opened descriptor's location is checked afterwards. O_NOFOLLOW_ANY covers
 // the last component too, and macOS rejects it combined with O_NOFOLLOW.
 const NOFOLLOW_ANY = process.platform === "darwin" ? 0x20000000 : 0;
-const NOFOLLOW = NOFOLLOW_ANY || (constants.O_NOFOLLOW ?? 0);
-const FILE_FLAGS = constants.O_RDONLY | NOFOLLOW | (constants.O_NONBLOCK ?? 0);
-const DIRECTORY_FLAGS = constants.O_RDONLY | NOFOLLOW | (constants.O_DIRECTORY ?? 0);
+function openFlags(directory, anyComponent) {
+  const nofollow = (anyComponent && NOFOLLOW_ANY) || (constants.O_NOFOLLOW ?? 0);
+  return constants.O_RDONLY | nofollow | (directory ? constants.O_DIRECTORY ?? 0 : constants.O_NONBLOCK ?? 0);
+}
 
-// `hooks.beforeOpen(real)` runs between resolving a path and opening it, and
+// `hooks.beforeInspect(real)` runs before a resolved file is inspected,
+// `hooks.beforeOpen(real)` and `hooks.afterOpen(real)` around opening it, and
 // `hooks.beforeRead` and `hooks.afterRead` around reading a folder's entries;
 // they exist so tests can replace a path component at exactly those moments.
-// `handlePaths: false` simulates a system with no handle-bound folder path.
+// `handlePaths: false` simulates a system where an opened descriptor's
+// location cannot be proven (no /proc/self/fd, /.vol or O_NOFOLLOW_ANY).
 export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, handlePaths = true } = {}) {
   let rawStreams = 0;
   const waiting = [];
@@ -234,6 +237,7 @@ async function openFile(root, relative, hooks, handlePaths) {
   try { linkInfo = await lstat(logical); } catch (error) { throw fileSystemError(error, relative, "File"); }
   const { real } = await resolveInside(root, relative);
   let info;
+  await hooks.beforeInspect?.(real);
   try { info = await lstat(real); } catch (error) { throw fileSystemError(error, relative, "File"); }
   const link = linkInfo.isSymbolicLink() ? { target: toPosix(path.relative(root, real)) } : null;
   if (info.isSymbolicLink()) throw pathChanged();
@@ -254,23 +258,24 @@ async function openFile(root, relative, hooks, handlePaths) {
 // it was resolved. macOS refuses a link anywhere in the path; Linux reads the
 // descriptor's own location from /proc. A folder is then read through that
 // descriptor (/proc/self/fd/N, or the volume's file-ID path /.vol/dev/ino on
-// macOS), never by name again. Node cannot read a folder from a descriptor,
-// so where neither path exists (Windows, a macOS volume without /.vol, Linux
-// without /proc) a folder is not listed at all: a name checked before and
-// after reading could still point elsewhere while it is read (owner decision:
-// listing there is deferred to OUT-144 and fails closed). A file is read
-// from its held descriptor, whose identity is compared with the checked path.
+// macOS), never by name again. Where the opened location cannot be proven
+// (Windows, Linux without /proc) nothing is read: a name checked before and
+// after opening or reading could still point elsewhere in between. So there
+// folders are not listed and files are not previewed, and a macOS volume
+// without /.vol lists no folders (owner decision: these platforms are
+// deferred to OUT-144 and fail closed).
 async function openVerified(root, real, relative, directory, hooks, handlePaths) {
   const noun = directory ? "Folder" : "File";
   await hooks.beforeOpen?.(real);
   let handle;
-  try { handle = await open(real, directory ? DIRECTORY_FLAGS : FILE_FLAGS); }
+  try { handle = await open(real, openFlags(directory, handlePaths)); }
   catch (error) {
     // The path was resolved without links, so a link here is a replacement.
     if (error?.code === "ELOOP") throw pathChanged();
     throw fileSystemError(error, relative, noun);
   }
   try {
+    await hooks.afterOpen?.(real);
     const procPath = `/proc/self/fd/${handle.fd}`;
     if (handlePaths && process.platform === "linux") {
       const location = await readlink(procPath).catch(() => null);
@@ -279,17 +284,15 @@ async function openVerified(root, real, relative, directory, hooks, handlePaths)
         return { handle, readPath: procPath };
       }
     }
-    if (NOFOLLOW_ANY && !directory) return { handle };
+    if (handlePaths && NOFOLLOW_ANY && !directory) return { handle };
     if (handlePaths && NOFOLLOW_ANY) {
       const info = await handle.stat({ bigint: true });
       const volumePath = `/.vol/${info.dev}/${info.ino}`;
       const usable = await stat(volumePath, { bigint: true }).then((found) => found.ino === info.ino && found.dev === info.dev, () => false);
       if (usable) return { handle, readPath: volumePath };
     }
-    if (directory) throw fileError(501, "Folder listing is unavailable on this file system, because a folder cannot be read through the handle Outright checked. Go to file still opens a file by its path", "LISTING_UNAVAILABLE");
-    const [again, now, held] = await Promise.all([realpath(real).catch(() => null), stat(real).catch(() => null), handle.stat()]);
-    if (again !== real || !now || now.ino !== held.ino || now.dev !== held.dev) throw pathChanged();
-    return { handle };
+    if (directory) throw fileError(501, "Folder listing is unavailable on this file system, because a folder cannot be read through the handle Outright checked", "LISTING_UNAVAILABLE");
+    throw fileError(501, "Previews are unavailable on this file system, because Outright cannot prove where an opened file is", "PREVIEW_UNAVAILABLE");
   } catch (error) {
     await handle.close();
     throw error;

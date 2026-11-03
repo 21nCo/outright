@@ -149,6 +149,8 @@ export function App() {
   // clears the request, so a later remount for another worktree does not.
   const [quickOpenRequest, setQuickOpenRequest] = useState(0);
   const clearQuickOpen = useCallback(() => setQuickOpenRequest(0), []);
+  // Files refreshes after a run in one of the shown worktree's conversations.
+  const worktreeConversationIds = useMemo(() => conversations.map((item) => item.id), [conversations]);
   // Setup state and output events, and checkpoint changes, reach an open
   // setup or checkpoints dialog through this.
   const [lifecycleEvents] = useState(() => new EventTarget());
@@ -2093,7 +2095,7 @@ export function App() {
     changes: <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />,
     terminal: <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} terminalsVersion={terminalsVersion} unverifiedTerminalIds={unverifiedTerminalIds} sendRuntime={sendRuntime} onError={handleError} />,
     context: <ContextPane worktree={worktree} settings={settings} onError={handleError} />,
-    files: <FilesPane key={`${project.id}:${worktree.path}`} project={project} worktree={worktree} settings={settings} runtimeEvent={runtimeEvent} quickOpen={quickOpenRequest} onQuickOpenHandled={clearQuickOpen} onError={handleError} />,
+    files: <FilesPane key={`${project.id}:${worktree.path}`} project={project} worktree={worktree} settings={settings} runtimeEvent={runtimeEvent} conversationIds={worktreeConversationIds} quickOpen={quickOpenRequest} onQuickOpenHandled={clearQuickOpen} onError={handleError} />,
   };
 
   return <div className={`app-shell ${sidebarOpen ? "sidebar-is-open" : "sidebar-is-closed"}`}>

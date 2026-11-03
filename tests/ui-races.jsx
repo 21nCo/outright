@@ -8974,9 +8974,11 @@ async function filesPaneRegression() {
   const unnamed = { name: "caf\uFFFD", path: null, kind: "directory", hidden: false };
   const rootEntries = (hidden) => [entry("docs", "directory"), entry("flaky", "directory"), entry("many", "directory"), unnamed, ...(hidden ? [entry(".env")] : []), entry("app.bin"),
     entry("escape.txt", "symlink", { target: { state: "outside" } }), entry("huge.log"), entry("notes.md"), entry("report.pdf"), entry("slow.md")];
-  const pdf = new TextEncoder().encode(["%PDF-1.4", "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj", "2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj",
+  const pdf = new TextEncoder().encode(["%PDF-1.4", "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj", "2 0 obj<</Type/Pages/Kids[3 0 R 6 0 R]/Count 2>>endobj",
     "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj",
     "4 0 obj<</Length 40>>stream", "BT /F1 18 Tf 20 40 Td (Hello PDF) Tj ET", "endstream endobj", "5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj",
+    "6 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Contents 7 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj",
+    "7 0 obj<</Length 41>>stream", "BT /F1 18 Tf 20 40 Td (Second PDF) Tj ET", "endstream endobj",
     "trailer<</Root 1 0 R>>", "%%EOF"].join("\n"));
   const markdown = "# Fixture notes\n\n<script>window.outrightFilesInjected = 1</script>\n<img src=x onerror=\"window.outrightFilesInjected = 2\">\n\n[unsafe](javascript:window.outrightFilesInjected=3) [site](https://example.com) [guide](docs/guide.md)\n\n![logo](logo.png) ![tracker](https://tracker.example/p.png) ![gone image](gone.png)\n";
   const previews = {
@@ -9153,10 +9155,10 @@ async function filesPaneRegression() {
 
     // A PDF is drawn by the viewer, with its text beside the page.
     row("report.pdf").click();
-    await until(() => preview()?.querySelector(".pdf-toolbar [role=status]")?.textContent === "Page 1 of 1", "the PDF did not open", 15_000);
+    await until(() => preview()?.querySelector(".pdf-toolbar [role=status]")?.textContent === "Page 1 of 2", "the PDF did not open", 15_000);
     await until(() => preview().querySelector(".pdf-text p")?.textContent.includes("Hello PDF"), "the PDF page text was not offered");
     const canvas = preview().querySelector(".pdf-frame canvas");
-    assert(canvas.width > 0 && canvas.getAttribute("aria-label") === "Page 1 of 1 of report.pdf", "the PDF page was not drawn with a label");
+    assert(canvas.width > 0 && canvas.getAttribute("aria-label") === "Page 1 of 2 of report.pdf", "the PDF page was not drawn with a label");
     assert(liveWorkers === 1, `the open PDF has ${liveWorkers} workers`);
 
     // Explicit states for what cannot be shown.
@@ -9184,12 +9186,17 @@ async function filesPaneRegression() {
     toggle.click();
     await until(() => row(".env") && toggle.getAttribute("aria-pressed") === "true", "turning on hidden files did not show the dotfile");
     assert(listed("").at(-1).hidden === "true" && listed("docs").at(-1).hidden === "true", "hidden files were not requested for every open folder");
-    // A run's completion rereads open folders, even when other events follow it at once.
+    // A run in another worktree's conversation reads nothing.
+    const show = (runtimeEvent) => root.render(<TooltipProvider><FilesPane project={project} worktree={worktree} settings={{ editor: "zed" }} runtimeEvent={runtimeEvent}
+      conversationIds={["chat-A"]} onError={(error) => errors.push(error)} /></TooltipProvider>);
+    const quietReads = requests.length;
+    show({ type: "run.event", conversationId: "chat-B", runId: "run-b", payload: { type: "run.completed" } });
+    await remainsTrue(() => requests.length === quietReads, 700, "a run in another worktree refreshed Files");
+    // This worktree's run completion rereads open folders, even when other events follow it at once.
     const rootReads = listed("").length;
-    const show = (runtimeEvent) => root.render(<TooltipProvider><FilesPane project={project} worktree={worktree} settings={{ editor: "zed" }} runtimeEvent={runtimeEvent} onError={(error) => errors.push(error)} /></TooltipProvider>);
-    show({ type: "run.completed", payload: { runId: "run-1" } });
+    show({ type: "run.event", conversationId: "chat-A", runId: "run-1", payload: { type: "run.completed" } });
     await settle();
-    show({ type: "run.event", payload: { type: "message.delta" } });
+    show({ type: "run.event", conversationId: "chat-A", runId: "run-1", payload: { type: "message.delta" } });
     await until(() => listed("").length > rootReads && listed("docs").length > listedDocs + 2, "a completed run did not refresh the open folders");
 
     // While a folder's first page reloads, its old "load more" waits: the old
@@ -9225,6 +9232,33 @@ async function filesPaneRegression() {
     nextPage.resolve();
     gates.delete("/api/files:many:more");
     await remainsTrue(() => !row("item-200.txt") && moreRow()?.textContent === "Load 50 more of 50", 150, "a page from the replaced listing was appended");
+
+    // A refresh after this worktree's run keeps every loaded page, the
+    // focused row, and an unchanged PDF on the page being read.
+    moreRow().click();
+    await until(() => row("item-249.txt") && !moreRow(), "the large folder's last page did not load");
+    row("report.pdf").click();
+    await until(() => preview()?.querySelector(".pdf-toolbar [role=status]")?.textContent === "Page 1 of 2", "the PDF did not reopen", 15_000);
+    preview().querySelector('button[aria-label="Next page"]').click();
+    await until(() => preview().querySelector(".pdf-toolbar [role=status]")?.textContent === "Page 2 of 2" && preview().querySelector(".pdf-text p")?.textContent.includes("Second PDF"), "the PDF did not turn to its second page");
+    const pdfCanvas = preview().querySelector(".pdf-frame canvas");
+    const rawReads = () => requests.filter((request) => request.route === "/api/files/raw").length;
+    const previewReads = () => requests.filter((request) => request.route === "/api/files/preview").length;
+    const [rawBefore, previewBefore, manyBefore] = [rawReads(), previewReads(), listed("many").length];
+    row("item-249.txt").focus();
+    await until(() => document.activeElement === row("item-249.txt"), "the last loaded entry did not take focus");
+    const manyGate = deferred();
+    gates.set("/api/files:many", manyGate);
+    show({ type: "run.event", conversationId: "chat-A", runId: "run-2", payload: { type: "run.completed" } });
+    await until(() => listed("many").length === manyBefore + 1 && previewReads() === previewBefore + 1, "a completed run did not refresh the folder and the preview");
+    // While the folder rereads, what was shown stays.
+    assert(row("item-249.txt") && document.activeElement === row("item-249.txt"), "the refreshing folder dropped its loaded entries or focus");
+    manyGate.resolve();
+    gates.delete("/api/files:many");
+    await until(() => listed("many").length === manyBefore + 2 && tree().getAttribute("aria-busy") === "false" && listed("many").at(-1).cursor === "page-2", "the refresh did not reread the loaded pages");
+    await remainsTrue(() => row("item-249.txt") && !moreRow() && document.activeElement === row("item-249.txt"), 150, "the refresh lost loaded pages or the focused row");
+    assert(preview().querySelector(".pdf-toolbar [role=status]")?.textContent === "Page 2 of 2" && preview().querySelector(".pdf-frame canvas") === pdfCanvas, "the refresh reopened an unchanged PDF");
+    assert(rawReads() === rawBefore, "the refresh downloaded an unchanged PDF again");
     assert(!errors.length, `the pane reported errors: ${errors.map((error) => error.message).join("; ")}`);
 
     // Where folders cannot be read through a checked handle, the tree says

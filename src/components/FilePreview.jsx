@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { ArrowSquareOut, ArrowsClockwise, FileX, LinkBreak, Prohibit, SpinnerGap, WarningCircle } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { MarkdownView } from "@/components/MarkdownView";
@@ -8,20 +8,32 @@ import { api, query } from "@/lib/runtime-api";
 const PdfPreview = lazy(() => import("@/components/PdfPreview"));
 
 // Shows one worktree file. Each response is checked against the file it was
-// asked for, so a slow answer for an earlier selection is never shown.
+// asked for, so a slow answer for an earlier selection is never shown. A
+// refresh keeps the shown preview until its answer arrives, and keeps it
+// as it is (scroll, PDF page) when the file's version has not changed.
 export function FilePreview({ project, worktree, file, refreshKey, settings, onNavigate, onFolder, onRefreshFolder, onError }) {
   const [state, setState] = useState({ status: "loading", file });
   const [mode, setMode] = useState("rendered");
   const [mediaFailed, setMediaFailed] = useState(false);
   const [retry, setRetry] = useState(0);
   const target = { projectId: project.id, path: worktree.path };
+  // What the effect below may keep: the preview shown at the last render,
+  // unless its image or PDF failed and needs a fresh start.
+  const shownRef = useRef(null);
+  shownRef.current = state.status === "ready" && state.file === file && !mediaFailed ? state : null;
 
   useEffect(() => {
     let current = true;
-    setState({ status: "loading", file });
-    setMediaFailed(false);
+    const shown = shownRef.current;
+    const background = Boolean(shown);
+    if (!background) { setState({ status: "loading", file }); setMediaFailed(false); }
     api(query("/api/files/preview", { ...target, file }))
-      .then((preview) => { if (current) setState({ status: "ready", file, preview }); })
+      .then((preview) => {
+        if (!current) return;
+        if (background && preview.version === shown.preview.version && preview.previewType === shown.preview.previewType) return;
+        setMediaFailed(false);
+        setState({ status: "ready", file, preview });
+      })
       .catch((error) => {
         if (!current) return;
         if (error.payload?.code === "IS_DIRECTORY") { onFolder?.(file); return; }
@@ -44,6 +56,7 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
       LINK_LOOP: [LinkBreak, `${file} is a link that points back to itself.`, null],
       EXCLUDED: [Prohibit, "Git metadata is not shown in Files.", null],
       UNREADABLE: [Prohibit, `${file} cannot be read with your permissions.`, null],
+      PREVIEW_UNAVAILABLE: [Prohibit, "Previews are unavailable on this file system, because Outright cannot prove that an opened file is inside this worktree.", editorButton],
     }[state.code] ?? [WarningCircle, `${file} could not be previewed: ${state.message}`, <Button key="retry" variant="outline" size="xs" onClick={reload}><ArrowsClockwise />Retry</Button>];
     return <section className="file-preview" aria-label={`Preview of ${name}`}><div className="preview-state" role="alert"><Icon /><p>{text}</p>{action}</div></section>;
   }
