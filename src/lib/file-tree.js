@@ -37,16 +37,22 @@ export function visibleRows(folders, expanded) {
     if (folder.status === "error" && folder.error?.code === "LISTING_UNAVAILABLE") { rows.push({ id: `unavailable:${directory}`, type: "unavailable", directory, level, error: folder.error }); return; }
     if (folder.status === "error") { rows.push({ id: `error:${directory}`, type: "error", directory, level, error: folder.error }); return; }
     if (!folder.entries.length) rows.push({ id: `empty:${directory}`, type: "empty", directory, level, hiddenCount: folder.hiddenCount });
+    // What follows the shown entries, as the server counted it with the
+    // last page; unknown (null) without that count. The folder's total
+    // can mix generations once later pages are added to earlier ones.
+    let remaining = 0;
+    if (folder.nextCursor) remaining = Number.isInteger(folder.remaining) && folder.remaining >= 0 ? folder.remaining : null;
+    const setSize = remaining === null ? folder.entries.length : folder.entries.length + remaining;
     folder.entries.forEach((entry, index) => {
       const expandable = isExpandable(entry);
       const open = expandable && expanded.has(entry.path) && !visited.has(entry.path);
       rows.push({ id: entryRowId(directory, entry), type: "entry", entry, directory, level, expandable, open,
-        setSize: Math.max(folder.total, folder.entries.length), position: index + 1 });
+        setSize, position: index + 1 });
       if (open) visit(entry.path, level + 1);
     });
     // While the first page reloads, the old cursor belongs to a listing that
     // is being replaced, so "load more" waits for the new one.
-    if (folder.nextCursor) rows.push({ id: `more:${directory}`, type: "more", directory, level, loading: Boolean(folder.loadingMore) || folder.status === "loading", error: folder.moreError, remaining: folder.total - folder.entries.length });
+    if (folder.nextCursor) rows.push({ id: `more:${directory}`, type: "more", directory, level, loading: Boolean(folder.loadingMore) || folder.status === "loading", error: folder.moreError, remaining });
     if (folder.truncated) rows.push({ id: `truncated:${directory}`, type: "truncated", directory, level, limit: folder.scanLimit });
   };
   visit("", 1);

@@ -34,13 +34,16 @@ const IMAGES = Object.freeze({
   ".jpeg": ["image/jpeg", (bytes) => startsWith(bytes, [0xff, 0xd8, 0xff])],
   ".gif": ["image/gif", (bytes) => ascii(bytes, 0, 6) === "GIF87a" || ascii(bytes, 0, 6) === "GIF89a"],
   ".webp": ["image/webp", (bytes) => ascii(bytes, 0, 4) === "RIFF" && ascii(bytes, 8, 12) === "WEBP"],
-  ".avif": ["image/avif", (bytes) => ascii(bytes, 4, 8) === "ftyp" && /^avi[fs]$/.test(ascii(bytes, 8, 12))],
+  ".avif": ["image/avif", isAvif],
   ".bmp": ["image/bmp", (bytes) => ascii(bytes, 0, 2) === "BM"],
   ".ico": ["image/x-icon", (bytes) => startsWith(bytes, [0x00, 0x00, 0x01, 0x00])],
   // SVG can carry script. It is only ever shown through <img>, which runs
   // none, and its raw response is sandboxed should it be opened directly.
-  ".svg": ["image/svg+xml", (bytes) => !bytes.includes(0) && /<svg[\s>]/i.test(bytes.toString("utf8"))],
+  ".svg": ["image/svg+xml", isSvg],
 });
+// The first element of an SVG may follow a long prolog (comments, a DOCTYPE
+// with its own declarations), so more of an .svg file is read to find it.
+const SVG_SAMPLE_BYTES = 1024 * 1024;
 // A raw response cannot run script, load anything, or be embedded by
 // another site, even if it is opened as a top-level page.
 const RAW_HEADERS = Object.freeze({
@@ -132,6 +135,10 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
       entries: listed,
       nextCursor: remaining.length > page.length && last ? encodeCursor(last) : null,
       total: visible.length,
+      // How many entries follow this page in the folder as it is now. A
+      // client adding this page to earlier ones counts what is left from
+      // this, not from a total its earlier pages may no longer match.
+      remaining: remaining.length - page.length,
       hiddenCount,
       truncated,
       scanLimit: limits.maxScanEntries,
@@ -236,7 +243,7 @@ function describe(relative, opened, kind) {
 async function classify(relative, { handle, info }, limits, withText) {
   if (!handle) return { previewType: "unsupported", reason: "This is not a regular file" };
   const extension = path.extname(relative).toLowerCase();
-  const sample = await readBytes(handle, Math.min(info.size, limits.sampleBytes));
+  const sample = await readBytes(handle, Math.min(info.size, extension === ".svg" ? Math.max(limits.sampleBytes, SVG_SAMPLE_BYTES) : limits.sampleBytes));
   const image = IMAGES[extension];
   if (image) {
     if (!image[1](sample)) return { previewType: "unsupported", reason: `The contents are not a ${extension.slice(1).toUpperCase()} image` };
@@ -441,6 +448,58 @@ async function readBytes(handle, length) {
 }
 
 function fileVersion(info) { return [info.size, info.mtimeNs, info.ctimeNs, info.ino, info.dev].map((value) => value.toString(36)).join("-"); }
+// An AVIF file starts with an ftyp box naming avif or avis as its major
+// brand or as one of its compatible brands (a major brand may be mif1).
+function isAvif(bytes) {
+  if (ascii(bytes, 4, 8) !== "ftyp") return false;
+  const size = Math.min(bytes.readUInt32BE(0), bytes.length);
+  const brands = [ascii(bytes, 8, 12)];
+  for (let offset = 16; offset + 4 <= size; offset += 4) brands.push(ascii(bytes, offset, offset + 4));
+  return brands.some((brand) => brand === "avif" || brand === "avis");
+}
+// An SVG's first element is <svg> (or a prefixed svg element), after only
+// a byte order mark, an XML declaration, processing instructions, comments,
+// a DOCTYPE and white space. Text whose first element is anything else, or
+// whose prolog runs past what was read, is not taken for an SVG.
+function isSvg(bytes) {
+  if (bytes.includes(0)) return false;
+  const text = bytes.toString("utf8");
+  let at = text.charCodeAt(0) === 0xfeff ? 1 : 0;
+  const skip = (pattern) => {
+    pattern.lastIndex = at;
+    const match = pattern.exec(text);
+    if (!match) return false;
+    at = pattern.lastIndex;
+    return true;
+  };
+  for (;;) {
+    if (skip(/\s+/y)) continue;
+    if (text.startsWith("<?", at)) { if (!skip(/<\?[\s\S]*?\?>/y)) return false; continue; }
+    if (text.startsWith("<!--", at)) { if (!skip(/<!--[\s\S]*?-->/y)) return false; continue; }
+    if (/^<!DOCTYPE/i.test(text.slice(at, at + 9))) { at = doctypeEnd(text, at + 9); if (at < 0) return false; continue; }
+    return /^<(?:[A-Za-z_][\w.-]*:)?svg[\s/>]/.test(text.slice(at, at + 256));
+  }
+}
+// Where a DOCTYPE ends: its first ">" outside quotes and outside its
+// internal subset ("[...]", whose comments are skipped), or -1 when the
+// text ends first. One pass.
+function doctypeEnd(text, from) {
+  let quote = "";
+  let subset = false;
+  for (let index = from; index < text.length; index += 1) {
+    const char = text[index];
+    if (quote) { if (char === quote) quote = ""; }
+    else if (subset && text.startsWith("<!--", index)) {
+      const end = text.indexOf("-->", index + 4);
+      if (end < 0) return -1;
+      index = end + 2;
+    } else if (char === '"' || char === "'") quote = char;
+    else if (char === "[" && !subset) subset = true;
+    else if (char === "]" && subset) subset = false;
+    else if (char === ">" && !subset) return index + 1;
+  }
+  return -1;
+}
 function startsWith(bytes, prefix) { return bytes.length >= prefix.length && prefix.every((value, index) => bytes[index] === value); }
 function ascii(bytes, start, end) { return bytes.length >= end ? bytes.toString("latin1", start, end) : ""; }
 function toPosix(value) { return value.split(path.sep).join("/"); }

@@ -49,6 +49,13 @@ async function until(check, label, timeoutMs = 5000) {
     await frame();
   }
 }
+async function untilAsync(check, label, timeoutMs = 5000) {
+  const deadline = performance.now() + timeoutMs;
+  while (!(await check())) {
+    if (performance.now() > deadline) throw new Error(`Timed out: ${label}; page ${document.visibilityState}`);
+    await frame();
+  }
+}
 async function remainsTrue(check, durationMs, label) {
   const deadline = performance.now() + durationMs;
   while (performance.now() < deadline) {
@@ -9075,6 +9082,76 @@ async function filesPdfLibraryLoadRegression() {
   return true;
 }
 
+// The worker pdf.js parses in is started by the viewer. A worker script that
+// fails to load fails the document with Retry, and Retry asks for the
+// script again; pdf.js never falls back to parsing on the page's main
+// thread, and each worker ends with its preview.
+const PDF_WORKER_SCRIPT = "/node_modules/pdfjs-dist/build/pdf.worker.min.mjs";
+const fixtureRequests = async (pathname) => (await (await originalFetch(`/__fixture/requests?path=${encodeURIComponent(pathname)}`)).json()).count;
+async function filesPdfWorkerLoadRegression() {
+  root.render(null);
+  await settle();
+  const NativeWorker = window.Worker;
+  const started = [];
+  let liveWorkers = 0;
+  window.Worker = class CountedWorker extends NativeWorker {
+    constructor(url, options) {
+      super(url, options);
+      liveWorkers += 1;
+      started.push({ url: String(url), type: options?.type });
+      const terminate = this.terminate.bind(this);
+      let ended = false;
+      this.terminate = () => { if (!ended) { ended = true; liveWorkers -= 1; } terminate(); };
+    }
+  };
+  let fixture = pdfFixture();
+  try {
+    // A PDF opens first, so the viewer, pdf.js and the worker's address are
+    // loaded and the failures below reach only the worker script.
+    await until(fixture.pdfRow, "the worktree root was not listed");
+    fixture.pdfRow().click();
+    await until(() => fixture.pageStatus() === "Page 1 of 2", `the PDF did not open before the worker failed: ${fixture.alertText()}`, 15_000);
+    root.render(null);
+    await settle();
+    await until(() => liveWorkers === 0, "closing the first PDF did not end its worker");
+    // Two failures: the first start and its first Retry both fail.
+    await failModule(PDF_WORKER_SCRIPT, 2);
+    fixture = pdfFixture();
+    const { errors, alertText, retry, pdfRow } = fixture;
+    await until(pdfRow, "the worktree root was not listed again");
+    let scriptRequests = await fixtureRequests(PDF_WORKER_SCRIPT);
+    pdfRow().click();
+    await until(() => /report\.pdf could not be read/.test(alertText()) && retry(), "a worker that did not load was not reported with Retry", 15_000);
+    assert(/report\.pdf could not be read: The PDF reader did not start/.test(alertText()), `a worker that did not load was reported as something else: ${alertText()}`);
+    assert(fixture.workspaceStays() && !errors.length, "a worker that did not load took down the workspace");
+    assert(liveWorkers === 0, `a worker that did not load was left running (${liveWorkers})`);
+    assert(await fixtureRequests(PDF_WORKER_SCRIPT) > scriptRequests, "opening the PDF did not ask for the worker script");
+    // The first Retry asks again and fails again; the second starts it.
+    scriptRequests = await fixtureRequests(PDF_WORKER_SCRIPT);
+    retry().click();
+    await untilAsync(async () => await fixtureRequests(PDF_WORKER_SCRIPT) > scriptRequests && /The PDF reader did not start/.test(alertText()) && Boolean(retry()),
+      `Retry did not ask for the worker script again: ${alertText()}`, 15_000);
+    assert(liveWorkers === 0 && fixture.workspaceStays() && !errors.length, "a second worker failure left a worker or took down the workspace");
+    scriptRequests = await fixtureRequests(PDF_WORKER_SCRIPT);
+    retry().click();
+    await until(() => fixture.pageStatus() === "Page 1 of 2", `Retry did not start the worker: ${alertText()}`, 15_000);
+    assert(await fixtureRequests(PDF_WORKER_SCRIPT) > scriptRequests, "the worker that started was not asked for afresh");
+    assert(!alertText() && !errors.length, "the started worker still reported a failure");
+    // The document parses in a module worker, never on the page's main thread.
+    assert(liveWorkers === 1 && started.at(-1).type === "module" && new URL(started.at(-1).url).pathname === PDF_WORKER_SCRIPT, `the PDF is not in one module worker: ${JSON.stringify(started)}`);
+    assert(!("pdfjsWorker" in window), "pdf.js loaded its worker on the main thread");
+    root.render(null);
+    await settle();
+    await until(() => liveWorkers === 0, "closing the PDF did not end its worker");
+  } finally {
+    await failModule(PDF_WORKER_SCRIPT, 0);
+    window.Worker = NativeWorker;
+    root.render(null);
+    await settle();
+  }
+  return true;
+}
+
 async function filesPaneRegression() {
   root.render(null);
   await settle();
@@ -9122,8 +9199,8 @@ async function filesPaneRegression() {
         return response({ directory: "flaky", entries: [{ name: "steady.txt", path: "flaky/steady.txt", kind: "file", hidden: false }], nextCursor: null, total: 1, hiddenCount: 0, truncated: false });
       }
       const manyHidden = hidden ? [{ name: ".many-cache", path: "many/.many-cache", kind: "file", hidden: true }] : [];
-      if (parameters.dir === "many") return response(parameters.cursor ? { entries: many.slice(200), nextCursor: null, total: 250 + manyHidden.length, hiddenCount: 1, truncated: false }
-        : { entries: [...manyHidden, ...many.slice(0, 200)], nextCursor: "page-2", total: 250 + manyHidden.length, hiddenCount: 1, truncated: false });
+      if (parameters.dir === "many") return response(parameters.cursor ? { entries: many.slice(200), nextCursor: null, total: 250 + manyHidden.length, remaining: 0, hiddenCount: 1, truncated: false }
+        : { entries: [...manyHidden, ...many.slice(0, 200)], nextCursor: "page-2", total: 250 + manyHidden.length, remaining: 50, hiddenCount: 1, truncated: false });
     }
     if (url.pathname === "/api/editor/open") return response({ ok: true });
     if (url.pathname === "/api/files/preview") {
@@ -10839,6 +10916,7 @@ try {
     ["responsive focus", responsiveFocusRegression, "narrow drawer and one-at-a-time panes contain and restore focus", "responsive transition requires the CDP viewport bridge"],
     ["files pdf viewer load", filesPdfViewerLoadRegression, "a PDF viewer that does not load is reported in the preview with Retry, Refresh files and Retry load it again, and the rest of the workspace stays"],
     ["files pdf library load", filesPdfLibraryLoadRegression, "a pdf.js library that does not load is reported in the preview, and Retry loads it without a page reload"],
+    ["files pdf worker load", filesPdfWorkerLoadRegression, "a pdf.js worker that does not load is reported in the preview, Retry starts a new one without a page reload, and no PDF parses on the main thread"],
     ["files pane", filesPaneRegression, "folders load lazily and page, the tree is keyboard navigable, hidden files are a control, previews never run their content, and missing, outside, oversized and unsupported files say so"],
     ["files quick open", filesQuickOpenRegression, "Cmd/Ctrl+P shows Files and focuses Go to file with its text selected, from a closed, open or compact Files pane", "the compact layout requires the CDP viewport bridge"],
     ["narrow toolbar", narrowToolbarRegression, "at 320px with the sidebar closed every toolbar action stays inside the window, with and without a lifecycle chip, and the Panes menu toggles panes", "toolbar geometry requires the CDP viewport bridge"],

@@ -11,10 +11,12 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 const FIXTURE_PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da63f8ffff3f0005fe02fea7d6a4a70000000049454e44ae426082", "hex");
 // A step may also serve another PNG name (/__fixture/raw?serve=late.png),
 // count its reads (/__fixture/raw?reads=late.png), and fail the next loads
-// of an app module (/__fixture/fail-module?path=/src/x.jsx&times=1).
+// of an app module (/__fixture/fail-module?path=/src/x.jsx&times=1), and
+// count the requests for any address (/__fixture/requests?path=/src/x.jsx).
 const servedPngs = new Set(["logo.png", "docs/logo.png"]);
 const pngReads = new Map();
 const failingModules = new Map();
+const requestCounts = new Map();
 const fixtureRawFiles = {
   name: "ui-races-raw-files",
   configureServer(server) {
@@ -28,11 +30,17 @@ const fixtureRawFiles = {
         response.end(JSON.stringify({ reads: counted ? pngReads.get(counted) ?? [] : [] }));
         return;
       }
+      if (url.pathname === "/requests") {
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({ count: requestCounts.get(url.searchParams.get("path")) ?? 0 }));
+        return;
+      }
       if (url.pathname === "/fail-module") failingModules.set(url.searchParams.get("path"), Number(url.searchParams.get("times") ?? 1));
       response.end("ok");
     });
     server.middlewares.use((request, response, next) => {
       const pathname = new URL(request.url, "http://fixture").pathname;
+      requestCounts.set(pathname, (requestCounts.get(pathname) ?? 0) + 1);
       const left = failingModules.get(pathname) ?? 0;
       if (left <= 0) { next(); return; }
       failingModules.set(pathname, left - 1);

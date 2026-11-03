@@ -73,7 +73,13 @@ test("a large folder pages without repeats or gaps while it changes, and stops s
   const files = createFileBrowser();
   const first = await files.list(root, { directory: "many" });
   assert.equal(first.entries.length, FILE_BROWSER_LIMITS.pageSize);
-  assert.equal(first.total, 450);
+  assert.deepEqual([first.total, first.remaining], [450, 250]);
+  // After 199 listed entries are deleted, the next page still counts what
+  // follows it exactly; the folder's total alone would say -149.
+  for (let index = 1; index < 200; index += 1) rmSync(path.join(root, "many", `file-${String(index).padStart(3, "0")}.txt`));
+  const after = await files.list(root, { directory: "many", cursor: first.nextCursor });
+  assert.deepEqual([after.total, after.entries.length, after.remaining, first.entries.length + after.entries.length - after.total], [251, 200, 50, 149]);
+  for (let index = 1; index < 200; index += 1) write(`many/file-${String(index).padStart(3, "0")}.txt`, "");
   // Entries added before the cursor and removed after it change only what is left to page.
   write("many/file-000a.txt", "");
   rmSync(path.join(root, "many", "file-449.txt"));
@@ -82,6 +88,7 @@ test("a large folder pages without repeats or gaps while it changes, and stops s
   while (cursor) {
     const page = await files.list(root, { directory: "many", cursor });
     names.push(...page.entries.map((entry) => entry.name));
+    if (!page.nextCursor) assert.equal(page.remaining, 0);
     cursor = page.nextCursor;
   }
   const expected = Array.from({ length: 449 }, (_, index) => `file-${String(index).padStart(3, "0")}.txt`);
@@ -146,6 +153,21 @@ test("previews return text only for UTF-8 text, verify image and PDF contents, a
   assert.deepEqual([(await preview("logo.png")).previewType, (await preview("logo.png")).mimeType, (await preview("logo.png")).text], ["image", "image/png", undefined]);
   assert.deepEqual([(await preview("fake.png")).previewType, (await preview("fake.png")).reason], ["unsupported", "The contents are not a PNG image"]);
   assert.equal((await preview("icon.svg")).previewType, "image");
+  // An SVG's first element may follow a prolog longer than the usual sample,
+  // and an AVIF may name avif only among its compatible brands.
+  for (const [name, content, type] of [
+    ["long-prolog.svg", `<?xml version="1.0"?>\n<!-- ${"x".repeat(20_000)} -->\n<!DOCTYPE svg [ <!-- it's > here --> <!ENTITY a "]>"> ]>\n<svg:svg xmlns:svg="http://www.w3.org/2000/svg"/>`, "image"],
+    ["bom.svg", "\uFEFF<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>", "image"],
+    ["page.svg", "<!DOCTYPE html><html><body><svg></svg></body></html>", "unsupported"],
+    ["unclosed.svg", `<!-- ${"x".repeat(20_000)}`, "unsupported"],
+    ["mif1.avif", Buffer.concat([Buffer.from([0, 0, 0, 28]), Buffer.from("ftypmif1\0\0\0\0mif1miafavif"), Buffer.alloc(16)]), "image"],
+    ["heic.avif", Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from("ftypheic\0\0\0\0mif1heic"), Buffer.alloc(16)]), "unsupported"],
+    // A brand past the end of the ftyp box is not one of its brands.
+    ["short-box.avif", Buffer.concat([Buffer.from([0, 0, 0, 20]), Buffer.from("ftypmif1\0\0\0\0mif1avif"), Buffer.alloc(16)]), "unsupported"],
+  ]) {
+    write(name, content);
+    assert.equal((await preview(name)).previewType, type, name);
+  }
   assert.equal((await preview("doc.pdf")).previewType, "pdf");
   assert.equal((await preview("fake.pdf")).previewType, "unsupported");
   assert.deepEqual([(await preview("app.bin")).previewType, (await preview("latin1.txt")).reason], ["unsupported", "The contents are not UTF-8 text"]);

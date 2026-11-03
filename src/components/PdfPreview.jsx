@@ -3,6 +3,7 @@ import { ArrowsClockwise, CaretLeft, CaretRight, SpinnerGap, WarningCircle } fro
 import { Button } from "@/components/ui/button";
 import { retryingImport } from "@/lib/module-retry";
 import { pdfCanvasSize } from "@/lib/pdf-canvas";
+import { pdfWorkerStarter } from "@/lib/pdf-worker";
 
 const MAX_PAGE_TEXT = 100_000;
 
@@ -17,6 +18,9 @@ const assetUrl = (folder) => new URL(`${PDF_ASSETS}${folder}/`, window.location.
 // reported like a document that cannot be read, and Retry loads it afresh.
 const loadPdfjs = retryingImport(() => import("pdfjs-dist"));
 const loadWorkerUrl = retryingImport(() => import("pdfjs-dist/build/pdf.worker.min.mjs?url"));
+
+// Each document gets its own worker, started here (see pdf-worker.js).
+const startWorker = pdfWorkerStarter();
 // A document that fails to load is reported through onFailed, so the
 // preview offers Retry and a refresh opens it afresh. A page that fails to
 // draw offers its own Retry, and is drawn again on the next refresh.
@@ -37,14 +41,19 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
   useEffect(() => {
     let cancelled = false;
     let task;
+    let started;
+    let port;
     setPdfState({ status: "loading" });
     setPage(1);
     (async () => {
-      const [pdfjs, worker] = await Promise.all([loadPdfjs(), loadWorkerUrl()]);
+      const [pdfjs, script] = await Promise.all([loadPdfjs(), loadWorkerUrl()]);
       // Unmounted or reopened while the viewer loaded: start nothing.
       if (cancelled) return;
-      pdfjs.GlobalWorkerOptions.workerSrc = worker.default;
-      task = pdfjs.getDocument({ url, isEvalSupported: false, enableXfa: false, withCredentials: false, disableAutoFetch: true,
+      started = startWorker(script.default);
+      await started.ready;
+      if (cancelled) return;
+      port = new pdfjs.PDFWorker({ port: started.worker });
+      task = pdfjs.getDocument({ url, worker: port, isEvalSupported: false, enableXfa: false, withCredentials: false, disableAutoFetch: true,
         cMapUrl: assetUrl("cmaps"), cMapPacked: true, standardFontDataUrl: assetUrl("standard_fonts"), wasmUrl: assetUrl("wasm"), iccUrl: assetUrl("iccs") });
       const pdf = await task.promise;
       if (!cancelled) setPdfState({ status: "ready", pdf, pages: pdf.numPages });
@@ -54,9 +63,14 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
       setPdfState({ status: "error", message });
       onFailedRef.current?.(message);
     });
-    // Destroying the loading task ends its worker and document, whether the
-    // document is still loading or already shown.
-    return () => { cancelled = true; void task?.destroy(); };
+    // Closing, replacing or failing ends the document, then its worker,
+    // which pdf.js does not end for a port it was given. A worker that does
+    // not answer within a few seconds is ended anyway.
+    return () => {
+      cancelled = true;
+      const ended = task ? Promise.race([task.destroy().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 3000))]) : Promise.resolve();
+      void ended.then(() => { port?.destroy(); started?.worker.terminate(); });
+    };
   }, [url]);
 
   useEffect(() => {

@@ -60,7 +60,7 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, conversat
       }
       if (!fresh()) return;
       setFolders((current) => withFolder(current, directory, { status: "loaded", generation, hidden, entries,
-        nextCursor: page.nextCursor, total: page.total, hiddenCount: page.hiddenCount, truncated: page.truncated, scanLimit: page.scanLimit }));
+        nextCursor: page.nextCursor, total: page.total, remaining: page.remaining, hiddenCount: page.hiddenCount, truncated: page.truncated, scanLimit: page.scanLimit }));
     } catch (error) {
       if (!fresh()) return;
       if (reportable(error)) onErrorRef.current(error);
@@ -81,7 +81,7 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, conversat
       const page = await api(query("/api/files", { projectId: project.id, path: worktree.path, dir: directory, cursor: folder.nextCursor, hidden: folder.hidden ? "true" : undefined }));
       if (!fresh()) return;
       setFolders((current) => installed(current) ? withFolder(current, directory, { ...current.get(directory), loadingMore: false, entries: [...current.get(directory).entries, ...page.entries],
-        nextCursor: page.nextCursor, total: page.total, hiddenCount: page.hiddenCount, truncated: page.truncated, scanLimit: page.scanLimit }) : current);
+        nextCursor: page.nextCursor, total: page.total, remaining: page.remaining, hiddenCount: page.hiddenCount, truncated: page.truncated, scanLimit: page.scanLimit }) : current);
     } catch (error) {
       if (!fresh()) return;
       if (reportable(error)) onErrorRef.current(error);
@@ -263,7 +263,7 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, conversat
     if (row.type === "unavailable") return `${row.error.message}.`;
     if (row.type === "error") return row.error.code === "MISSING" ? `${row.directory || "This worktree"} no longer exists. Retry` : `Could not open ${row.directory || "the worktree"}: ${row.error.message}. Retry`;
     if (row.type === "empty") return row.hiddenCount && !showHidden ? `Empty, ${row.hiddenCount} hidden` : "Empty folder";
-    if (row.type === "more") return row.loading ? "Loading more…" : row.error ? `Could not load more: ${row.error}. Retry` : `Load ${Math.min(row.remaining, 200)} more of ${row.remaining}`;
+    if (row.type === "more") return row.loading ? "Loading more…" : row.error ? `Could not load more: ${row.error}. Retry` : row.remaining ? `Load ${Math.min(row.remaining, PAGE_SIZE)} more of ${row.remaining}` : "Load more";
     if (row.type === "truncated") return `Only the first ${row.limit.toLocaleString()} entries were read`;
     return row.entry.name;
   };

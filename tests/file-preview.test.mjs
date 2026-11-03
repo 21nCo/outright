@@ -3,6 +3,7 @@ import test from "node:test";
 import { MARKDOWN_NODE_BUDGET, linkTarget, parseInline, parseMarkdown, parseMarkdownPreview } from "../src/lib/markdown.js";
 import { failedModuleUrl, retryingImport } from "../src/lib/module-retry.js";
 import { PDF_CANVAS_LIMITS, pdfCanvasSize } from "../src/lib/pdf-canvas.js";
+import { pdfWorkerStarter } from "../src/lib/pdf-worker.js";
 import { ancestorsOf, entryRowId, isExpandable, normalizeTypedPath, samePreview, treeKeyTarget, visibleRows } from "../src/lib/file-tree.js";
 
 const types = (nodes) => nodes.map((node) => node.type);
@@ -141,13 +142,22 @@ test("entries without a path keep distinct row ids when their names decode alike
 test("tree rows follow open folders lazily and keyboard moves stay within them", () => {
   const folders = new Map(Object.entries({
     "": { status: "loaded", entries: [{ name: "src", path: "src", kind: "directory" }, { name: "link", path: "link", kind: "symlink", target: { state: "directory", path: "src" } }, { name: "a.md", path: "a.md", kind: "file" }], total: 3, nextCursor: null },
-    src: { status: "loaded", entries: [{ name: "b.js", path: "src/b.js", kind: "file" }], total: 450, nextCursor: "next" },
+    src: { status: "loaded", entries: [{ name: "b.js", path: "src/b.js", kind: "file" }], total: 450, remaining: 449, nextCursor: "next" },
     link: { status: "error", error: { message: "gone", code: "MISSING" } },
   }));
   const rows = visibleRows(folders, new Set(["src", "link"]));
   assert.deepEqual(rows.map((row) => row.id), ["entry:src", "entry:src/b.js", "more:src", "entry:link", "error:link", "entry:a.md"]);
   assert.deepEqual([rows[1].level, rows[1].setSize, rows[2].remaining, rows[3].expandable], [2, 450, 449, true]);
   assert.deepEqual(visibleRows(folders, new Set()).map((row) => row.id), ["entry:src", "entry:link", "entry:a.md"]);
+  // 200 entries listed, 199 of them since deleted, then the next page of a
+  // folder now 251 long: what is left is the server's count after that page,
+  // never the fresh total minus entries kept from the older listing.
+  const mixed = (extra) => new Map([["", { status: "loaded", entries: Array.from({ length: 400 }, (_, index) => ({ name: `f${index}`, path: `f${index}`, kind: "file" })), total: 251, nextCursor: "next", ...extra }]]);
+  const mixedRows = visibleRows(mixed({ remaining: 50 }));
+  assert.deepEqual([mixedRows.at(-1).remaining, mixedRows[0].setSize], [50, 450]);
+  // Without the server's count, nothing negative or invented is offered.
+  const uncounted = visibleRows(mixed({}));
+  assert.deepEqual([uncounted.at(-1).remaining, uncounted[0].setSize], [null, 400]);
   assert.deepEqual(visibleRows(new Map(), new Set()).map((row) => row.type), ["loading"]);
   assert.equal(treeKeyTarget(rows, 1, "ArrowLeft"), 0);
   assert.equal(treeKeyTarget(rows, 0, "ArrowRight"), 1);
@@ -267,4 +277,38 @@ test("a module that failed to load is loaded again at a fresh address, and a loa
   const unnamed = retryingImport(() => (plain += 1) === 1 ? Promise.reject(new TypeError("Importing a module script failed.")) : Promise.resolve({ ok: true }), { origin, importUrl: () => assert.fail("no address to retry") });
   await assert.rejects(unnamed());
   assert.deepEqual(await unnamed(), { ok: true });
+});
+
+test("a pdf.js worker that fails before it is ready fails its document and is started afresh next time", async () => {
+  const created = [];
+  class FakeWorker extends EventTarget {
+    constructor(url) { super(); this.url = url; this.terminated = false; created.push(this); }
+    terminate() { this.terminated = true; }
+  }
+  const start = pdfWorkerStarter({ createWorker: (url) => new FakeWorker(url), base: () => "http://app.test/files" });
+  const message = (data) => Object.assign(new Event("message"), { data });
+  const first = start("/assets/pdf.worker.mjs");
+  first.worker.dispatchEvent(new Event("error"));
+  await assert.rejects(first.ready, /The PDF reader did not start/);
+  assert.equal(first.worker.terminated, true);
+  // After a failure the script is asked for at a new address, again after each one.
+  const second = start("/assets/pdf.worker.mjs");
+  second.worker.dispatchEvent(new Event("error"));
+  await assert.rejects(second.ready);
+  const third = start("/assets/pdf.worker.mjs");
+  assert.deepEqual(created.map((worker) => worker.url), ["http://app.test/assets/pdf.worker.mjs", "http://app.test/assets/pdf.worker.mjs?retry=1", "http://app.test/assets/pdf.worker.mjs?retry=2"]);
+  // Only pdf.js's own "ready" starts the document; other messages do not.
+  let ready = false;
+  void third.ready.then(() => { ready = true; });
+  third.worker.dispatchEvent(message({ sourceName: "main", action: "ready" }));
+  third.worker.dispatchEvent(message({ sourceName: "worker", action: "configure" }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(ready, false);
+  third.worker.dispatchEvent(message({ sourceName: "worker", targetName: "main", action: "ready", data: null }));
+  await third.ready;
+  // An error after it is ready is pdf.js's to report, and the worker stays its own.
+  third.worker.dispatchEvent(new Event("error"));
+  assert.equal(third.worker.terminated, false);
+  // A worker that started clears the failure: the next start uses the plain address.
+  assert.equal(start("/assets/pdf.worker.mjs").worker.url, "http://app.test/assets/pdf.worker.mjs");
 });

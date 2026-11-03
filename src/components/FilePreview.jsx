@@ -7,8 +7,12 @@ import { retryingImport } from "@/lib/module-retry";
 import { api, query } from "@/lib/runtime-api";
 
 // The PDF viewer loads on first use, through retryingImport, as do the
-// pdf.js library and worker it loads (PdfPreview.jsx). These are the only
-// dynamic imports in the preview path. A rejected lazy() keeps its
+// pdf.js library and its worker script's address (PdfPreview.jsx). These
+// are the only dynamic imports on this page's side of the preview path.
+// The worker itself is started by PdfPreview for each document and given
+// to pdf.js, so pdf.js's own import of the worker script never runs; a
+// failed start is retried by the next attempt's new worker, and anything
+// that worker imports starts afresh with it. A rejected lazy() keeps its
 // rejection, so a failed load replaces the lazy component for the next
 // attempt, which retryingImport loads afresh.
 const loadPdfViewer = retryingImport(() => import("@/components/PdfPreview"));
