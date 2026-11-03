@@ -99,3 +99,12 @@ export function ancestorsOf(file) {
   const parts = file.split("/");
   return parts.slice(0, -1).map((_, index) => parts.slice(0, index + 1).join("/"));
 }
+
+// Text is compared as text, so a write the file's version cannot see (a
+// timestamp of coarse resolution) is still shown. An image or PDF is kept
+// only on the same version, which raw also checks before serving bytes.
+export function samePreview(shown, next) {
+  if (shown.previewType !== next.previewType || (shown.link?.target ?? null) !== (next.link?.target ?? null)) return false;
+  if (typeof shown.text === "string" || typeof next.text === "string") return shown.text === next.text;
+  return shown.version === next.version && shown.size === next.size && shown.limit === next.limit && shown.reason === next.reason;
+}

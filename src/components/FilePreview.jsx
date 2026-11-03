@@ -2,7 +2,7 @@ import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { ArrowSquareOut, ArrowsClockwise, FileX, LinkBreak, Prohibit, SpinnerGap, WarningCircle } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { MarkdownView } from "@/components/MarkdownView";
-import { formatBytes } from "@/lib/file-tree";
+import { formatBytes, samePreview } from "@/lib/file-tree";
 import { api, query } from "@/lib/runtime-api";
 
 const PdfPreview = lazy(() => import("@/components/PdfPreview"));
@@ -10,7 +10,7 @@ const PdfPreview = lazy(() => import("@/components/PdfPreview"));
 // Shows one worktree file. Each response is checked against the file it was
 // asked for, so a slow answer for an earlier selection is never shown. A
 // refresh keeps the shown preview until its answer arrives, and keeps it
-// as it is (scroll, PDF page) when the file's version has not changed.
+// as it is (scroll, PDF page) only when the answer shows the same thing.
 export function FilePreview({ project, worktree, file, refreshKey, settings, onNavigate, onFolder, onRefreshFolder, onError }) {
   const [state, setState] = useState({ status: "loading", file });
   const [mode, setMode] = useState("rendered");
@@ -30,7 +30,7 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
     api(query("/api/files/preview", { ...target, file }))
       .then((preview) => {
         if (!current) return;
-        if (background && preview.version === shown.preview.version && preview.previewType === shown.preview.previewType) return;
+        if (background && samePreview(shown.preview, preview)) return;
         setMediaFailed(false);
         setState({ status: "ready", file, preview });
       })

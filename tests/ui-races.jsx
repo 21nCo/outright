@@ -9301,6 +9301,17 @@ async function filesPaneRegression() {
     assert(preview().querySelector(".pdf-toolbar [role=status]")?.textContent === "Page 2 of 2" && preview().querySelector(".pdf-frame canvas") === pdfCanvas, "the refresh reopened an unchanged PDF");
     assert(rawReads() === rawBefore, "the refresh downloaded an unchanged PDF again");
 
+    // Text is compared as text: a refresh whose answer has the same version
+    // but different text (a write within the version's resolution) shows it.
+    row("guide.md").click();
+    await until(() => preview()?.querySelector(".markdown-preview h1")?.textContent === "Guide", "the guide did not open");
+    const guide = previews["docs/guide.md"];
+    previews["docs/guide.md"] = { ...guide, text: "# Fresh\n" };
+    const guideReads = previewReads();
+    host.querySelector('.files-pane button[aria-label="Refresh files"]').click();
+    await until(() => previewReads() > guideReads && preview()?.querySelector(".markdown-preview h1")?.textContent === "Fresh", "a refresh with the same version kept text that had changed");
+    previews["docs/guide.md"] = guide;
+
     // Only a healthy PDF is kept. One whose download failed offers Retry,
     // and a refresh or Retry downloads it again.
     const pdfStatus = () => preview()?.querySelector(".pdf-toolbar [role=status]")?.textContent;

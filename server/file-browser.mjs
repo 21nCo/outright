@@ -154,7 +154,7 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
       if (kind.previewType !== "image" && kind.previewType !== "pdf") {
         throw fileError(415, "Only verified image and PDF previews are served as files", "NOT_RAW_PREVIEW");
       }
-      if (version && version !== fileVersion(opened.info)) throw fileError(409, "The file changed after it was previewed", "FILE_CHANGED");
+      if (version && version !== opened.info.version) throw fileError(409, "The file changed after it was previewed", "FILE_CHANGED");
       response.statusCode = 200;
       for (const [name, value] of Object.entries(RAW_HEADERS)) response.setHeader(name, value);
       response.setHeader("Content-Type", kind.mimeType);
@@ -207,7 +207,7 @@ function describe(relative, opened, kind) {
     name: relative.split("/").at(-1),
     size: info.size,
     modifiedAt: info.mtime.toISOString(),
-    version: fileVersion(info),
+    version: info.version,
     link,
     ...kind,
   };
@@ -255,19 +255,27 @@ async function openFile(root, relative, hooks, handlePaths) {
   }
   let info;
   await hooks.beforeInspect?.(real);
-  try { info = await lstat(real); } catch (error) { throw fileSystemError(error, relative, "File"); }
+  try { info = await lstat(real, { bigint: true }); } catch (error) { throw fileSystemError(error, relative, "File"); }
   const link = linkInfo.isSymbolicLink() ? { target: toPosix(path.relative(root, real)) } : null;
   if (info.isSymbolicLink()) throw pathChanged();
   if (info.isDirectory()) throw fileError(409, `${relative} is a folder`, "IS_DIRECTORY");
-  if (!info.isFile()) return { handle: null, info, link };
+  if (!info.isFile()) return { handle: null, info: fileFacts(info), link };
   const { handle } = await openVerified(root, real, relative, false, hooks, handlePaths);
-  const opened = await handle.stat();
+  const opened = await handle.stat({ bigint: true });
   // The file at the canonical path must be the one that was checked.
   if (!opened.isFile() || opened.ino !== info.ino || opened.dev !== info.dev) {
     await handle.close();
     throw fileError(409, "The file changed while it was being opened; retry", "FILE_CHANGED");
   }
-  return { handle, info: opened, link };
+  return { handle, info: fileFacts(opened), link };
+}
+
+// What a preview needs from a bigint stat: plain numbers, and a version that
+// changes on any write. A write sets ctime, which utimes cannot set back, so
+// restoring mtime or a same-size rewrite within one millisecond still gives
+// a new version (to the file system's timestamp resolution).
+function fileFacts(info) {
+  return { size: Number(info.size), mtime: info.mtime, version: fileVersion(info) };
 }
 
 // Opens `real`, a canonical path inside `root`, and proves that what was
@@ -412,7 +420,7 @@ async function readBytes(handle, length) {
   return buffer.subarray(0, offset);
 }
 
-function fileVersion(info) { return `${info.size.toString(36)}-${Math.trunc(info.mtimeMs).toString(36)}-${info.ino.toString(36)}`; }
+function fileVersion(info) { return [info.size, info.mtimeNs, info.ctimeNs, info.ino, info.dev].map((value) => value.toString(36)).join("-"); }
 function startsWith(bytes, prefix) { return bytes.length >= prefix.length && prefix.every((value, index) => bytes[index] === value); }
 function ascii(bytes, start, end) { return bytes.length >= end ? bytes.toString("latin1", start, end) : ""; }
 function toPosix(value) { return value.split(path.sep).join("/"); }

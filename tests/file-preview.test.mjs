@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { MARKDOWN_NODE_BUDGET, linkTarget, parseInline, parseMarkdown, parseMarkdownPreview } from "../src/lib/markdown.js";
 import { PDF_CANVAS_LIMITS, pdfCanvasSize } from "../src/lib/pdf-canvas.js";
-import { ancestorsOf, entryRowId, isExpandable, normalizeTypedPath, treeKeyTarget, visibleRows } from "../src/lib/file-tree.js";
+import { ancestorsOf, entryRowId, isExpandable, normalizeTypedPath, samePreview, treeKeyTarget, visibleRows } from "../src/lib/file-tree.js";
 
 const types = (nodes) => nodes.map((node) => node.type);
 function collect(blocks, found = []) {
@@ -224,4 +224,18 @@ test("a PDF page canvas stays within its per-side and total pixel budget, or the
   assert.deepEqual(pdfCanvasSize({ width: 1, height: 14_400 * 75_000 }, 800, 2), { tooLarge: true });
   assert.deepEqual(pdfCanvasSize({ width: 0, height: 792 }, 800, 2), { tooLarge: true });
   assert.deepEqual(pdfCanvasSize({ width: Number.NaN, height: 792 }, 800, 2), { tooLarge: true });
+});
+
+test("a refresh keeps text only when the text is the same, and an image or PDF only on the same version", () => {
+  const markdown = { previewType: "markdown", text: "# Old\n", size: 6, version: "v1", link: null };
+  assert.equal(samePreview(markdown, { ...markdown }), true);
+  // The same version with other text is a change the version could not see.
+  assert.equal(samePreview(markdown, { ...markdown, text: "# New\n" }), false);
+  assert.equal(samePreview(markdown, { ...markdown, version: "v2" }), true);
+  assert.equal(samePreview(markdown, { ...markdown, link: { target: "docs/notes.md" } }), false);
+  assert.equal(samePreview(markdown, { ...markdown, previewType: "text" }), false);
+  const pdf = { previewType: "pdf", mimeType: "application/pdf", size: 900, version: "v1", link: null };
+  assert.equal(samePreview(pdf, { ...pdf }), true);
+  assert.equal(samePreview(pdf, { ...pdf, version: "v2" }), false);
+  assert.equal(samePreview({ previewType: "oversized", size: 9, limit: 4, version: "v1" }, { previewType: "oversized", size: 9, limit: 8, version: "v1" }), false);
 });

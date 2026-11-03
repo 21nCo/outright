@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { closeSync, constants, existsSync, mkdirSync, openSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, mkdirSync, openSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
@@ -190,6 +190,38 @@ test("raw bytes are served only for verified images and PDFs, sandboxed, same-si
   assert.equal(await refused("logo.png", version, { "sec-fetch-site": "cross-site" }), "CROSS_SITE");
   write("logo.png", Buffer.concat([PNG, Buffer.from([0])]));
   assert.equal(await refused("logo.png", version), "FILE_CHANGED");
+});
+
+test("an in-place rewrite of the same size with its mtime put back is a new version, and raw refuses the old one", previewable, async (t) => {
+  const { root, write } = fixture(t);
+  const when = new Date("2026-01-02T03:04:05Z");
+  const rewrite = (name, bytes) => {
+    // The same inode and size; only the contents and ctime change.
+    const descriptor = openSync(path.join(root, name), "r+");
+    try { writeSync(descriptor, bytes, 0, bytes.length, 0); } finally { closeSync(descriptor); }
+    utimesSync(path.join(root, name), when, when);
+  };
+  write("notes.md", "# Old\n");
+  write("logo.png", PNG);
+  for (const name of ["notes.md", "logo.png"]) utimesSync(path.join(root, name), when, when);
+  const files = createFileBrowser();
+  const [notes, logo] = [await files.preview(root, "notes.md"), await files.preview(root, "logo.png")];
+  // Past a coarse timestamp tick, so the rewrite's ctime differs.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  rewrite("notes.md", Buffer.from("# New\n"));
+  const changed = Buffer.from(PNG);
+  changed[changed.length - 1] ^= 0xff;
+  rewrite("logo.png", changed);
+  const [notesAfter, logoAfter] = [await files.preview(root, "notes.md"), await files.preview(root, "logo.png")];
+  assert.deepEqual([notesAfter.text, notesAfter.size, notesAfter.modifiedAt], ["# New\n", notes.size, notes.modifiedAt]);
+  assert.notEqual(notesAfter.version, notes.version, "a same-size rewrite with the mtime put back kept its version");
+  assert.deepEqual([logoAfter.size, logoAfter.modifiedAt], [logo.size, logo.modifiedAt]);
+  assert.notEqual(logoAfter.version, logo.version, "an image rewritten in place kept its version");
+  const stale = capture();
+  assert.equal((await refusal(files.raw(root, "logo.png", logo.version, stale.request, stale.response))).code, "FILE_CHANGED");
+  const fresh = capture();
+  await files.raw(root, "logo.png", logoAfter.version, fresh.request, fresh.response);
+  assert.deepEqual(fresh.body(), changed);
 });
 
 test("a folder replaced by a link after it was resolved is never read through, for listing, preview or raw", posixOnly, async (t) => {
