@@ -104,7 +104,8 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
         if (hidden && !showHidden) continue;
         // A name that is not UTF-8 cannot be named again in a request.
         const readable = Buffer.from(name, "utf8").equals(entry.name);
-        visible.push({ name, hidden, readable, kind: direntKind(entry), group: entry.isDirectory() ? 0 : 1 });
+        // The raw bytes keep two names that decode alike apart.
+        visible.push({ name, key: entry.name.toString("base64url"), bytes: entry.name, hidden, readable, kind: direntKind(entry), group: entry.isDirectory() ? 0 : 1 });
       }
     } catch (error) { throw fileSystemError(error, relative, "Folder"); }
     await hooks.afterRead?.(folder.readPath);
@@ -117,6 +118,8 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
       // Some file systems report no type with the name.
       if (kind === "unknown" && item.readable) kind = await lstat(path.join(folder.readPath, item.name)).then(statKind, () => "other");
       const result = { name: item.name, path: item.readable ? entryPath : null, kind, hidden: item.hidden };
+      // An entry without a path is told apart by its raw name instead.
+      if (!item.readable) result.nameKey = item.key;
       if (kind === "symlink" && item.readable) result.target = await linkTarget(root, path.join(root, ...entryPath.split("/")));
       return result;
     }));
@@ -357,25 +360,28 @@ function pageLimit(value, limits) {
   return Math.min(parsed, limits.maxPageSize);
 }
 
-function encodeCursor(entry) { return Buffer.from(JSON.stringify([entry.group, entry.name]), "utf8").toString("base64url"); }
+function encodeCursor(entry) { return Buffer.from(JSON.stringify([entry.group, entry.name, entry.key]), "utf8").toString("base64url"); }
 function parseCursor(value) {
   if (!value) return null;
   try {
-    const [group, name] = JSON.parse(Buffer.from(String(value), "base64url").toString("utf8"));
-    if ((group === 0 || group === 1) && typeof name === "string") return { group, name };
+    const [group, name, key] = JSON.parse(Buffer.from(String(value), "base64url").toString("utf8"));
+    if ((group === 0 || group === 1) && typeof name === "string" && typeof key === "string" && /^[\w-]*$/.test(key)) {
+      return { group, name, bytes: Buffer.from(key, "base64url") };
+    }
   } catch { /* Reported below. */ }
   throw fileError(400, "The folder page cursor is invalid", "CURSOR_INVALID");
 }
 
 // Folders first, then a case-insensitive name order with an exact tie-break,
-// so the order is total and a cursor names one position.
+// then the raw name bytes (names that are not UTF-8 can decode alike), so the
+// order is total over the folder's entries and a cursor names one position.
 function compareEntries(left, right) {
   if (left.group !== right.group) return left.group - right.group;
   const a = left.name.toLowerCase();
   const b = right.name.toLowerCase();
   if (a !== b) return a < b ? -1 : 1;
-  if (left.name === right.name) return 0;
-  return left.name < right.name ? -1 : 1;
+  if (left.name !== right.name) return left.name < right.name ? -1 : 1;
+  return Buffer.compare(left.bytes, right.bytes);
 }
 
 function direntKind(entry) {

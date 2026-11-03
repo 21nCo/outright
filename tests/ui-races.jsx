@@ -8993,6 +8993,7 @@ async function filesPaneRegression() {
   const gates = new Map();
   let flakyReads = 0;
   let listingUnavailable = false;
+  let previewUnavailable = false;
   let rawFailures = 0;
   route = async (url) => {
     const parameters = Object.fromEntries(url.searchParams);
@@ -9014,8 +9015,10 @@ async function filesPaneRegression() {
       if (parameters.dir === "many") return response(parameters.cursor ? { entries: many.slice(200), nextCursor: null, total: 250 + manyHidden.length, hiddenCount: 1, truncated: false }
         : { entries: [...manyHidden, ...many.slice(0, 200)], nextCursor: "page-2", total: 250 + manyHidden.length, hiddenCount: 1, truncated: false });
     }
+    if (url.pathname === "/api/editor/open") return response({ ok: true });
     if (url.pathname === "/api/files/preview") {
       const file = parameters.file;
+      if (previewUnavailable) return response({ error: "File previews are unavailable on this file system", code: "PREVIEW_UNAVAILABLE" }, 501);
       if (file === "escape.txt") return response({ error: "escape.txt links outside this worktree", code: "OUTSIDE_WORKTREE" }, 403);
       if (!previews[file]) return response({ error: `${file} no longer exists`, code: "MISSING" }, 404);
       return response({ path: file, name: file.split("/").at(-1), modifiedAt: "2026-11-03T00:00:00Z", version: "v1", link: null, ...previews[file] });
@@ -9328,6 +9331,22 @@ async function filesPaneRegression() {
     setControlValue(goTo, "notes.md");
     goTo.form.requestSubmit();
     await until(() => preview()?.querySelector(".markdown-preview h1")?.textContent === "Fixture notes", "Go to file did not preview a file while listing was unavailable");
+
+    // Where an opened file's location cannot be proven, the preview says so
+    // in place, offers the editor, and neither retries nor reports an error.
+    previewUnavailable = true;
+    const previewRequests = () => requests.filter((request) => request.route === "/api/files/preview").length;
+    setControlValue(goTo, "docs/guide.md");
+    goTo.form.requestSubmit();
+    const unavailablePreview = () => preview()?.querySelector('.preview-state[role="alert"]');
+    await until(() => /Previews are unavailable on this file system/.test(unavailablePreview()?.textContent ?? ""), "an unavailable preview was not shown as an explicit state");
+    const previewButtons = [...unavailablePreview().querySelectorAll("button")].map((button) => button.textContent.trim());
+    assert(previewButtons.includes("Open in zed") && !previewButtons.some((label) => /Retry|Refresh/.test(label)), `the unavailable preview offers ${JSON.stringify(previewButtons)} instead of only the editor`);
+    const previewsBefore = previewRequests();
+    await remainsTrue(() => previewRequests() === previewsBefore && unavailablePreview(), 300, "the unavailable preview requested the file again");
+    [...unavailablePreview().querySelectorAll("button")].find((button) => button.textContent.trim() === "Open in zed").click();
+    await until(() => requests.some((request) => request.route === "/api/editor/open"), "Open in editor did not ask the runtime to open the file");
+    assert(!errors.length, `an unavailable preview was reported as a runtime error: ${errors.map((error) => error.message).join("; ")}`);
   } finally {
     window.Worker = NativeWorker;
     localStorage.removeItem("outright.files.show-hidden");

@@ -222,10 +222,48 @@ export function parseInline(text, counter = { left: Infinity }) {
   };
   const destinations = new Map();
   const destinationAt = (labelEnd) => {
-    if (!destinations.has(labelEnd)) destinations.set(labelEnd, /^\(\s*<?([^\s<>()]*)>?(?:\s+"([^"\n]*)")?\s*\)/.exec(text.slice(labelEnd + 1, labelEnd + 2050)));
+    if (!destinations.has(labelEnd)) destinations.set(labelEnd, scanDestination(text, labelEnd + 1, stats));
     return destinations.get(labelEnd);
   };
   return inline(text, 0, text.length, { find, closerAt, destinationAt, counter, stats }, 0);
+}
+
+const DESTINATION_WINDOW = 2049;
+const DESTINATION_STOP = /[\s<>()]/;
+
+// The link destination starting at `open`, read in one pass over at most
+// DESTINATION_WINDOW characters: "(", spaces, an optional "<", the address
+// (no spaces, "<", ">", "(" or ")"), an optional ">", then optionally spaces
+// and a "title" in double quotes (no newline), spaces and ")". A title needs
+// a space before its quote, which may be the one after "(" when there is no
+// address. Returns { length, url, title } or null.
+function scanDestination(text, open, stats) {
+  const limit = Math.min(text.length, open + DESTINATION_WINDOW);
+  if (text[open] !== "(") return null;
+  let at = open + 1;
+  let found = null;
+  const skipSpaces = () => { while (at < limit && SPACE.test(text[at])) at += 1; };
+  skipSpaces();
+  if (at < limit && text[at] === "<") at += 1;
+  const urlStart = at;
+  while (at < limit && !DESTINATION_STOP.test(text[at])) at += 1;
+  const url = text.slice(urlStart, at);
+  if (at < limit && text[at] === ">") at += 1;
+  skipSpaces();
+  if (at < limit && text[at] === "\"" && at - 1 > open && SPACE.test(text[at - 1])) {
+    const titleStart = at + 1;
+    at = titleStart;
+    while (at < limit && text[at] !== "\"" && text[at] !== "\n") at += 1;
+    if (at < limit && text[at] === "\"") {
+      const title = text.slice(titleStart, at);
+      at += 1;
+      skipSpaces();
+      if (at < limit && text[at] === ")") found = { length: at + 1 - open, url, title };
+    }
+  } else if (at < limit && text[at] === ")") found = { length: at + 1 - open, url, title: undefined };
+  // Every character looked at, including the one that ended the scan.
+  if (stats) stats.scanned += Math.min(at + 1, limit) - open;
+  return found;
 }
 
 // A closing delimiter follows a non-space; a closing "_" is not followed by
@@ -306,9 +344,9 @@ function inline(text, start, end, context, depth) {
       // The label is the text up to the first "]", which must open the destination.
       if (labelEnd >= 0 && labelEnd < end && find("]", labelStart) === labelEnd) {
         const destination = destinationAt(labelEnd);
-        if (destination && labelEnd + 1 + destination[0].length <= end) {
-          const label = { url: destination[1], title: destination[2] ?? "" };
-          const after = labelEnd + 1 + destination[0].length;
+        if (destination && labelEnd + 1 + destination.length <= end) {
+          const label = { url: destination.url, title: destination.title ?? "" };
+          const after = labelEnd + 1 + destination.length;
           if (image) push({ type: "image", alt: text.slice(labelStart, labelEnd), ...label }, after);
           else push({ type: "link", ...label, children: inline(text, labelStart, labelEnd, context, depth + 1) }, after);
           continue;

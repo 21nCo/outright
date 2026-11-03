@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { MARKDOWN_NODE_BUDGET, linkTarget, parseInline, parseMarkdown, parseMarkdownPreview } from "../src/lib/markdown.js";
 import { PDF_CANVAS_LIMITS, pdfCanvasSize } from "../src/lib/pdf-canvas.js";
-import { ancestorsOf, isExpandable, normalizeTypedPath, treeKeyTarget, visibleRows } from "../src/lib/file-tree.js";
+import { ancestorsOf, entryRowId, isExpandable, normalizeTypedPath, treeKeyTarget, visibleRows } from "../src/lib/file-tree.js";
 
 const types = (nodes) => nodes.map((node) => node.type);
 function collect(blocks, found = []) {
@@ -58,6 +58,14 @@ test("adversarial Markdown near the preview size limit parses with linear work a
     "brackets before a rejected link": `${fill("[", "]x](t)")}`,
     "brackets before an unclosed destination": `${fill("[", `](${"a".repeat(2000)} x`)}`,
     "rejected closers": fill("[a]x](t) "),
+    // Link destinations are scanned once per label: a long space or tab run
+    // after "(" was quadratic in the old pattern's overlapping quantifiers.
+    "empty labels before spaces": fill(`[](${" ".repeat(2000)}`),
+    "empty labels before spaces and a newline": fill(`[](${" ".repeat(1000)}\n${" ".repeat(1000)}`),
+    "labels before spaces": fill(`[x](${" ".repeat(1000)}`),
+    "labels before tabs": fill(`[x](${"\t".repeat(2000)}`),
+    "labels before an unclosed title": fill(`[x]( "${"a".repeat(2000)}`),
+    "labels before a title without a closing parenthesis": fill(`[x](a "t"${" ".repeat(1000)}`),
     "heading with trailing spaces": `# a${fill(" ", "b")}`,
     "heading closing run": `# a ${fill("#", "x")}`,
     "table delimiter with spaces": `| a |\n-${fill(" ", "x")}`,
@@ -72,8 +80,10 @@ test("adversarial Markdown near the preview size limit parses with linear work a
     const started = performance.now();
     parseMarkdownPreview(source, undefined, stats);
     const elapsed = performance.now() - started;
-    // The work is counted, so the bound holds however loaded the machine is;
-    // the clock only catches a pattern that backtracks outside the count.
+    // The work is counted, including every link destination scan, so the
+    // bound holds however loaded the machine is. The clock only catches a
+    // pattern that backtracks outside the count; no pattern left in the
+    // parser has adjacent quantifiers that can match the same text.
     assert.ok(stats.steps > 0 && stats.steps + stats.scanned <= 8 * source.length, `${name}: ${stats.steps} steps and ${stats.scanned} characters searched for ${source.length}`);
     // Text is copied in runs, not a piece per character that starts nothing.
     assert.ok(stats.pieces <= source.length / 2, `${name}: ${stats.pieces} text pieces for ${source.length} characters`);
@@ -108,6 +118,19 @@ test("headings, list items and links parse as before after the linear rewrite", 
   assert.deepEqual([blocks[5].items[0].blocks[0].children[0].value, blocks[6].ordered, blocks[6].items[0].blocks[0].children[0].value], ["spaced item", true, "numbered"]);
   const inline = blocks[7].children;
   assert.deepEqual(inline.filter((node) => node.type === "link").map((node) => [node.url, node.title]), [["y", "T"]]);
+});
+
+test("entries without a path keep distinct row ids when their names decode alike", () => {
+  const entries = [
+    { name: "a\uFFFD", path: "odd/a\uFFFD", kind: "file" },
+    { name: "a\uFFFD", path: null, nameKey: "Yf4", kind: "directory" },
+    { name: "a\uFFFD", path: null, nameKey: "Yf8", kind: "directory" },
+  ];
+  const folders = new Map([["", { status: "loaded", entries: [{ name: "odd", path: "odd", kind: "directory" }], total: 1 }], ["odd", { status: "loaded", entries, total: 3 }]]);
+  const ids = visibleRows(folders, new Set(["odd"])).map((row) => row.id);
+  assert.equal(new Set(ids).size, ids.length);
+  assert.deepEqual(entries.map((entry) => entryRowId("odd", entry)), ["entry:odd/a\uFFFD", "entry:odd\u0000Yf4", "entry:odd\u0000Yf8"]);
+  assert.deepEqual(visibleRows(folders, new Set(["odd"])).filter((row) => row.type === "entry").map((row) => row.expandable), [true, false, false, false]);
 });
 
 test("tree rows follow open folders lazily and keyboard moves stay within them", () => {

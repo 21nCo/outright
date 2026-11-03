@@ -9,6 +9,12 @@ export function isExpandable(entry) {
   return isFolderPath(entry?.path) && (entry.kind === "directory" || (entry.kind === "symlink" && entry.target?.state === "directory"));
 }
 
+// A path names one entry; an entry without one is named by its folder and
+// its raw name bytes (nameKey), since two such names can decode alike.
+export function entryRowId(directory, entry) {
+  return typeof entry.path === "string" ? `entry:${entry.path}` : `entry:${directory}\u0000${entry.nameKey ?? entry.name}`;
+}
+
 export function isFolderPath(path) { return typeof path === "string" && path !== ""; }
 
 export function visibleRows(folders, expanded) {
@@ -25,7 +31,7 @@ export function visibleRows(folders, expanded) {
     folder.entries.forEach((entry, index) => {
       const expandable = isExpandable(entry);
       const open = expandable && expanded.has(entry.path) && !visited.has(entry.path);
-      rows.push({ id: `entry:${entry.path ?? `${directory}\u0000${entry.name}`}`, type: "entry", entry, directory, level, expandable, open,
+      rows.push({ id: entryRowId(directory, entry), type: "entry", entry, directory, level, expandable, open,
         setSize: Math.max(folder.total, folder.entries.length), position: index + 1 });
       if (open) visit(entry.path, level + 1);
     });

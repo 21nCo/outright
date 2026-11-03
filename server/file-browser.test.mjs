@@ -317,6 +317,40 @@ test("O_NOFOLLOW_ANY is trusted only on macOS kernels that enforce it", (t) => {
   closeSync(openSync(path.join(root, "docs", "guide.md"), constants.O_RDONLY | flag));
 });
 
+test("names that decode alike are distinct entries: paging never drops or repeats one", listable, async (t) => {
+  const { root } = fixture(t);
+  const folder = path.join(root, "odd");
+  mkdirSync(folder);
+  // 61 ff and 61 fe are not UTF-8 and both decode to "a\uFFFD", as does the
+  // valid name "a\uFFFD" itself.
+  try {
+    for (const bytes of [[0x61, 0xff], [0x61, 0xfe]]) writeFileSync(Buffer.concat([Buffer.from(`${folder}${path.sep}`), Buffer.from(bytes)]), "x");
+  } catch (error) {
+    t.skip(`this file system rejects names that are not UTF-8 (${error.code})`);
+    return;
+  }
+  writeFileSync(path.join(folder, "a\uFFFD"), "valid");
+  writeFileSync(path.join(folder, "b.txt"), "b");
+  const files = createFileBrowser();
+  const describe = (entry) => [entry.name, entry.path, entry.nameKey ?? null];
+  const whole = (await files.list(root, { directory: "odd" })).entries.map(describe);
+  const paged = [];
+  let cursor = null;
+  do {
+    const page = await files.list(root, { directory: "odd", limit: 1, cursor });
+    paged.push(...page.entries.map(describe));
+    cursor = page.nextCursor;
+  } while (cursor);
+  assert.equal(paged.length, whole.length, "paging one entry at a time dropped or repeated an entry");
+  assert.deepEqual(whole, [
+    ["a\uFFFD", "odd/a\uFFFD", null],
+    ["a\uFFFD", null, Buffer.from([0x61, 0xfe]).toString("base64url")],
+    ["a\uFFFD", null, Buffer.from([0x61, 0xff]).toString("base64url")],
+    ["b.txt", "odd/b.txt", null],
+  ]);
+  assert.deepEqual(paged, whole);
+});
+
 test("names that merely begin with two dots are inside the worktree", listable, async (t) => {
   const { root, write } = fixture(t);
   write("..notes.md", "# Dots\n");
