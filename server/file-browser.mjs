@@ -257,7 +257,8 @@ async function openFile(root, relative, hooks, handlePaths) {
 // macOS), never by name again. Node cannot read a folder from a descriptor,
 // so where neither path exists (Windows, a macOS volume without /.vol, Linux
 // without /proc) a folder is not listed at all: a name checked before and
-// after reading could still point elsewhere while it is read. A file is read
+// after reading could still point elsewhere while it is read (owner decision:
+// listing there is deferred to OUT-144 and fails closed). A file is read
 // from its held descriptor, whose identity is compared with the checked path.
 async function openVerified(root, real, relative, directory, hooks, handlePaths) {
   const noun = directory ? "Folder" : "File";

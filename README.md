@@ -77,7 +77,7 @@ Previews never run the file's content:
 
 Larger files, binary files and other types show an explicit oversized or unsupported state with a way to open them in your editor; a missing file or a link outside the worktree is reported in place.
 
-Folders are read only through the handle Outright checked, so a folder swapped for a link while it is read cannot expose files outside the worktree. That is possible on Linux (through `/proc`) and on macOS APFS volumes (through `/.vol`). On Windows and other file systems, the tree says that folder listing is unavailable, and Go to file and previews still work.
+Folders are read only through the handle Outright checked, so a folder swapped for a link while it is read cannot expose files outside the worktree. That is possible on Linux (through `/proc`) and on macOS APFS volumes (through `/.vol`). On Windows and other file systems, the tree says that folder listing is unavailable, and Go to file and previews still work. Listing on those platforms is deferred to OUT-144.
 
 Layouts are saved in the browser's local storage per worktree, for the 64 most recently arranged worktrees. A saved layout with an unknown or duplicate view or an invalid size is repaired on restore, and an unreadable one falls back to the conversation alone; Outright names the repair it made, and says only once per session when the saved layouts cannot be read at all.
 
