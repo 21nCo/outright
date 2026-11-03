@@ -5,9 +5,10 @@ import { PassThrough, Readable } from "node:stream";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { assertRuntimeRequest, createOutrightRuntime, defaultRecoveryProcessAlive, defaultRecoveryProcessIdentity, defaultTerminateRecoveryProcess, runtimeAllowedHosts } from "./outright-runtime.mjs";
@@ -1269,7 +1270,7 @@ function seedLegacyRunningUnknownTargetDatabase(filename, { secondRun = false } 
 // behaviour skip win32. The native realpath expands Windows short names, as
 // the runtime's does.
 function withWorktreeRuntime(fn, options = {}) {
-  return async () => {
+  return async (t) => {
     const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-e2e-")));
     const repo = path.join(root, "repo");
     const bin = path.join(root, "bin");
@@ -1300,7 +1301,14 @@ function withWorktreeRuntime(fn, options = {}) {
       const worktree = project?.worktrees.find((item) => !item.isLinked);
       if (!project || !worktree) throw new Error("the temp repo was not discovered as a project worktree");
       runtime.database.trustProject(project.id, project.path);
-      await fn(runtime, { project, worktree, bin });
+      // A restart stops this runtime and starts another over the same data.
+      const restart = async () => {
+        await runtime.shutdown();
+        runtime = createOutrightRuntime({ configUrl: pathToFileURL(configFile), ...options });
+        await runtime.projects();
+        return runtime;
+      };
+      await fn(runtime, { project, worktree, bin, restart, signal: t?.signal });
     } finally {
       process.env.PATH = previousPath;
       if (previousDataDir === undefined) delete process.env.OUTRIGHT_DATA_DIR; else process.env.OUTRIGHT_DATA_DIR = previousDataDir;
@@ -3214,7 +3222,13 @@ function captureEvents(runtime) {
   // Storage reports each committed change's task ids as a set.
   return { taskChanges: () => events.filter((event) => event.type === "tasks.changed")
     .map((event) => ({ ...event.payload, taskIds: [...event.payload.taskIds].sort() })),
-    of: (type) => events.filter((event) => event.type === type), clear: () => { events.length = 0; } };
+    of: (type) => events.filter((event) => event.type === type), all: () => [...events], clear: () => { events.length = 0; } };
+}
+
+// Events name a worktree by its canonical path, which on Windows is not
+// Git's forward-slash spelling.
+function sameWorktree(value, worktree) {
+  try { return realpathSync.native(value) === realpathSync.native(worktree.path); } catch { return false; }
 }
 
 async function callRuntime(runtime, method, url, body) {
@@ -3773,3 +3787,462 @@ test("unconfirmed setup processes hold agent work until acknowledged, and setup 
 }, { agentManagerFactory: (options) => createAgentManager(unconfirmedAgentOptions = options),
   lifecycleSubprocesses: { capacity: () => ({ active: 1, limit: 4, unknown: 1 }), reconcileUnknown: async () => 0, unknownOwnerStatus: () => [],
     run: async () => { throw Object.assign(new Error("ownership unknown"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN", cause: new Error("lost") }); } } }));
+
+// Polls until `found` holds. A test's signal aborts when it times out, so
+// the wait ends with it and its fixture still shuts the runtime down.
+async function waitUntil(found, what, signal, ms = 15_000) {
+  for (const deadline = Date.now() + ms; !found(); await delay(25, undefined, { signal })) {
+    if (Date.now() > deadline) assert.fail(`timed out waiting for ${what}`);
+  }
+}
+async function within(promise, what, signal, ms = 15_000) {
+  const settled = new AbortController();
+  try {
+    return await Promise.race([promise, delay(ms, undefined, { signal: signal ? AbortSignal.any([signal, settled.signal]) : settled.signal })
+      .then(() => assert.fail(`timed out waiting for ${what}`))]);
+  } finally { settled.abort(); }
+}
+
+let checkpointAgentOptions;
+let checkpointGate = null;
+test("a checkpoint restore is refused beside agent work and holds new runs and Git writes while it runs", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree, signal }) => {
+  const target = { projectId: project.id, worktreePath: worktree.path };
+  const notes = path.join(worktree.path, "notes.txt");
+  writeFileSync(notes, "checkpointed\n");
+  const created = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints", { ...target, label: "Before agent" });
+  assert.equal(created.statusCode, 201, created.raw);
+  const { id } = created.body.checkpoint;
+  writeFileSync(notes, "agent changed this\n");
+  const preview = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints/preview", { ...target, id });
+  assert.deepEqual(preview.body.entries.map((entry) => entry.path), ["notes.txt"], preview.raw);
+  const request = { ...target, id, planDigest: preview.body.planDigest, paths: ["notes.txt"] };
+
+  const hasWorktreeWork = runtime.agents.hasWorktreeWork;
+  runtime.agents.hasWorktreeWork = (paths) => paths.includes(worktree.path);
+  const beside = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints/restore", request);
+  runtime.agents.hasWorktreeWork = hasWorktreeWork;
+  assert.deepEqual([beside.statusCode, beside.body.code, beside.body.blockers?.[0].code], [409, "CHECKPOINT_WRITERS_ACTIVE", "WORKTREE_AGENT_ACTIVE"], beside.raw);
+  assert.equal(readFileSync(notes, "utf8"), "agent changed this\n");
+
+  let release;
+  checkpointGate = new Promise((resolve) => { release = resolve; });
+  const restoring = callRuntime(runtime, "POST", "/api/worktrees/checkpoints/restore", request);
+  try {
+    await waitUntil(() => checkpointAgentOptions.worktreeHeld(worktree.path), "the restore to hold the worktree", signal);
+    // Provider discovery is not under test here.
+    runtime.agents.providerAvailable = async () => true;
+    const conversation = runtime.database.createConversation({ ...target, worktreeId: worktree.id, title: "During restore", provider: "codex" });
+    const during = await callRuntime(runtime, "POST", `/api/conversations/${conversation.id}/runs`, { prompt: "start during restore" });
+    assert.equal(during.body.code, "CHECKPOINT_RESTORE_RUNNING", during.raw);
+    assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+    for (const [route, body] of [["/api/git/stage", { path: worktree.path, files: ["notes.txt"] }], ["/api/git/unstage", { path: worktree.path, files: ["notes.txt"] }],
+      ["/api/git/commit", { path: worktree.path, message: "during restore" }], ["/api/terminals", { cwd: worktree.path }]]) {
+      const refused = await callRuntime(runtime, "POST", route, body);
+      assert.deepEqual([refused.statusCode, refused.body.code], [409, "CHECKPOINT_RESTORE_RUNNING"], `${route}: ${refused.raw}`);
+    }
+    const setup = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/setup", target);
+    assert.deepEqual([setup.statusCode, setup.body.code], [409, "CHECKPOINT_RESTORE_RUNNING"], setup.raw);
+    assert.deepEqual(runtime.terminals.list({ saved: false }), [], "a shell started that the restore never confirmed");
+  } finally {
+    checkpointGate = null;
+    release();
+  }
+  const restored = await restoring;
+  assert.equal(restored.statusCode, 200, restored.raw);
+  assert.equal(readFileSync(notes, "utf8"), "checkpointed\n");
+  assert.equal(checkpointAgentOptions.worktreeHeld(worktree.path), false);
+  const listed = await callRuntime(runtime, "GET", `/api/worktrees/checkpoints?projectId=${encodeURIComponent(project.id)}&path=${encodeURIComponent(worktree.path)}`);
+  assert.deepEqual(listed.body.checkpoints.map((checkpoint) => checkpoint.reason), ["before-restore", "manual"], listed.raw);
+}, { agentManagerFactory: (options) => createAgentManager(checkpointAgentOptions = options),
+  subprocesses: { capacity: () => ({ active: 0, limit: 8 }), run: async (file, args, options) => {
+    if (checkpointGate && args.includes("commit-tree")) await checkpointGate;
+    return execFileAsync(file, args, options);
+  } } }));
+
+test("a restore waits for terminal ownership recovery and confirms recovered shells with no recorded worktree", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const target = { projectId: project.id, worktreePath: worktree.path };
+  const notes = path.join(worktree.path, "notes.txt");
+  writeFileSync(notes, "checkpointed\n");
+  const created = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints", target);
+  assert.equal(created.statusCode, 201, created.raw);
+  const { id } = created.body.checkpoint;
+  writeFileSync(notes, "changed\n");
+  const restoreRequest = async (acknowledgeTerminals) => {
+    const preview = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints/preview", { ...target, id });
+    assert.equal(preview.statusCode, 200, preview.raw);
+    const restored = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints/restore",
+      { ...target, id, planDigest: preview.body.planDigest, paths: ["notes.txt"], acknowledgeTerminals });
+    return { preview: preview.body, restored };
+  };
+
+  // While the audit scan rebuilds inherited owners, none of them is listed.
+  const pending = Object.getOwnPropertyDescriptor(runtime.database, "terminalAuditScanPending");
+  const failure = Object.getOwnPropertyDescriptor(runtime.database, "terminalAuditScanError");
+  try {
+    Object.defineProperty(runtime.database, "terminalAuditScanPending", { configurable: true, get: () => true });
+    for (const error of [null, "storage unavailable"]) {
+      Object.defineProperty(runtime.database, "terminalAuditScanError", { configurable: true, get: () => error });
+      const { preview, restored } = await restoreRequest([]);
+      assert.deepEqual(preview.blockers.map((item) => item.code), ["TERMINAL_RECOVERY_PENDING"], JSON.stringify(preview));
+      assert.deepEqual([restored.statusCode, restored.body.code, restored.body.blockers?.map((item) => item.code)],
+        [409, "CHECKPOINT_WRITERS_ACTIVE", ["TERMINAL_RECOVERY_PENDING"]], restored.raw);
+      assert.match(restored.body.error, error ? /restart Outright/ : /retry shortly/);
+      assert.equal(readFileSync(notes, "utf8"), "changed\n");
+    }
+  } finally {
+    Object.defineProperty(runtime.database, "terminalAuditScanPending", pending);
+    Object.defineProperty(runtime.database, "terminalAuditScanError", failure);
+  }
+
+  // An inherited owner recorded without a worktree is charged to every one.
+  const list = runtime.terminals.list;
+  runtime.terminals.list = () => [
+    { id: "recovered-anywhere", cwd: null, name: "Terminal recovery required", status: "unknown", recoveryReservation: true },
+    { id: "shell-here", cwd: worktree.path, name: "zsh", status: "running" },
+    { id: "shell-elsewhere", cwd: path.join(worktree.path, "..", "elsewhere"), name: "zsh", status: "running" },
+    { id: "shell-exited", cwd: worktree.path, name: "zsh", status: "exited" },
+  ];
+  try {
+    const { preview, restored } = await restoreRequest(["shell-here"]);
+    assert.deepEqual(preview.blockers, []);
+    assert.deepEqual(preview.terminals.map((terminal) => terminal.id), ["recovered-anywhere", "shell-here"]);
+    assert.deepEqual([restored.statusCode, restored.body.code, restored.body.terminals?.map((terminal) => terminal.id)],
+      [409, "CHECKPOINT_TERMINALS_UNACKNOWLEDGED", ["recovered-anywhere", "shell-here"]], restored.raw);
+    assert.equal(readFileSync(notes, "utf8"), "changed\n");
+    const confirmed = await restoreRequest(["recovered-anywhere", "shell-here"]);
+    assert.equal(confirmed.restored.statusCode, 200, confirmed.restored.raw);
+  } finally {
+    runtime.terminals.list = list;
+  }
+  assert.equal(readFileSync(notes, "utf8"), "checkpointed\n");
+}, { subprocesses: { capacity: () => ({ active: 0, limit: 8 }), run: (file, args, options) => execFileAsync(file, args, options) } }));
+
+test("a checkpoint change is named by its project rescan however many watcher paths share the window", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree, signal }) => {
+  const events = captureEvents(runtime);
+  const watched = (event) => event.type === "projects.changed" && Array.isArray(event.payload.changedPaths);
+  // Ignored by Git, so the files the watcher reports add nothing to a
+  // project scan or the checkpoint.
+  mkdirSync(path.join(worktree.path, ".git", "info"), { recursive: true });
+  appendFileSync(path.join(worktree.path, ".git", "info", "exclude"), "\nprobe-*\nflood-*\n");
+  // Writes stop at a fixed count, when the checkpoint is taken, or when the
+  // test ends, whichever is first.
+  let written = 0;
+  const writer = (prefix, count, every, limit) => {
+    const timer = setInterval(() => {
+      for (let burst = 0; burst < count && written < limit; burst += 1) writeFileSync(path.join(worktree.path, `${prefix}-${written++}.txt`), `${prefix}\n`);
+      if (written >= limit) clearInterval(timer);
+    }, every);
+    const stop = () => clearInterval(timer);
+    signal?.addEventListener("abort", stop, { once: true });
+    return stop;
+  };
+  // The watcher reports changes once its initial scan is done.
+  const stopProbe = writer("probe", 1, 600, 40);
+  try {
+    await waitUntil(() => events.all().some(watched), "the watcher to report a change", signal);
+  } finally {
+    stopProbe();
+  }
+  events.clear();
+  // Changes arriving faster than the rescan debounce keep one window open
+  // while more watcher paths than one event names, then the checkpoint, join it.
+  written = 0;
+  const stopFlood = writer("flood", 16, 50, 1_600);
+  try {
+    await waitUntil(() => written >= 160, "the watcher paths", signal);
+    await delay(600, undefined, { signal });
+    const created = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints", { projectId: project.id, worktreePath: worktree.path });
+    assert.equal(created.statusCode, 201, created.raw);
+  } finally {
+    stopFlood();
+  }
+  const checkpointAt = events.all().findIndex((event) => event.type === "worktree.checkpoints");
+  assert.notEqual(checkpointAt, -1, "the checkpoint change was not published");
+  const coalesced = !events.all().slice(0, checkpointAt).some(watched);
+  const rescan = () => events.all().slice(checkpointAt).find(watched);
+  await waitUntil(rescan, "the rescan after the checkpoint change", signal);
+  const { changedPaths, changedPathsTruncated } = rescan().payload;
+  assert.ok(changedPaths.some((value) => sameWorktree(value, worktree)), `the checkpoint's worktree is missing from ${changedPaths.length} changed paths`);
+  assert.ok(changedPaths.length <= 65, `${changedPaths.length} changed paths`);
+  // Unless a stalled event loop let an earlier rescan fire, the flood
+  // exceeded the bound and the event says its list is incomplete.
+  if (coalesced) assert.equal(changedPathsTruncated, true);
+}, { subprocesses: { capacity: () => ({ active: 0, limit: 8 }), run: (file, args, options) => execFileAsync(file, args, options) } }));
+
+// The scan the gate holds read Git status before the change.
+let heldScan = null;
+test("a checkpoint change is published from a project scan that started after it, not one already running", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree, signal }) => {
+  const events = captureEvents(runtime);
+  let release;
+  const read = new Promise((resolve) => { heldScan = { read: resolve, released: new Promise((done) => { release = done; }) }; });
+  try {
+    const running = runtime.projects(true);
+    await within(read, "the held scan to read Git status", signal);
+    writeFileSync(path.join(worktree.path, "after-scan.txt"), "after\n");
+    events.clear();
+    await runtime.checkpoints.capture({ project, worktree, worktreePath: realpathSync.native(worktree.path) });
+    assert.equal(events.of("worktree.checkpoints").length, 1);
+    // The rescan's debounce ends while the earlier scan is still running.
+    await delay(1_000, undefined, { signal });
+    release();
+    await running;
+    const named = () => events.of("projects.changed").find((event) => event.payload.changedPaths.some((value) => sameWorktree(value, worktree)));
+    await waitUntil(named, "a project rescan after the checkpoint change", signal);
+    const scanned = named().payload.projects.find((item) => item.id === project.id)?.worktrees.find((item) => sameWorktree(item.path, worktree));
+    assert.ok(scanned?.changedFiles.some((file) => file.path === "after-scan.txt"), JSON.stringify(scanned?.changedFiles));
+  } finally {
+    heldScan = null;
+    release();
+  }
+}, { subprocesses: { capacity: () => ({ active: 0, limit: 8 }), run: async (file, args, options) => {
+  const result = await execFileAsync(file, args, options);
+  const gate = args.includes("--porcelain=v1") && heldScan;
+  if (gate) {
+    heldScan = null;
+    gate.read();
+    await gate.released;
+  }
+  return result;
+} } }));
+
+let shutdownScanLog = [];
+test("a checkpoint rescan still waiting on an earlier scan starts no scan once shutdown begins", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree, signal }) => {
+  const events = captureEvents(runtime);
+  let release;
+  const read = new Promise((resolve) => { heldScan = { read: resolve, released: new Promise((done) => { release = done; }) }; });
+  try {
+    const running = runtime.projects(true);
+    await within(read, "the held scan to read Git status", signal);
+    writeFileSync(path.join(worktree.path, "after-scan.txt"), "after\n");
+    await runtime.checkpoints.capture({ project, worktree, worktreePath: realpathSync.native(worktree.path) });
+    // The rescan's debounce ends, and its fresh scan queues behind the held one.
+    await delay(1_000, undefined, { signal });
+    events.clear();
+    shutdownScanLog.push("shutdown-start");
+    const down = runtime.shutdown();
+    await delay(200, undefined, { signal });
+    release();
+    await running.catch(() => {});
+    await down;
+    shutdownScanLog.push("shutdown-done");
+    await delay(1_500, undefined, { signal });
+    const after = shutdownScanLog.slice(shutdownScanLog.indexOf("shutdown-start") + 1);
+    assert.deepEqual(after.filter((entry) => entry === "status-start"), [], JSON.stringify(shutdownScanLog));
+    assert.deepEqual(events.of("projects.changed"), []);
+  } finally {
+    heldScan = null;
+    release();
+  }
+}, { subprocesses: { capacity: () => ({ active: 0, limit: 8 }), run: async (file, args, options) => {
+  if (args.includes("--porcelain=v1")) shutdownScanLog.push("status-start");
+  const result = await execFileAsync(file, args, options);
+  const gate = args.includes("--porcelain=v1") && heldScan;
+  if (gate) {
+    heldScan = null;
+    gate.read();
+    await gate.released;
+  }
+  return result;
+} } }));
+
+let interruptedAgentOptions;
+test("a restore that did not finish holds agent runs, setup and Git writes after a restart until its files are kept", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  const target = { projectId: project.id, worktreePath: worktree.path };
+  writeFileSync(path.join(worktree.path, "notes.txt"), "work\n");
+  // The marker an interrupted restore leaves in the Git directory is all a
+  // new runtime has.
+  writeFileSync(path.join(worktree.path, ".git", "outright-checkpoint-restore.json"), "{}");
+  assert.equal(interruptedAgentOptions.worktreeHeld(worktree.path), true);
+  runtime.agents.providerAvailable = async () => true;
+  const conversation = runtime.database.createConversation({ ...target, worktreeId: worktree.id, title: "After restart", provider: "codex" });
+  const run = await callRuntime(runtime, "POST", `/api/conversations/${conversation.id}/runs`, { prompt: "start after restart" });
+  assert.deepEqual([run.statusCode, run.body.code], [409, "CHECKPOINT_RESTORE_INTERRUPTED"], run.raw);
+  assert.deepEqual(runtime.database.listRuns(conversation.id), []);
+  const setup = await callRuntime(runtime, "POST", "/api/worktrees/lifecycle/setup", target);
+  assert.deepEqual([setup.statusCode, setup.body.code], [409, "CHECKPOINT_RESTORE_INTERRUPTED"], setup.raw);
+  const stage = await callRuntime(runtime, "POST", "/api/git/stage", { path: worktree.path, files: ["notes.txt"] });
+  assert.deepEqual([stage.statusCode, stage.body.code], [409, "CHECKPOINT_RESTORE_INTERRUPTED"], stage.raw);
+  const listed = await callRuntime(runtime, "GET", `/api/worktrees/checkpoints?projectId=${encodeURIComponent(project.id)}&path=${encodeURIComponent(worktree.path)}`);
+  assert.equal(listed.body.restore?.status, "interrupted", listed.raw);
+
+  const kept = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints/recover", { ...target, action: "keep" });
+  assert.equal(kept.statusCode, 200, kept.raw);
+  assert.equal(interruptedAgentOptions.worktreeHeld(worktree.path), false);
+  const staged = await callRuntime(runtime, "POST", "/api/git/stage", { path: worktree.path, files: ["notes.txt"] });
+  assert.equal(staged.statusCode, 200, staged.raw);
+}, { agentManagerFactory: (options) => createAgentManager(interruptedAgentOptions = options),
+  subprocesses: { capacity: () => ({ active: 0, limit: 8 }), run: (file, args, options) => execFileAsync(file, args, options) } }));
+
+let strayAgentOptions;
+let strayUnknown = 1;
+const STRAY_OWNER = "8a7b6c5d-4e3f-4a1b-9c8d-7e6f5a4b3c2d";
+test("a Git write that lost its process before a restart holds the worktree until its owner is released, then queued runs resume", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree, signal }) => {
+  const target = { projectId: project.id, worktreePath: worktree.path };
+  const events = captureEvents(runtime);
+  writeFileSync(path.join(worktree.path, "notes.txt"), "work\n");
+  const created = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints", target);
+  assert.equal(created.statusCode, 201, created.raw);
+  // What the previous runtime's stage left behind; the budget still holds its owner.
+  writeFileSync(path.join(worktree.path, ".git", "outright-git-write-unconfirmed"), "earlier\n");
+  assert.equal(strayAgentOptions.worktreeHeld(worktree.path), true);
+  const preview = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints/preview", { ...target, id: created.body.checkpoint.id });
+  assert.deepEqual(preview.body.blockers?.map((item) => item.code), ["GIT_WRITE_UNCONFIRMED"], preview.raw);
+  for (const [route, body] of [["/api/git/stage", { path: worktree.path, files: ["notes.txt"] }], ["/api/worktrees/lifecycle/setup", target],
+    ["/api/terminals", { cwd: worktree.path }]]) {
+    const refused = await callRuntime(runtime, "POST", route, body);
+    assert.deepEqual([refused.statusCode, refused.body.code], [409, "GIT_WRITE_UNCONFIRMED"], `${route}: ${refused.raw}`);
+  }
+  let resumed = 0;
+  runtime.agents.resumeQueued = () => { resumed += 1; };
+  events.clear();
+  const released = await callRuntime(runtime, "POST", `/api/capacity/utility-owners/${STRAY_OWNER}/release`);
+  assert.equal(released.statusCode, 200, released.raw);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(resumed, 1, "runs waiting for the worktree were not resumed");
+  assert.equal(strayAgentOptions.worktreeHeld(worktree.path), false);
+  assert.equal(existsSync(path.join(worktree.path, ".git", "outright-git-write-unconfirmed")), false);
+  const published = events.of("worktree.checkpoints").map((event) => event.payload.worktreePath);
+  assert.ok(published.length > 0 && published.every((value) => sameWorktree(value, worktree)), JSON.stringify(published));
+  // The Changes pane and the sidebar learn of a restore through a rescan,
+  // as the watcher does not see an index-only change in a linked worktree.
+  // The marker's removal is also seen by the watcher in the same window.
+  const rescanned = () => events.of("projects.changed").some((event) => event.payload.changedPaths.some((value) => sameWorktree(value, worktree)));
+  await waitUntil(rescanned, "a project rescan after the checkpoint change", signal, 10_000);
+  const staged = await callRuntime(runtime, "POST", "/api/git/stage", { path: worktree.path, files: ["notes.txt"] });
+  assert.equal(staged.statusCode, 200, staged.raw);
+}, { agentManagerFactory: (options) => createAgentManager(strayAgentOptions = options),
+  subprocesses: { capacity: () => ({ active: strayUnknown, limit: 8, unknown: strayUnknown }), unknownOwnerStatus: () => strayUnknown ? [{ id: STRAY_OWNER }] : [],
+    releaseUnknownOwner: async (id, { audit }) => { const outcome = { id, proven: true, reason: "test" }; await audit(outcome); strayUnknown = 0; return outcome; },
+    run: (file, args, options) => execFileAsync(file, args, options) } }));
+
+let provenAgentOptions;
+let provenUnknown = 1;
+let provenCapacityReads = 0;
+test("a lost Git write's hold is released when the budget proves its owner gone by itself, and nothing re-checks after shutdown", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { worktree, signal }) => {
+  const marker = path.join(worktree.path, ".git", "outright-git-write-unconfirmed");
+  const events = captureEvents(runtime);
+  // What a stage that lost its Git process left; the budget still holds its owner.
+  writeFileSync(marker, "earlier\n");
+  let resumed = 0;
+  runtime.agents.resumeQueued = () => { resumed += 1; };
+  assert.equal(provenAgentOptions.worktreeHeld(worktree.path), true);
+  events.clear();
+  // The budget's own late empty-tree frame: no operator release, no request.
+  provenUnknown = 0;
+  const published = () => events.of("worktree.checkpoints").some((event) => sameWorktree(event.payload.worktreePath, worktree));
+  await waitUntil(() => resumed > 0 && published(), "the hold's release to resume queued runs and publish the change", signal, 5_000);
+  assert.equal(existsSync(marker), false);
+  assert.equal(provenAgentOptions.worktreeHeld(worktree.path), false);
+  // Held again, then shut down: the budget is not re-read afterwards.
+  writeFileSync(marker, "again\n");
+  provenUnknown = 1;
+  assert.equal(provenAgentOptions.worktreeHeld(worktree.path), true);
+  const armed = provenCapacityReads;
+  await waitUntil(() => provenCapacityReads > armed, "the budget to be re-read while the hold waits", signal, 5_000);
+  await runtime.shutdown();
+  const stopped = provenCapacityReads;
+  provenUnknown = 0;
+  await delay(1_500, undefined, { signal });
+  assert.equal(provenCapacityReads, stopped, "the budget was re-read after shutdown");
+  assert.equal(existsSync(marker), true, "a hold was released after shutdown");
+}, { agentManagerFactory: (options) => createAgentManager(provenAgentOptions = options),
+  subprocesses: { capacity: () => { provenCapacityReads += 1; return { active: provenUnknown, limit: 8, unknown: provenUnknown }; }, unknownOwnerStatus: () => [],
+    run: (file, args, options) => execFileAsync(file, args, options) } }));
+
+let removalUnknown = 0;
+let removalAttempts = 0;
+let removalGate = null;
+let removalLoses = true;
+const REMOVAL_OWNER = "3c2d1e0f-9a8b-4c7d-8e6f-5a4b3c2d1e0f";
+test("a worktree removal that lost its Git process holds that worktree's restores, across a restart, until its owner is released", { timeout: 60_000 }, withWorktreeRuntime(async (runtime, { project, worktree, restart, signal }) => {
+  const linked = path.join(path.dirname(realpathSync.native(worktree.path)), "repo-linked");
+  const notes = path.join(linked, "notes.txt");
+  for (const args of [["-C", worktree.path, "worktree", "add", "-b", "linked", linked]]) {
+    const result = spawnSync("git", args, { encoding: "utf8" });
+    if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+  }
+  writeFileSync(notes, "checkpointed\n");
+  spawnSync("git", ["-C", linked, "add", "notes.txt"]);
+  spawnSync("git", ["-C", linked, "commit", "-m", "notes"]);
+  const added = (await runtime.projects(true)).projects.find((item) => item.id === project.id)?.worktrees.find((item) => sameWorktree(item.path, { path: linked }));
+  assert.ok(added, "the linked worktree was not discovered");
+  const target = { projectId: project.id, worktreePath: added.path };
+  const removal = { projectId: project.id, worktreePath: added.path, confirmation: added.path };
+  const checkpoint = async (where) => {
+    const created = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints", where);
+    assert.equal(created.statusCode, 201, created.raw);
+    return created.body.checkpoint.id;
+  };
+  const restore = async (where, id, start = (request) => callRuntime(runtime, "POST", "/api/worktrees/checkpoints/restore", request)) => {
+    const preview = await callRuntime(runtime, "POST", "/api/worktrees/checkpoints/preview", { ...where, id });
+    assert.equal(preview.statusCode, 200, preview.raw);
+    return { preview: preview.body, restored: start({ ...where, id, planDigest: preview.body.planDigest, paths: preview.body.entries.map((entry) => entry.path) }) };
+  };
+  const id = await checkpoint(target);
+
+  // A removal is refused before Git runs while a restore holds the worktree.
+  writeFileSync(notes, "changed\n");
+  let open;
+  removalGate = new Promise((resolve) => { open = resolve; });
+  try {
+    const { restored } = await restore(target, id);
+    await waitUntil(() => runtime.checkpoints.holding(realpathSync.native(linked)), "the restore to hold the worktree", signal);
+    const during = await callRuntime(runtime, "DELETE", "/api/worktrees", removal);
+    assert.deepEqual([during.statusCode, during.body.code, removalAttempts], [409, "CHECKPOINT_RESTORE_RUNNING", 0], during.raw);
+    open();
+    assert.equal((await restored).statusCode, 200);
+  } finally {
+    removalGate = null;
+    open();
+  }
+  assert.equal(readFileSync(notes, "utf8"), "checkpointed\n");
+
+  // Git removes nothing here, but Outright cannot tell.
+  await runtime.projects(true);
+  const lost = await callRuntime(runtime, "DELETE", "/api/worktrees", removal);
+  assert.deepEqual([lost.statusCode, removalAttempts], [503, 1], lost.raw);
+  writeFileSync(notes, "changed\n");
+  const refused = async () => {
+    const { preview, restored } = await restore(target, id);
+    assert.deepEqual(preview.blockers.map((item) => item.code), ["GIT_WRITE_UNCONFIRMED"], JSON.stringify(preview));
+    const response = await restored;
+    assert.deepEqual([response.statusCode, response.body.code], [409, "CHECKPOINT_WRITERS_ACTIVE"], response.raw);
+    assert.equal(readFileSync(notes, "utf8"), "changed\n");
+    const retried = await callRuntime(runtime, "DELETE", "/api/worktrees", removal);
+    assert.deepEqual([retried.statusCode, retried.body.code, removalAttempts], [409, "GIT_WRITE_UNCONFIRMED", 1], retried.raw);
+  };
+  await refused();
+  // Another worktree of the project is not held.
+  const other = path.join(worktree.path, "other.txt");
+  writeFileSync(other, "kept\n");
+  const otherTarget = { projectId: project.id, worktreePath: worktree.path };
+  const otherId = await checkpoint(otherTarget);
+  writeFileSync(other, "changed\n");
+  assert.equal((await (await restore(otherTarget, otherId)).restored).statusCode, 200);
+  assert.equal(readFileSync(other, "utf8"), "kept\n");
+
+  runtime = await restart();
+  await refused();
+  const released = await callRuntime(runtime, "POST", `/api/capacity/utility-owners/${REMOVAL_OWNER}/release`);
+  assert.equal(released.statusCode, 200, released.raw);
+  const after = await restore(target, id);
+  assert.deepEqual(after.preview.blockers, []);
+  assert.equal((await after.restored).statusCode, 200);
+  assert.equal(readFileSync(notes, "utf8"), "checkpointed\n");
+  // A removal whose Git process is accounted for leaves nothing held.
+  removalLoses = false;
+  await runtime.projects(true);
+  const removed = await callRuntime(runtime, "DELETE", "/api/worktrees", removal);
+  assert.deepEqual([removed.statusCode, removalAttempts, existsSync(linked), runtime.checkpoints.holding(linked)], [200, 2, false, null], removed.raw);
+}, { subprocesses: { capacity: () => ({ active: removalUnknown, limit: 8, unknown: removalUnknown }),
+  unknownOwnerStatus: () => removalUnknown ? [{ id: REMOVAL_OWNER }] : [],
+  releaseUnknownOwner: async (id, { audit }) => { const outcome = { id, proven: true, reason: "test" }; await audit(outcome); removalUnknown = 0; return outcome; },
+  run: async (file, args, options) => {
+    if (args.includes("worktree") && args.includes("remove")) removalAttempts += 1;
+    if (args.includes("worktree") && args.includes("remove") && removalLoses) {
+      removalUnknown = 1;
+      throw Object.assign(new Error("ownership unknown"), { code: "SUBPROCESS_OWNERSHIP_UNKNOWN" });
+    }
+    if (removalGate && args.includes("commit-tree")) await removalGate;
+    return execFileAsync(file, args, options);
+  } } }));
