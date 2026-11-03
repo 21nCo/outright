@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { closeSync, constants, existsSync, mkdirSync, openSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, constants, existsSync, mkdirSync, openSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
@@ -424,6 +424,34 @@ test("raw requests beyond the stream limit wait their turn, and only a full queu
   assert.deepEqual(results.map((result) => result.status), ["fulfilled", "fulfilled", "fulfilled", "fulfilled", "rejected"]);
   assert.deepEqual(requests.slice(0, 4).map(({ body }) => body().equals(PNG)), [true, true, true, true]);
   assert.deepEqual(files.rawStats(), { active: 0, waiting: 0 });
+});
+
+test("shutdown ends a stalled raw stream and a queued request, closes the handle and refuses new ones", previewable, async (t) => {
+  const { root, write } = fixture(t);
+  write("report.pdf", Buffer.concat([Buffer.from("%PDF-1.4\n"), Buffer.alloc(4 * 1024 * 1024, 32)]));
+  const files = createFileBrowser({ limits: { ...FILE_BROWSER_LIMITS, maxRawStreams: 1, maxRawQueue: 1 } });
+  const openDescriptors = () => readdirSync("/dev/fd").length;
+  const before = openDescriptors();
+  // A client that never reads: its first chunk is never acknowledged.
+  const stalled = capture(undefined, new Promise(() => {}));
+  const active = files.raw(root, "report.pdf", null, stalled.request, stalled.response);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const queued = capture();
+  const waitingTurn = files.raw(root, "report.pdf", null, queued.request, queued.response);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(files.rawStats(), { active: 1, waiting: 1 });
+  const closing = files.shutdown();
+  assert.equal((await refusal(waitingTurn)).code, "SHUTTING_DOWN");
+  await Promise.race([closing, new Promise((_, reject) => setTimeout(() => reject(new Error("shutdown waited on a stalled stream")), 2000))]);
+  // The stalled stream settled, and its handle was closed before shutdown did.
+  await active;
+  assert.equal(openDescriptors(), before, "the stalled stream's file handle stayed open");
+  assert.equal(stalled.response.destroyed && queued.response.destroyed, true);
+  assert.deepEqual(files.rawStats(), { active: 0, waiting: 0 });
+  const late = capture();
+  assert.equal((await refusal(files.raw(root, "report.pdf", null, late.request, late.response))).code, "SHUTTING_DOWN");
+  assert.deepEqual(files.rawStats(), { active: 0, waiting: 0 });
+  await files.shutdown();
 });
 
 test("a raw request whose client left before its turn takes no slot and no place in the queue", previewable, async (t) => {

@@ -74,6 +74,9 @@ function openFlags(directory, anyComponent) {
 export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, handlePaths = true } = {}) {
   let rawStreams = 0;
   const waiting = [];
+  // Raw responses being streamed, and whether shutdown has begun.
+  const streaming = new Map();
+  let closed = false;
 
   async function list(root, { directory = "", cursor, limit, showHidden = false } = {}) {
     const relative = relativePath(directory, limits, true);
@@ -147,7 +150,11 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
     if (site && site !== "same-origin" && site !== "none") throw fileError(403, "File previews are only served to Outright", "CROSS_SITE");
     const relative = relativePath(file, limits, false);
     await acquireRawSlot(response);
+    // A queued turn that arrived as shutdown began is given back.
+    if (closed) { releaseRawSlot(); throw fileError(503, "Outright is shutting down", "SHUTTING_DOWN"); }
     let opened;
+    let finished;
+    streaming.set(response, new Promise((resolve) => { finished = resolve; }));
     try {
       opened = await openFile(root, relative, hooks, handlePaths);
       const kind = await classify(relative, opened, limits, false);
@@ -165,7 +172,8 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
       catch (error) { if (!response.destroyed) response.destroy(error); }
     } finally {
       releaseRawSlot();
-      await opened?.handle?.close();
+      try { await opened?.handle?.close(); }
+      finally { streaming.delete(response); finished(); }
     }
   }
 
@@ -174,12 +182,14 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
   // refused only when the queue is full.
   function acquireRawSlot(response) {
     // A client that left during the checks above takes neither a slot nor a place.
+    if (closed) return Promise.reject(fileError(503, "Outright is shutting down", "SHUTTING_DOWN"));
     if (response.destroyed || response.closed) return Promise.reject(fileError(499, "The preview request was closed", "CLIENT_CLOSED"));
     if (rawStreams < limits.maxRawStreams) { rawStreams += 1; return Promise.resolve(); }
     if (waiting.length >= limits.maxRawQueue) return Promise.reject(fileError(429, "Too many previews are loading; retry shortly", "PREVIEW_BUSY"));
     return new Promise((resolve, reject) => {
       const entry = {
         resolve: () => { response.off?.("close", abandon); resolve(); },
+        cancel: (error) => { response.off?.("close", abandon); reject(error); response.destroy?.(); },
       };
       function abandon() {
         const index = waiting.indexOf(entry);
@@ -197,7 +207,17 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
     if (next) next.resolve(); else rawStreams -= 1;
   }
 
-  return { list, preview, raw, rawStats: () => ({ active: rawStreams, waiting: waiting.length }) };
+  // Shutdown refuses new raw requests, drops queued ones, and ends every
+  // stream, so a client that stopped reading cannot hold the server open.
+  // It settles once each streamed file's handle is closed.
+  function shutdown() {
+    closed = true;
+    for (const entry of waiting.splice(0)) entry.cancel(fileError(503, "Outright is shutting down", "SHUTTING_DOWN"));
+    for (const response of streaming.keys()) if (!response.destroyed) response.destroy();
+    return Promise.all(streaming.values()).then(() => {});
+  }
+
+  return { list, preview, raw, shutdown, rawStats: () => ({ active: rawStreams, waiting: waiting.length }) };
 }
 
 function describe(relative, opened, kind) {

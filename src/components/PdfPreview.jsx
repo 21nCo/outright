@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ArrowsClockwise, CaretLeft, CaretRight, SpinnerGap, WarningCircle } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
+import { retryingImport } from "@/lib/module-retry";
 import { pdfCanvasSize } from "@/lib/pdf-canvas";
 
 const MAX_PAGE_TEXT = 100_000;
@@ -12,6 +13,10 @@ const MAX_PAGE_TEXT = 100_000;
 // fonts and image decoders load from this app's own /pdfjs/ folder.
 const PDF_ASSETS = `${import.meta.env.BASE_URL ?? "/"}pdfjs/`;
 const assetUrl = (folder) => new URL(`${PDF_ASSETS}${folder}/`, window.location.href).href;
+// pdf.js and its worker's address load on first use. A load that fails is
+// reported like a document that cannot be read, and Retry loads it afresh.
+const loadPdfjs = retryingImport(() => import("pdfjs-dist"));
+const loadWorkerUrl = retryingImport(() => import("pdfjs-dist/build/pdf.worker.min.mjs?url"));
 // A document that fails to load is reported through onFailed, so the
 // preview offers Retry and a refresh opens it afresh. A page that fails to
 // draw offers its own Retry, and is drawn again on the next refresh.
@@ -35,7 +40,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     setPdfState({ status: "loading" });
     setPage(1);
     (async () => {
-      const [pdfjs, worker] = await Promise.all([import("pdfjs-dist"), import("pdfjs-dist/build/pdf.worker.min.mjs?url")]);
+      const [pdfjs, worker] = await Promise.all([loadPdfjs(), loadWorkerUrl()]);
       // Unmounted or reopened while the viewer loaded: start nothing.
       if (cancelled) return;
       pdfjs.GlobalWorkerOptions.workerSrc = worker.default;

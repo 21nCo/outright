@@ -8979,14 +8979,13 @@ function fixturePdf() {
     "trailer<</Root 1 0 R>>", "%%EOF"].join("\n"));
 }
 
-// The PDF viewer loads on first use. When that load fails, the preview says
-// so in its pane, the rest of the workspace stays, and Retry loads it. This
-// step runs before any other opens a PDF, while the viewer is not loaded.
-async function filesPdfViewerLoadRegression() {
-  root.render(null);
-  await settle();
-  const viewerModule = "/src/components/PdfPreview.jsx";
-  assert(!performance.getEntriesByType("resource").some((entry) => new URL(entry.name).pathname === viewerModule), "the PDF viewer was loaded before this step");
+// The PDF viewer and the pdf.js library it loads are loaded on first use.
+const PDF_VIEWER_MODULE = "/src/components/PdfPreview.jsx";
+const PDF_LIBRARY_MODULE = "/node_modules/.vite/deps/pdfjs-dist.js";
+const moduleRequests = (pathname) => performance.getEntriesByType("resource").filter((entry) => new URL(entry.name).pathname === pathname).length;
+const failModule = async (pathname, times) => assert((await originalFetch(`/__fixture/fail-module?path=${encodeURIComponent(pathname)}&times=${times}`)).ok, `the fixture could not fail ${pathname}`);
+
+function pdfFixture() {
   const pdf = fixturePdf();
   const project = { id: "A", name: "Review A", path: "/fixture/A" };
   const worktree = { id: "A", name: "A", path: "/fixture/A", branch: "main" };
@@ -9000,24 +8999,76 @@ async function filesPdfViewerLoadRegression() {
     return response({ error: "unexpected" }, 404);
   };
   const errors = [];
-  assert((await originalFetch(`/__fixture/fail-module?path=${encodeURIComponent(viewerModule)}&times=1`)).ok, "the fixture could not fail the viewer's next load");
   root.render(<TooltipProvider><div className="workspace-fixture"><p className="conversation-fixture">Conversation stays</p>
     <FilesPane project={project} worktree={worktree} settings={{ editor: "zed" }} onError={(error) => errors.push(error)} /></div></TooltipProvider>);
   const preview = () => host.querySelector(".files-pane .file-preview");
-  const alertText = () => preview()?.querySelector('[role="alert"]')?.textContent ?? "";
-  const retry = () => [...(preview()?.querySelectorAll("button") ?? [])].find((button) => button.textContent.trim() === "Retry");
+  const pdfRow = () => [...host.querySelectorAll('.files-pane [role="treeitem"]')].find((item) => item.querySelector(".tree-label")?.textContent === "report.pdf");
+  return {
+    requests, errors, preview, pdfRow,
+    alertText: () => preview()?.querySelector('[role="alert"]')?.textContent ?? "",
+    retry: () => [...(preview()?.querySelectorAll("button") ?? [])].find((button) => button.textContent.trim() === "Retry"),
+    pageStatus: () => preview()?.querySelector(".pdf-toolbar [role=status]")?.textContent,
+    workspaceStays: () => host.querySelector(".conversation-fixture")?.textContent === "Conversation stays" && Boolean(pdfRow()),
+  };
+}
+
+// When the viewer fails to load, the preview says so in its pane, the rest
+// of the workspace stays, and both Refresh files and Retry load it again.
+// This step runs before any other opens a PDF, while the viewer is not
+// loaded. The pdf.js library is held failing here, so the next step starts
+// with it unloaded; the viewer reporting that failure shows it has loaded.
+async function filesPdfViewerLoadRegression() {
+  root.render(null);
+  await settle();
+  assert(!moduleRequests(PDF_VIEWER_MODULE) && !moduleRequests(PDF_LIBRARY_MODULE), "the PDF viewer was loaded before this step");
+  await failModule(PDF_VIEWER_MODULE, 2);
+  await failModule(PDF_LIBRARY_MODULE, 1000);
+  const fixture = pdfFixture();
+  const { requests, errors, alertText, retry, pdfRow } = fixture;
   try {
-    const pdfRow = () => [...host.querySelectorAll('.files-pane [role="treeitem"]')].find((item) => item.querySelector(".tree-label")?.textContent === "report.pdf");
     await until(pdfRow, "the worktree root was not listed");
     pdfRow().click();
     await until(() => /report\.pdf could not be shown/.test(alertText()) && retry(), `a viewer that did not load was not reported in the preview with Retry: ${host.textContent.slice(0, 200)}`, 15_000);
-    assert(host.querySelector(".conversation-fixture")?.textContent === "Conversation stays" && pdfRow(), "a viewer that did not load took down the rest of the workspace");
+    assert(fixture.workspaceStays(), "a viewer that did not load took down the rest of the workspace");
     assert(!requests.some((request) => request.route === "/api/files/raw"), "the PDF was downloaded without a viewer");
     assert(!errors.length, `a viewer that did not load was reported as a workspace error: ${errors.map((error) => error.message)}`);
+    // Refresh files loads the viewer again, as it retries any failed preview.
+    const viewerLoads = moduleRequests(PDF_VIEWER_MODULE);
+    host.querySelector('.files-pane button[aria-label="Refresh files"]').click();
+    await until(() => moduleRequests(PDF_VIEWER_MODULE) > viewerLoads, "Refresh files did not load a viewer that had failed", 15_000);
+    await until(() => /report\.pdf could not be shown/.test(alertText()) && retry(), "a viewer that failed again on refresh was not reported with Retry", 15_000);
+    assert(fixture.workspaceStays() && !errors.length, "a viewer that failed again took down the workspace");
     retry().click();
-    await until(() => preview()?.querySelector(".pdf-toolbar [role=status]")?.textContent === "Page 1 of 2", `Retry did not load the PDF viewer: ${alertText()}`, 15_000);
-    assert(!alertText() && !errors.length, "the loaded viewer still reported a failure");
+    await until(() => /report\.pdf could not be read: .*Failed to fetch/.test(alertText()), `Retry did not load the PDF viewer: ${alertText()}`, 15_000);
+    assert(fixture.workspaceStays() && !errors.length, "the loaded viewer's library failure left the preview");
   } finally {
+    await failModule(PDF_LIBRARY_MODULE, 0);
+    root.render(null);
+    await settle();
+  }
+  return true;
+}
+
+// The pdf.js library the viewer loads is retried like the viewer: after a
+// failed load, Retry asks again and the PDF is shown without a page reload.
+async function filesPdfLibraryLoadRegression() {
+  root.render(null);
+  await settle();
+  await failModule(PDF_LIBRARY_MODULE, 1);
+  const fixture = pdfFixture();
+  const { errors, alertText, retry, pdfRow } = fixture;
+  try {
+    await until(pdfRow, "the worktree root was not listed");
+    const libraryLoads = moduleRequests(PDF_LIBRARY_MODULE);
+    pdfRow().click();
+    await until(() => /could not be read/.test(alertText()) && retry(), `a pdf.js library that did not load was not reported with Retry: ${alertText() || host.textContent.slice(0, 200)}`, 15_000);
+    assert(moduleRequests(PDF_LIBRARY_MODULE) > libraryLoads, "the pdf.js library was not requested again after an earlier failure");
+    assert(fixture.workspaceStays() && !errors.length, "a pdf.js library that did not load took down the workspace");
+    retry().click();
+    await until(() => fixture.pageStatus() === "Page 1 of 2", `Retry did not load the pdf.js library: ${alertText()}`, 15_000);
+    assert(!alertText() && !errors.length, "the loaded library still reported a failure");
+  } finally {
+    await failModule(PDF_LIBRARY_MODULE, 0);
     root.render(null);
     await settle();
   }
@@ -10786,7 +10837,8 @@ try {
     ["pane layout replacement", paneLayoutReplacementRegression, "a separator drag on a replaced layout is discarded unsaved and focus on any removed pane chrome moves to the shown pane", "responsive transition requires the CDP viewport bridge"],
     ["pane drag isolation", paneDragChatTabRegression, "pane title drags never reorder chat tabs, even after an unfinished tab drag"],
     ["responsive focus", responsiveFocusRegression, "narrow drawer and one-at-a-time panes contain and restore focus", "responsive transition requires the CDP viewport bridge"],
-    ["files pdf viewer load", filesPdfViewerLoadRegression, "a PDF viewer that does not load is reported in the preview with Retry, and the rest of the workspace stays"],
+    ["files pdf viewer load", filesPdfViewerLoadRegression, "a PDF viewer that does not load is reported in the preview with Retry, Refresh files and Retry load it again, and the rest of the workspace stays"],
+    ["files pdf library load", filesPdfLibraryLoadRegression, "a pdf.js library that does not load is reported in the preview, and Retry loads it without a page reload"],
     ["files pane", filesPaneRegression, "folders load lazily and page, the tree is keyboard navigable, hidden files are a control, previews never run their content, and missing, outside, oversized and unsupported files say so"],
     ["files quick open", filesQuickOpenRegression, "Cmd/Ctrl+P shows Files and focuses Go to file with its text selected, from a closed, open or compact Files pane", "the compact layout requires the CDP viewport bridge"],
     ["narrow toolbar", narrowToolbarRegression, "at 320px with the sidebar closed every toolbar action stays inside the window, with and without a lifecycle chip, and the Panes menu toggles panes", "toolbar geometry requires the CDP viewport bridge"],

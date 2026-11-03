@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { MARKDOWN_NODE_BUDGET, linkTarget, parseInline, parseMarkdown, parseMarkdownPreview } from "../src/lib/markdown.js";
+import { failedModuleUrl, retryingImport } from "../src/lib/module-retry.js";
 import { PDF_CANVAS_LIMITS, pdfCanvasSize } from "../src/lib/pdf-canvas.js";
 import { ancestorsOf, entryRowId, isExpandable, normalizeTypedPath, samePreview, treeKeyTarget, visibleRows } from "../src/lib/file-tree.js";
 
@@ -238,4 +239,32 @@ test("a refresh keeps text only when the text is the same, and an image or PDF o
   assert.equal(samePreview(pdf, { ...pdf }), true);
   assert.equal(samePreview(pdf, { ...pdf, version: "v2" }), false);
   assert.equal(samePreview({ previewType: "oversized", size: 9, limit: 4, version: "v1" }, { previewType: "oversized", size: 9, limit: 8, version: "v1" }), false);
+});
+
+test("a module that failed to load is loaded again at a fresh address, and a loaded module is kept", async () => {
+  const origin = "http://app.test";
+  const failure = (url) => new TypeError(`Failed to fetch dynamically imported module: ${url}`);
+  assert.equal(failedModuleUrl(failure("https://cdn.test/pdf.js"), origin), null);
+  assert.equal(failedModuleUrl(new TypeError("Importing a module script failed."), origin), null);
+  const imported = [];
+  let loads = 0;
+  const load = retryingImport(() => { loads += 1; return Promise.reject(failure(`${origin}/assets/pdf-abc.js`)); }, {
+    origin,
+    importUrl: (href) => { imported.push(href); return imported.length === 1 ? Promise.reject(failure(href)) : Promise.resolve({ default: href }); },
+  });
+  await assert.rejects(load(), /pdf-abc/);
+  // The browser would fail the same address again without a request.
+  await assert.rejects(load(), /retry=/);
+  const module = await load();
+  assert.equal(loads, 1);
+  assert.equal(imported.length, 2);
+  assert.notEqual(new URL(imported[0]).searchParams.get("retry"), new URL(imported[1]).searchParams.get("retry"));
+  assert.deepEqual(imported.map((href) => new URL(href).pathname), ["/assets/pdf-abc.js", "/assets/pdf-abc.js"]);
+  assert.equal(await load(), module);
+  assert.equal(imported.length, 2);
+  // Without an address in the error (Safari), the original import is tried again.
+  let plain = 0;
+  const unnamed = retryingImport(() => (plain += 1) === 1 ? Promise.reject(new TypeError("Importing a module script failed.")) : Promise.resolve({ ok: true }), { origin, importUrl: () => assert.fail("no address to retry") });
+  await assert.rejects(unnamed());
+  assert.deepEqual(await unnamed(), { ok: true });
 });

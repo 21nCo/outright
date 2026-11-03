@@ -3,46 +3,31 @@ import { ArrowSquareOut, ArrowsClockwise, FileX, LinkBreak, Prohibit, SpinnerGap
 import { Button } from "@/components/ui/button";
 import { MarkdownView } from "@/components/MarkdownView";
 import { formatBytes, samePreview } from "@/lib/file-tree";
+import { retryingImport } from "@/lib/module-retry";
 import { api, query } from "@/lib/runtime-api";
 
-// The PDF viewer loads on first use. A rejected lazy() keeps its rejection,
-// so a failed load (the network, or a chunk gone after a rebuild) replaces
-// the loader for the next attempt. The browser also remembers a module that
-// failed to load and fails the same address again without a request, so the
-// next attempt asks for the failed address (which Chrome and Firefox name in
-// the error) with a query added: a new module to the browser, the same file
-// to the server. Without an address in the error, it imports as before.
-let viewerAttempts = 0;
-function failedModuleUrl(error) {
-  const named = /\bhttps?:\/\/[^\s"']+/.exec(error?.message ?? "")?.[0];
-  if (!named) return null;
-  try {
-    const url = new URL(named);
-    return url.origin === window.location.origin ? url : null;
-  } catch { return null; }
-}
-function pdfViewerLoader(failedUrl = null) {
-  const Viewer = lazy(() => {
-    let load;
-    if (failedUrl) {
-      const fresh = new URL(failedUrl);
-      fresh.searchParams.set("retry", String(++viewerAttempts));
-      load = import(/* @vite-ignore */ fresh.href);
-    } else load = import("@/components/PdfPreview");
-    return load.catch((error) => {
-      if (PdfPreview === Viewer) PdfPreview = pdfViewerLoader(failedModuleUrl(error) ?? failedUrl);
-      throw error;
-    });
-  });
+// The PDF viewer loads on first use, through retryingImport, as do the
+// pdf.js library and worker it loads (PdfPreview.jsx). These are the only
+// dynamic imports in the preview path. A rejected lazy() keeps its
+// rejection, so a failed load replaces the lazy component for the next
+// attempt, which retryingImport loads afresh.
+const loadPdfViewer = retryingImport(() => import("@/components/PdfPreview"));
+function pdfViewer() {
+  const Viewer = lazy(() => loadPdfViewer().catch((error) => {
+    if (PdfPreview === Viewer) PdfPreview = pdfViewer();
+    throw error;
+  }));
   return Viewer;
 }
-let PdfPreview = pdfViewerLoader();
+let PdfPreview = pdfViewer();
 
 // Keeps a preview that cannot render (for example a viewer that did not
 // load) inside this pane: the tree, other panes and the conversation stay.
+// A refresh (resetKey) tries again, as it does for every failed preview.
 class PreviewBoundary extends Component {
-  state = { error: null };
+  state = { error: null, resetKey: this.props.resetKey };
   static getDerivedStateFromError(error) { return { error }; }
+  static getDerivedStateFromProps(props, state) { return props.resetKey === state.resetKey ? null : { error: null, resetKey: props.resetKey }; }
   render() {
     if (!this.state.error) return this.props.children;
     return <div className="preview-state" role="alert"><WarningCircle /><p>{this.props.name} could not be shown: {this.state.error.message || "the viewer did not load"}</p>
@@ -130,6 +115,6 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
       </div>}
       <Button variant="ghost" size="icon-xs" aria-label={`Open ${name} in ${settings?.editor ?? "editor"}`} onClick={openInEditor}><ArrowSquareOut /></Button>
     </header>
-    <div className="file-preview-body"><PreviewBoundary key={retry} name={name} onRetry={reload}>{body}</PreviewBoundary></div>
+    <div className="file-preview-body"><PreviewBoundary key={retry} resetKey={refreshKey} name={name} onRetry={reload}>{body}</PreviewBoundary></div>
   </section>;
 }

@@ -1316,7 +1316,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     let disposed = false;
     shutdownPromise = (async () => {
       const shutdownErrors = [];
-      const preliminaries = await Promise.allSettled([watcher?.close(), agents.shutdown(), accounts.close(), lifecycle.shutdown(), checkpoints.shutdown()]);
+      const preliminaries = await Promise.allSettled([watcher?.close(), agents.shutdown(), accounts.close(), lifecycle.shutdown(), checkpoints.shutdown(), files.shutdown()]);
       for (const result of preliminaries) if (result.status === "rejected") shutdownErrors.push(result.reason);
       // A failed agent shutdown may be the sole owner of an exited provider's
       // result while both SQLite and its recovery sidecar are unavailable.
