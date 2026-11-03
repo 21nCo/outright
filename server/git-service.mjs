@@ -296,7 +296,12 @@ function parsePorcelain(output) {
 }
 async function validateFiles(cwd, files) { if (!Array.isArray(files) || !files.length) throw httpError(400, "At least one file is required"); for (const file of files) await requireChildPath(cwd, file); return files; }
 async function requireChildPath(root, child) { const resolved = path.resolve(root, child); if (!isWithin(root, resolved)) throw httpError(403, "File path escapes the worktree"); return resolved; }
-function isWithin(root, target) { const relative = path.relative(root, target); return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative)); }
+// Containment by path segment: "..large.log" or "..cache/x" is a child, while
+// ".." and "../x" (or another drive on Windows) are not.
+function isWithin(root, target) {
+  const relative = path.relative(root, target);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
 async function canonicalPath(target) { try { return await realpath(target); } catch { return path.resolve(target); } }
 async function exists(target) { try { await access(target); return true; } catch { return false; } }
 function httpError(statusCode, message) { const error = new Error(message); error.statusCode = statusCode; return error; }

@@ -8970,6 +8970,60 @@ function visibleFocus(element) {
 // control, previews that never run their content, and explicit missing,
 // outside, oversized and unsupported states. A slow answer for an earlier
 // file never replaces a later choice.
+function fixturePdf() {
+  return new TextEncoder().encode(["%PDF-1.4", "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj", "2 0 obj<</Type/Pages/Kids[3 0 R 6 0 R]/Count 2>>endobj",
+    "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj",
+    "4 0 obj<</Length 40>>stream", "BT /F1 18 Tf 20 40 Td (Hello PDF) Tj ET", "endstream endobj", "5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj",
+    "6 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Contents 7 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj",
+    "7 0 obj<</Length 41>>stream", "BT /F1 18 Tf 20 40 Td (Second PDF) Tj ET", "endstream endobj",
+    "trailer<</Root 1 0 R>>", "%%EOF"].join("\n"));
+}
+
+// The PDF viewer loads on first use. When that load fails, the preview says
+// so in its pane, the rest of the workspace stays, and Retry loads it. This
+// step runs before any other opens a PDF, while the viewer is not loaded.
+async function filesPdfViewerLoadRegression() {
+  root.render(null);
+  await settle();
+  const viewerModule = "/src/components/PdfPreview.jsx";
+  assert(!performance.getEntriesByType("resource").some((entry) => new URL(entry.name).pathname === viewerModule), "the PDF viewer was loaded before this step");
+  const pdf = fixturePdf();
+  const project = { id: "A", name: "Review A", path: "/fixture/A" };
+  const worktree = { id: "A", name: "A", path: "/fixture/A", branch: "main" };
+  const requests = [];
+  route = async (url) => {
+    const parameters = Object.fromEntries(url.searchParams);
+    requests.push({ ...parameters, route: url.pathname });
+    if (url.pathname === "/api/files") return response({ directory: "", entries: [{ name: "report.pdf", path: "report.pdf", kind: "file", hidden: false }], nextCursor: null, total: 1, hiddenCount: 0, truncated: false });
+    if (url.pathname === "/api/files/preview") return response({ path: "report.pdf", name: "report.pdf", modifiedAt: "2026-11-03T00:00:00Z", version: "v1", link: null, previewType: "pdf", mimeType: "application/pdf", size: pdf.length });
+    if (url.pathname === "/api/files/raw") return new Response(pdf, { headers: { "Content-Type": "application/pdf", "Content-Length": String(pdf.length) } });
+    return response({ error: "unexpected" }, 404);
+  };
+  const errors = [];
+  assert((await originalFetch(`/__fixture/fail-module?path=${encodeURIComponent(viewerModule)}&times=1`)).ok, "the fixture could not fail the viewer's next load");
+  root.render(<TooltipProvider><div className="workspace-fixture"><p className="conversation-fixture">Conversation stays</p>
+    <FilesPane project={project} worktree={worktree} settings={{ editor: "zed" }} onError={(error) => errors.push(error)} /></div></TooltipProvider>);
+  const preview = () => host.querySelector(".files-pane .file-preview");
+  const alertText = () => preview()?.querySelector('[role="alert"]')?.textContent ?? "";
+  const retry = () => [...(preview()?.querySelectorAll("button") ?? [])].find((button) => button.textContent.trim() === "Retry");
+  try {
+    const pdfRow = () => [...host.querySelectorAll('.files-pane [role="treeitem"]')].find((item) => item.querySelector(".tree-label")?.textContent === "report.pdf");
+    await until(pdfRow, "the worktree root was not listed");
+    pdfRow().click();
+    await until(() => /report\.pdf could not be shown/.test(alertText()) && retry(), `a viewer that did not load was not reported in the preview with Retry: ${host.textContent.slice(0, 200)}`, 15_000);
+    assert(host.querySelector(".conversation-fixture")?.textContent === "Conversation stays" && pdfRow(), "a viewer that did not load took down the rest of the workspace");
+    assert(!requests.some((request) => request.route === "/api/files/raw"), "the PDF was downloaded without a viewer");
+    assert(!errors.length, `a viewer that did not load was reported as a workspace error: ${errors.map((error) => error.message)}`);
+    retry().click();
+    await until(() => preview()?.querySelector(".pdf-toolbar [role=status]")?.textContent === "Page 1 of 2", `Retry did not load the PDF viewer: ${alertText()}`, 15_000);
+    assert(!alertText() && !errors.length, "the loaded viewer still reported a failure");
+  } finally {
+    root.render(null);
+    await settle();
+  }
+  return true;
+}
+
 async function filesPaneRegression() {
   root.render(null);
   await settle();
@@ -8981,12 +9035,7 @@ async function filesPaneRegression() {
   const unnamed = { name: "caf\uFFFD", path: null, nameKey: "Y2Fm_w", kind: "directory", hidden: false };
   const rootEntries = (hidden) => [entry("docs", "directory"), entry("flaky", "directory"), entry("many", "directory"), unnamed, ...(hidden ? [entry(".env")] : []), entry("app.bin"),
     entry("escape.txt", "symlink", { target: { state: "outside" } }), entry("huge.log"), entry("notes.md"), entry("report.pdf"), entry("slow.md")];
-  const pdf = new TextEncoder().encode(["%PDF-1.4", "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj", "2 0 obj<</Type/Pages/Kids[3 0 R 6 0 R]/Count 2>>endobj",
-    "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj",
-    "4 0 obj<</Length 40>>stream", "BT /F1 18 Tf 20 40 Td (Hello PDF) Tj ET", "endstream endobj", "5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj",
-    "6 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Contents 7 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj",
-    "7 0 obj<</Length 41>>stream", "BT /F1 18 Tf 20 40 Td (Second PDF) Tj ET", "endstream endobj",
-    "trailer<</Root 1 0 R>>", "%%EOF"].join("\n"));
+  const pdf = fixturePdf();
   const markdown = "# Fixture notes\n\n<script>window.outrightFilesInjected = 1</script>\n<img src=x onerror=\"window.outrightFilesInjected = 2\">\n\n[unsafe](javascript:window.outrightFilesInjected=3) [site](https://example.com) [guide](docs/guide.md) [backslash](a%5Cb.md)\n\n![logo](logo.png) ![tracker](https://tracker.example/p.png) ![gone image](gone.png)\n";
   const previews = {
     "notes.md": { previewType: "markdown", text: markdown, size: markdown.length },
@@ -9162,6 +9211,27 @@ async function filesPaneRegression() {
     await until(() => image.complete && image.naturalWidth === 1, "the relative image did not load");
     await until(() => /Image could not be loaded: gone image/.test(rendered.textContent), "an image that failed to load did not say so");
     await remainsTrue(() => window.outrightFilesInjected === undefined, 100, "content from the previewed file ran");
+    // A refresh retries an inline image that failed, and a new destination
+    // is requested without Retry, while the kept Markdown stays as it is.
+    const refreshFiles = () => host.querySelector('.files-pane button[aria-label="Refresh files"]').click();
+    const inlineImage = (alt) => preview()?.querySelector(`.markdown-preview img[alt="${alt}"]`);
+    const imageShown = (alt, file) => inlineImage(alt)?.complete && inlineImage(alt).naturalWidth === 1 && new URL(inlineImage(alt).src).searchParams.get("file") === file
+      && !preview().querySelector(".markdown-image-failed");
+    const shownHeading = preview().querySelector(".markdown-preview h1");
+    await originalFetch("/__fixture/raw?serve=gone.png");
+    refreshFiles();
+    await until(() => imageShown("gone image", "gone.png"), "a refresh did not load an inline image that had failed");
+    assert(preview().querySelector(".markdown-preview h1") === shownHeading, "a refresh replaced Markdown that had not changed");
+    previews["notes.md"] = { ...previews["notes.md"], text: markdown.replace("](gone.png)", "](moved.png)") };
+    refreshFiles();
+    await until(() => /Image could not be loaded: gone image/.test(preview().textContent), "an inline image whose new destination is missing did not say so");
+    previews["notes.md"] = { ...previews["notes.md"], text: markdown.replace("](gone.png)", "](logo.png)") };
+    refreshFiles();
+    await until(() => imageShown("gone image", "logo.png"), "an inline image with a new destination was not requested after an earlier failure");
+    await originalFetch("/__fixture/raw?unserve=gone.png");
+    previews["notes.md"] = { ...previews["notes.md"], text: markdown };
+    refreshFiles();
+    await until(() => /Image could not be loaded: gone image/.test(preview().textContent), "the restored notes did not show their missing image");
     [...preview().querySelectorAll("button")].find((button) => button.textContent === "Source").click();
     await until(() => preview().querySelector(".file-text")?.textContent === markdown, "Source did not show the file's text");
     [...preview().querySelectorAll("button")].find((button) => button.textContent === "Preview").click();
@@ -10716,6 +10786,7 @@ try {
     ["pane layout replacement", paneLayoutReplacementRegression, "a separator drag on a replaced layout is discarded unsaved and focus on any removed pane chrome moves to the shown pane", "responsive transition requires the CDP viewport bridge"],
     ["pane drag isolation", paneDragChatTabRegression, "pane title drags never reorder chat tabs, even after an unfinished tab drag"],
     ["responsive focus", responsiveFocusRegression, "narrow drawer and one-at-a-time panes contain and restore focus", "responsive transition requires the CDP viewport bridge"],
+    ["files pdf viewer load", filesPdfViewerLoadRegression, "a PDF viewer that does not load is reported in the preview with Retry, and the rest of the workspace stays"],
     ["files pane", filesPaneRegression, "folders load lazily and page, the tree is keyboard navigable, hidden files are a control, previews never run their content, and missing, outside, oversized and unsupported files say so"],
     ["files quick open", filesQuickOpenRegression, "Cmd/Ctrl+P shows Files and focuses Go to file with its text selected, from a closed, open or compact Files pane", "the compact layout requires the CDP viewport bridge"],
     ["narrow toolbar", narrowToolbarRegression, "at 320px with the sidebar closed every toolbar action stays inside the window, with and without a lifecycle chip, and the Panes menu toggles panes", "toolbar geometry requires the CDP viewport bridge"],

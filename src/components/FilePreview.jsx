@@ -1,11 +1,54 @@
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { Component, lazy, Suspense, useEffect, useRef, useState } from "react";
 import { ArrowSquareOut, ArrowsClockwise, FileX, LinkBreak, Prohibit, SpinnerGap, WarningCircle } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { MarkdownView } from "@/components/MarkdownView";
 import { formatBytes, samePreview } from "@/lib/file-tree";
 import { api, query } from "@/lib/runtime-api";
 
-const PdfPreview = lazy(() => import("@/components/PdfPreview"));
+// The PDF viewer loads on first use. A rejected lazy() keeps its rejection,
+// so a failed load (the network, or a chunk gone after a rebuild) replaces
+// the loader for the next attempt. The browser also remembers a module that
+// failed to load and fails the same address again without a request, so the
+// next attempt asks for the failed address (which Chrome and Firefox name in
+// the error) with a query added: a new module to the browser, the same file
+// to the server. Without an address in the error, it imports as before.
+let viewerAttempts = 0;
+function failedModuleUrl(error) {
+  const named = /\bhttps?:\/\/[^\s"']+/.exec(error?.message ?? "")?.[0];
+  if (!named) return null;
+  try {
+    const url = new URL(named);
+    return url.origin === window.location.origin ? url : null;
+  } catch { return null; }
+}
+function pdfViewerLoader(failedUrl = null) {
+  const Viewer = lazy(() => {
+    let load;
+    if (failedUrl) {
+      const fresh = new URL(failedUrl);
+      fresh.searchParams.set("retry", String(++viewerAttempts));
+      load = import(/* @vite-ignore */ fresh.href);
+    } else load = import("@/components/PdfPreview");
+    return load.catch((error) => {
+      if (PdfPreview === Viewer) PdfPreview = pdfViewerLoader(failedModuleUrl(error) ?? failedUrl);
+      throw error;
+    });
+  });
+  return Viewer;
+}
+let PdfPreview = pdfViewerLoader();
+
+// Keeps a preview that cannot render (for example a viewer that did not
+// load) inside this pane: the tree, other panes and the conversation stay.
+class PreviewBoundary extends Component {
+  state = { error: null };
+  static getDerivedStateFromError(error) { return { error }; }
+  render() {
+    if (!this.state.error) return this.props.children;
+    return <div className="preview-state" role="alert"><WarningCircle /><p>{this.props.name} could not be shown: {this.state.error.message || "the viewer did not load"}</p>
+      <Button variant="outline" size="xs" onClick={this.props.onRetry}><ArrowsClockwise />Retry</Button></div>;
+  }
+}
 
 // Shows one worktree file. Each response is checked against the file it was
 // asked for, so a slow answer for an earlier selection is never shown. A
@@ -65,7 +108,9 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
 
   const { preview } = state;
   const raw = query("/api/files/raw", { ...target, file, version: preview.version });
-  const imageUrl = (path) => query("/api/files/raw", { ...target, file: path });
+  // A refresh asks for inline images again, so one that failed, or changed
+  // in place, is loaded afresh while the kept Markdown stays as it is.
+  const imageUrl = (path) => query("/api/files/raw", { ...target, file: path, refresh: refreshKey + retry });
   const details = [formatBytes(preview.size), preview.link ? `link to ${preview.link.target}` : ""].filter(Boolean).join(" · ");
   let body;
   if (preview.previewType === "markdown" && mode === "rendered") body = <MarkdownView source={preview.text} file={preview.link?.target ?? file} imageUrl={imageUrl} onNavigate={onNavigate} />;
@@ -85,6 +130,6 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
       </div>}
       <Button variant="ghost" size="icon-xs" aria-label={`Open ${name} in ${settings?.editor ?? "editor"}`} onClick={openInEditor}><ArrowSquareOut /></Button>
     </header>
-    <div className="file-preview-body">{body}</div>
+    <div className="file-preview-body"><PreviewBoundary key={retry} name={name} onRetry={reload}>{body}</PreviewBoundary></div>
   </section>;
 }

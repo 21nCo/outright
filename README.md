@@ -75,7 +75,7 @@ Previews never run the file's content:
 - PNG, JPEG, GIF, WebP, AVIF, BMP, ICO and SVG images, up to 20 MB, served only when the bytes match the type; SVG is shown as an image, so its scripts never run
 - PDFs, up to 50 MB, drawn page by page by pdf.js without scripts, forms or annotations, with each page's text beside it
 
-Larger files, binary files and other types show an explicit oversized or unsupported state with a way to open them in your editor; a missing file or a link outside the worktree is reported in place.
+Larger files, binary files and other types show an explicit oversized or unsupported state with a way to open them in your editor; a missing file or a link outside the worktree is reported in place. **Refresh files** (and a finished run) loads inline images again, so one that was missing or changed shows its current state; if the PDF viewer cannot be loaded, the preview says so with **Retry** and the rest of the workspace stays.
 
 Files and folders are read only through a handle whose location Outright has proven inside the worktree, so a folder swapped for a link while it is read cannot expose anything outside it. Linux proves it through `/proc`, and macOS 11 and later by refusing a link anywhere in the opened path (`O_NOFOLLOW_ANY`; macOS 10.15 ignores that flag, so there nothing is proven); a folder is then read through that handle (`/proc/self/fd` on Linux, `/.vol` on macOS APFS volumes). On a macOS volume without `/.vol`, the tree says that folder listing is unavailable, and Go to file and previews still work. On Windows, macOS 10.15, and Linux without `/proc`, neither folders nor files can be proven, so the tree and the preview say they are unavailable. Files on those platforms is deferred to OUT-144.
 

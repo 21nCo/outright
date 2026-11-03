@@ -158,6 +158,32 @@ test("stage, unstage and commit pass the checkpoint writer fence: refused before
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("open in editor accepts dot-prefixed names inside the worktree and refuses paths outside it", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-editor-paths-"));
+  try {
+    const cwd = await realpath(root);
+    const launched = [];
+    const subprocesses = createSubprocessBudget({ limit: 1, launch: (file, args) => {
+      const child = new EventEmitter();
+      child.pid = 7;
+      child.unref = () => {};
+      launched.push(args.at(-1));
+      queueMicrotask(() => child.emit("spawn"));
+      return child;
+    } });
+    const service = createGitService({ database: { getSettings: () => ({ editor: "code" }), auditAdmission() {}, auditCritical() {} },
+      getProjects: () => [{ worktrees: [{ path: cwd }] }], getConfig: async () => ({ scanRoots: [cwd] }), subprocesses });
+    // Before, any relative path starting with ".." was refused as an escape.
+    for (const name of ["..large.log", path.join("..cache", "x"), "...", "a/../b.txt"]) {
+      assert.equal((await service.openInEditor(cwd, name)).target, path.resolve(cwd, name), `${name} was refused`);
+    }
+    for (const name of ["..", "../x", path.join("..", "..cache"), path.join(os.tmpdir(), "elsewhere.txt"), "a/../../x"]) {
+      await assert.rejects(service.openInEditor(cwd, name), (error) => error.statusCode === 403, `${name} was opened`);
+    }
+    assert.deepEqual(launched, ["..large.log", path.join("..cache", "x"), "...", "a/../b.txt"].map((name) => path.resolve(cwd, name)));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("editor launch releases utility capacity when a GUI stays open and records spawn failure", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "outright-editor-launch-"));
   try {

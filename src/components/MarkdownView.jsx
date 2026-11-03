@@ -58,7 +58,12 @@ function Inline({ nodes, context }) {
       }
       case "image": {
         const target = linkTarget(node.url, context.file);
-        if (target.kind === "file" && context.imageUrl) return <MarkdownImage key={index} src={context.imageUrl(target.path)} alt={node.alt} title={node.title} path={target.path} />;
+        if (target.kind === "file" && context.imageUrl) {
+          // Keyed by its address, so a new destination or a refresh starts
+          // a fresh load instead of keeping an earlier failure.
+          const src = context.imageUrl(target.path);
+          return <MarkdownImage key={`${index}:${src}`} src={src} alt={node.alt} title={node.title} path={target.path} />;
+        }
         return <span key={index} className="markdown-image-placeholder" title="Images from other sites are not loaded in previews">[Image not loaded{node.alt ? `: ${node.alt}` : ""}]</span>;
       }
       default: return null;
