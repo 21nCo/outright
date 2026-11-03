@@ -66,7 +66,7 @@ Separators resize with the pointer or, when focused, with the arrow keys, `Home`
 
 ## Files
 
-The Files pane browses the selected worktree without leaving it. Folders load when opened, 200 entries at a time with **Load more**; a folder with more than 10,000 entries lists only the first 10,000 and says so. Dotfiles are hidden until the eye control shows them, and `.git` is never listed or previewed. A name that is not UTF-8 is listed, kept distinct from names that read the same, but cannot be opened. Symbolic links are marked as pointing inside the worktree, outside it, or nowhere; Files never follows a link out of the worktree and never opens a FIFO or other special file. **Go to file** (`Cmd/Ctrl P`) opens a path typed relative to the worktree, exactly as typed apart from leading `./` or `/` and extra slashes: spaces and backslashes stay part of the name, and a Markdown link opens the exact file it names. A broken link and a path outside the worktree each say so. The tree is a single tab stop: arrow keys move and open or close folders, `Home` and `End` jump, `Enter` opens, and typing a letter moves to the next matching name.
+The Files pane browses the selected worktree without leaving it. Folders load when opened, 200 entries at a time with **Load more**; a folder with more than 10,000 entries lists only the first 10,000 and says so. Dotfiles are hidden until the eye control shows them, and `.git` is never listed or previewed. A name that is not UTF-8 is listed, kept distinct from names that read the same, but cannot be opened. Symbolic links are marked as pointing inside the worktree, outside it, or nowhere; Files never follows a link out of the worktree and never opens a FIFO or other special file. **Go to file** (`Cmd P` on macOS, `Ctrl P` elsewhere) opens a path typed relative to the worktree, exactly as typed apart from leading `./` or `/` and extra slashes: spaces and backslashes stay part of the name, and a Markdown link opens the exact file it names. A broken link and a path outside the worktree each say so. The tree is a single tab stop: arrow keys move and open or close folders, `Home` and `End` jump, `Enter` opens, and typing a letter moves to the next matching name.
 
 Previews never run the file's content:
 
@@ -127,7 +127,7 @@ A restore is refused while an agent run in the worktree is queued or running, wh
 - `Cmd/Ctrl K`: project, worktree, and conversation search
 - `Cmd/Ctrl N`: new conversation
 - `Cmd/Ctrl Shift T`: open or focus the terminal pane
-- `Cmd/Ctrl P`: show the Files pane and focus Go to file
+- `Cmd P` (macOS) or `Ctrl P`: show the Files pane and focus Go to file
 - `Cmd F` on macOS, `Ctrl Shift F` elsewhere, with focus in the terminal pane: find in its scrollback; `Enter` / `Shift Enter` move to the next (newer) or previous (older) match and `Escape` closes Find and returns to the terminal
 - `F6` / `Shift F6`: move focus to the next or previous pane
 - `Enter`: send a prompt

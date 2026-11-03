@@ -751,7 +751,23 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
   };
   const port = await unusedPort();
   const profile = process.env.OUTRIGHT_TEST_UI_PROFILE ?? mkdtempSync(path.join(tmpdir(), "outright-ui-races-"));
-  const vite = spawn(process.execPath, [viteCli, "--config", "tests/vite.ui-races.config.mjs", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
+  // OUTRIGHT_UI_BUILD=1 builds the fixture as the app is built and serves
+  // the build (tests/preview-build.test.mjs), so a step loads production
+  // chunks instead of the development server's modules.
+  const built = process.env.OUTRIGHT_UI_BUILD === "1" ? mkdtempSync(path.join(tmpdir(), "outright-ui-build-")) : null;
+  if (built) {
+    phase = "build the fixture";
+    const result = spawnSync(process.execPath, [viteCli, "build", "--config", "tests/vite.ui-races.config.mjs", "--outDir", built, "--emptyOutDir", "--logLevel", "warn"], {
+      cwd: root, env: { ...process.env, NO_COLOR: "1" }, encoding: "utf8", timeout: Math.min(120_000, remaining()), windowsHide: true,
+    });
+    if (result.status !== 0) {
+      rmSync(built, { recursive: true, force: true });
+      if (!process.env.OUTRIGHT_TEST_UI_PROFILE) rmSync(profile, { recursive: true, force: true });
+      throw new Error(`The fixture did not build: ${result.error?.message ?? ""}${result.stderr?.slice(-2000) ?? ""}`);
+    }
+  }
+  const server = built ? ["preview", "--outDir", built] : [];
+  const vite = spawn(process.execPath, [viteCli, ...server, "--config", "tests/vite.ui-races.config.mjs", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
     cwd: root,
     env: { ...process.env, NO_COLOR: "1" },
     stdio: ["ignore", "pipe", "pipe"],
@@ -1030,6 +1046,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
         ["Chrome tree", () => stop(browser)],
         ["Vite tree", () => stop(vite)],
         ["Chrome profile", () => rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })],
+        ["fixture build", () => built && rmSync(built, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })],
       ]);
     } catch (error) {
       if (failure) throw new AggregateError([failure, error], `UI fixture failed: ${failure.message}; ${error.message}`);

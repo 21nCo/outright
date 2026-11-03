@@ -279,6 +279,32 @@ test("a module that failed to load is loaded again at a fresh address, and a loa
   assert.deepEqual(await unnamed(), { ok: true });
 });
 
+test("a retried module without the names its import gives is a failure and is never kept", async () => {
+  const origin = "http://app.test";
+  const failure = (url) => new TypeError(`Failed to fetch dynamically imported module: ${url}`);
+  let loads = 0;
+  const imported = [];
+  // A shared chunk's own namespace (short names), as a retry of its address
+  // gets when the original import picked pdf.js out of it.
+  const answers = [{ a: "worker.mjs", p: {} }, { getDocument() {}, PDFWorker: class {} }];
+  const load = retryingImport(() => { loads += 1; return Promise.reject(failure(`${origin}/assets/pdf-abc.js`)); }, {
+    origin, exports: ["getDocument", "PDFWorker"],
+    importUrl: (href) => { imported.push(href); return Promise.resolve(answers[imported.length - 1]); },
+  });
+  await assert.rejects(load(), /pdf-abc/);
+  await assert.rejects(load(), /The loaded module has no getDocument, PDFWorker/);
+  // Not kept: the next attempt starts again from the original import.
+  await assert.rejects(load(), /pdf-abc/);
+  assert.equal(loads, 2);
+  const module = await load();
+  assert.equal(module, answers[1]);
+  assert.equal(await load(), module);
+  assert.equal(imported.length, 2);
+  // A module the original import gives is checked the same way.
+  const direct = retryingImport(() => Promise.resolve({}), { exports: ["default"] });
+  await assert.rejects(direct(), /no default/);
+});
+
 test("a pdf.js worker that fails before it is ready fails its document and is started afresh next time", async () => {
   const created = [];
   class FakeWorker extends EventTarget {

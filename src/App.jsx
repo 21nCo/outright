@@ -40,6 +40,7 @@ import { lifecycleFor, mergeLifecycleSnapshot, removalRequest, teardownProblem, 
 import { PANE_LAYOUT_PRESETS, PANE_STORE_PROBLEMS, applyPreset, defaultPaneLayout, focusView, layoutViews, loadPaneLayout, paneRestoreMessage, savePaneLayout } from "@/lib/pane-layout";
 
 const CHAT_TAB_DRAG_TYPE = "application/x-outright-chat-tab";
+const APPLE_PLATFORM = typeof navigator !== "undefined" && /mac|iphone|ipad|ipod/i.test(navigator.userAgentData?.platform ?? navigator.platform ?? "");
 const MAX_RENDERED_MESSAGES = 1000;
 function moveMessageViewport(viewport, top) {
   if (!viewport) return;
@@ -957,7 +958,9 @@ export function App() {
         event.preventDefault();
         paneLayoutRef.current?.open("terminal");
       }
-      if ((event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "p") {
+      // On macOS only ⌘P: Ctrl+P moves up a line in a text field there.
+      const quickOpenKey = APPLE_PLATFORM ? event.metaKey && !event.ctrlKey : event.metaKey || event.ctrlKey;
+      if (quickOpenKey && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "p") {
         event.preventDefault();
         paneLayoutRef.current?.open("files");
         setQuickOpenRequest((value) => value + 1);

@@ -9152,6 +9152,53 @@ async function filesPdfWorkerLoadRegression() {
   return true;
 }
 
+// In the production build the viewer and pdf.js are chunks named by hash.
+// A chunk that fails is retried at its own address, so it must give the
+// names its import asked for (server/vite-chunks.mjs). The viewer fails
+// once and pdf.js twice: Retry loads the viewer, Refresh files asks for
+// pdf.js again, and the next Retry shows the PDF, all without a reload.
+// Run by tests/preview-build.test.mjs against a build of this fixture.
+const BUILT_VIEWER = "/assets/PdfPreview-";
+const BUILT_LIBRARY = "/assets/pdf-";
+const failChunk = async (prefix, times) => assert((await originalFetch(`/__fixture/fail-module?prefix=${encodeURIComponent(prefix)}&times=${times}`)).ok, `the fixture could not fail ${prefix}`);
+const chunkRequests = async (prefix) => (await (await originalFetch(`/__fixture/requests?prefix=${encodeURIComponent(prefix)}`)).json()).count;
+async function filesPdfBuildLoadRegression() {
+  root.render(null);
+  await settle();
+  assert(!await chunkRequests(BUILT_VIEWER) && !await chunkRequests(BUILT_LIBRARY), "the built PDF viewer or pdf.js was loaded before this step");
+  await failChunk(BUILT_VIEWER, 1);
+  await failChunk(BUILT_LIBRARY, 2);
+  const fixture = pdfFixture();
+  const { errors, alertText, retry, pdfRow } = fixture;
+  try {
+    await until(pdfRow, "the worktree root was not listed");
+    pdfRow().click();
+    await until(() => /report\.pdf could not be shown/.test(alertText()) && retry(), `a built viewer that did not load was not reported with Retry: ${alertText()}`, 15_000);
+    assert(fixture.workspaceStays() && !errors.length, "a built viewer that did not load took down the workspace");
+    retry().click();
+    const loaded = () => performance.getEntriesByType("resource").map((entry) => new URL(entry.name)).filter((url) => url.pathname.startsWith("/assets/")).map((url) => url.pathname + url.search).join(" ");
+    await untilAsync(async () => /report\.pdf could not be read: .*Failed to fetch/.test(alertText()) && Boolean(retry()), `Retry did not load the built viewer, or pdf.js did not fail: ${alertText() || fixture.preview()?.textContent}; viewer requests ${await chunkRequests(BUILT_VIEWER)}; loaded ${loaded()}`, 15_000);
+    assert(await chunkRequests(BUILT_VIEWER) > 1, "Retry did not ask for the built viewer again");
+    let libraryRequests = await chunkRequests(BUILT_LIBRARY);
+    assert(libraryRequests > 0, "the built viewer did not ask for pdf.js");
+    host.querySelector('.files-pane button[aria-label="Refresh files"]').click();
+    await untilAsync(async () => await chunkRequests(BUILT_LIBRARY) > libraryRequests && /report\.pdf could not be read: .*Failed to fetch/.test(alertText()) && Boolean(retry()),
+      `Refresh files did not ask for pdf.js again: ${alertText()}`, 15_000);
+    assert(fixture.workspaceStays() && !errors.length, "a second pdf.js failure took down the workspace");
+    libraryRequests = await chunkRequests(BUILT_LIBRARY);
+    retry().click();
+    await until(() => fixture.pageStatus() === "Page 1 of 2", `Retry did not load the built pdf.js: ${alertText()}`, 15_000);
+    assert(await chunkRequests(BUILT_LIBRARY) > libraryRequests, "the built pdf.js was not asked for afresh");
+    assert(!alertText() && !errors.length, "the built pdf.js still reported a failure");
+  } finally {
+    await failChunk(BUILT_VIEWER, 0);
+    await failChunk(BUILT_LIBRARY, 0);
+    root.render(null);
+    await settle();
+  }
+  return true;
+}
+
 async function filesPaneRegression() {
   root.render(null);
   await settle();
@@ -9637,6 +9684,16 @@ async function filesQuickOpenRegression() {
     const composer = () => host.querySelector('textarea[aria-label="Message the agent"]');
     await until(() => composer(), "the workspace did not render");
     assert(!host.querySelector("#pane-files"), "Files was open before the shortcut");
+
+    // On macOS Ctrl+P stays with the text field (it moves up a line); only
+    // ⌘P opens Files there.
+    if (/mac|iphone|ipad|ipod/i.test(navigator.userAgentData?.platform ?? navigator.platform ?? "")) {
+      composer().focus();
+      const control = new KeyboardEvent("keydown", { key: "p", ctrlKey: true, bubbles: true, cancelable: true });
+      composer().dispatchEvent(control);
+      await settle();
+      assert(!control.defaultPrevented && !host.querySelector("#pane-files"), "Ctrl+P was taken from the text field on macOS");
+    }
 
     // Files closed: the shortcut opens it beside the conversation.
     composer().focus();
@@ -10922,6 +10979,8 @@ try {
     ["narrow toolbar", narrowToolbarRegression, "at 320px with the sidebar closed every toolbar action stays inside the window, with and without a lifecycle chip, and the Panes menu toggles panes", "toolbar geometry requires the CDP viewport bridge"],
     ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],
   ];
+  // Only a built fixture has production chunks to fail.
+  if (import.meta.env.PROD) steps.push(["files pdf build load", filesPdfBuildLoadRegression, "in the production build, a PDF viewer and a pdf.js chunk that do not load are reported with Retry, and Retry and Refresh files load them without a page reload"]);
   // The harness runs every step with reduced motion, as hosted macOS and
   // Windows runners report it. Pane and diff geometry must be final at commit
   // in either mode, so those steps run again without it.

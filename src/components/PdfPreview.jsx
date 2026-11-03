@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { retryingImport } from "@/lib/module-retry";
 import { pdfCanvasSize } from "@/lib/pdf-canvas";
 import { pdfWorkerStarter } from "@/lib/pdf-worker";
+import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 const MAX_PAGE_TEXT = 100_000;
 
@@ -14,10 +15,10 @@ const MAX_PAGE_TEXT = 100_000;
 // fonts and image decoders load from this app's own /pdfjs/ folder.
 const PDF_ASSETS = `${import.meta.env.BASE_URL ?? "/"}pdfjs/`;
 const assetUrl = (folder) => new URL(`${PDF_ASSETS}${folder}/`, window.location.href).href;
-// pdf.js and its worker's address load on first use. A load that fails is
-// reported like a document that cannot be read, and Retry loads it afresh.
-const loadPdfjs = retryingImport(() => import("pdfjs-dist"));
-const loadWorkerUrl = retryingImport(() => import("pdfjs-dist/build/pdf.worker.min.mjs?url"));
+// pdf.js loads on first use. A load that fails is reported like a document
+// that cannot be read, and Retry loads it afresh. The worker script's
+// address is only a string, so it is part of this module.
+const loadPdfjs = retryingImport(() => import("pdfjs-dist"), { exports: ["getDocument", "PDFWorker"] });
 
 // Each document gets its own worker, started here (see pdf-worker.js).
 const startWorker = pdfWorkerStarter();
@@ -46,10 +47,10 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     setPdfState({ status: "loading" });
     setPage(1);
     (async () => {
-      const [pdfjs, script] = await Promise.all([loadPdfjs(), loadWorkerUrl()]);
+      const pdfjs = await loadPdfjs();
       // Unmounted or reopened while the viewer loaded: start nothing.
       if (cancelled) return;
-      started = startWorker(script.default);
+      started = startWorker(workerUrl);
       await started.ready;
       if (cancelled) return;
       port = new pdfjs.PDFWorker({ port: started.worker });
