@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { CaretLeft, CaretRight, SpinnerGap, WarningCircle } from "@phosphor-icons/react";
+import { ArrowsClockwise, CaretLeft, CaretRight, SpinnerGap, WarningCircle } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { pdfCanvasSize } from "@/lib/pdf-canvas";
 
@@ -12,9 +12,17 @@ const MAX_PAGE_TEXT = 100_000;
 // fonts and image decoders load from this app's own /pdfjs/ folder.
 const PDF_ASSETS = `${import.meta.env.BASE_URL ?? "/"}pdfjs/`;
 const assetUrl = (folder) => new URL(`${PDF_ASSETS}${folder}/`, window.location.href).href;
-export default function PdfPreview({ url, name }) {
+// A document that fails to load is reported through onFailed, so the
+// preview offers Retry and a refresh opens it afresh. A page that fails to
+// draw offers its own Retry, and is drawn again on the next refresh.
+export default function PdfPreview({ url, name, refreshKey, onFailed }) {
   const [pdfState, setPdfState] = useState({ status: "loading" });
-  const [pageError, setPageError] = useState("");
+  const [pageError, setPageError] = useState(null);
+  const [redraw, setRedraw] = useState(0);
+  const onFailedRef = useRef(onFailed);
+  onFailedRef.current = onFailed;
+  const drawFailedRef = useRef(false);
+  drawFailedRef.current = Boolean(pageError?.retry);
   const [page, setPage] = useState(1);
   const [width, setWidth] = useState(0);
   const [pageText, setPageText] = useState("");
@@ -35,7 +43,12 @@ export default function PdfPreview({ url, name }) {
         cMapUrl: assetUrl("cmaps"), cMapPacked: true, standardFontDataUrl: assetUrl("standard_fonts"), wasmUrl: assetUrl("wasm"), iccUrl: assetUrl("iccs") });
       const pdf = await task.promise;
       if (!cancelled) setPdfState({ status: "ready", pdf, pages: pdf.numPages });
-    })().catch((error) => { if (!cancelled) setPdfState({ status: "error", message: error?.message || "The PDF could not be read" }); });
+    })().catch((error) => {
+      if (cancelled) return;
+      const message = error?.message || "The PDF could not be read";
+      setPdfState({ status: "error", message });
+      onFailedRef.current?.(message);
+    });
     // Destroying the loading task ends its worker and document, whether the
     // document is still loading or already shown.
     return () => { cancelled = true; void task?.destroy(); };
@@ -49,12 +62,15 @@ export default function PdfPreview({ url, name }) {
     return () => observer.disconnect();
   }, [pdfState.status]);
 
+  // A refresh draws a failed page again; a page that drew is left as it is.
+  useEffect(() => { if (drawFailedRef.current) setRedraw((value) => value + 1); }, [refreshKey]);
+
   useEffect(() => {
     if (pdfState.status !== "ready" || !width || !canvasRef.current) return undefined;
     let cancelled = false;
     let render;
     setPageText("");
-    setPageError("");
+    setPageError(null);
     (async () => {
       const pdfPage = await pdfState.pdf.getPage(page);
       if (cancelled) return;
@@ -64,7 +80,7 @@ export default function PdfPreview({ url, name }) {
       if (size.tooLarge) {
         canvas.width = 0;
         canvas.height = 0;
-        setPageError("This page is too large to draw. Its text is below.");
+        setPageError({ message: "This page is too large to draw. Its text is below.", retry: false });
       } else {
         canvas.width = size.canvasWidth;
         canvas.height = size.canvasHeight;
@@ -76,10 +92,10 @@ export default function PdfPreview({ url, name }) {
       const content = await pdfPage.getTextContent();
       if (!cancelled) setPageText(content.items.map((item) => item.str ?? "").join(" ").replace(/\s+/g, " ").trim().slice(0, MAX_PAGE_TEXT));
     })().catch((error) => {
-      if (!cancelled && error?.name !== "RenderingCancelledException") setPageError(error?.message || "This page could not be drawn");
+      if (!cancelled && error?.name !== "RenderingCancelledException") setPageError({ message: `This page could not be drawn: ${error?.message || "unknown error"}`, retry: true });
     });
     return () => { cancelled = true; render?.cancel(); };
-  }, [pdfState, page, width]);
+  }, [pdfState, page, width, redraw]);
 
   if (pdfState.status === "loading") return <div className="preview-state" role="status"><SpinnerGap className="spin" />Reading PDF…</div>;
   if (pdfState.status === "error") return <div className="preview-state" role="alert"><WarningCircle />This PDF could not be read: {pdfState.message}</div>;
@@ -91,7 +107,7 @@ export default function PdfPreview({ url, name }) {
     </div>
     <div className="pdf-frame" ref={frameRef}>
       <canvas ref={canvasRef} role="img" hidden={Boolean(pageError)} aria-label={`Page ${page} of ${pdfState.pages} of ${name}`} />
-      {pageError && <p role="alert">{pageError}</p>}
+      {pageError && <div className="preview-state" role="alert"><p>{pageError.message}</p>{pageError.retry && <Button variant="outline" size="xs" onClick={() => setRedraw((value) => value + 1)}><ArrowsClockwise />Retry</Button>}</div>}
     </div>
     <details className="pdf-text"><summary>Page text</summary><p>{pageText || "No text found on this page."}</p></details>
   </div>;

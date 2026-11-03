@@ -1,5 +1,6 @@
 import { constants } from "node:fs";
 import { lstat, open, opendir, readlink, realpath, stat } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 
@@ -49,11 +50,16 @@ const RAW_HEADERS = Object.freeze({
   "Cross-Origin-Resource-Policy": "same-origin",
   "Content-Disposition": "inline",
 });
-// macOS refuses a link in any component of the path (O_NOFOLLOW_ANY, macOS
-// 11+). Elsewhere only the last component is guarded by O_NOFOLLOW, so the
-// opened descriptor's location is checked afterwards. O_NOFOLLOW_ANY covers
-// the last component too, and macOS rejects it combined with O_NOFOLLOW.
-const NOFOLLOW_ANY = process.platform === "darwin" ? 0x20000000 : 0;
+// macOS refuses a link in any component of the path (O_NOFOLLOW_ANY). The
+// flag exists from macOS 11 (Darwin 20); an older kernel ignores the unknown
+// bit and would follow a link, so there it proves nothing and is not used.
+// Elsewhere only the last component is guarded by O_NOFOLLOW, so the opened
+// descriptor's location is checked afterwards. O_NOFOLLOW_ANY covers the
+// last component too, and macOS rejects it combined with O_NOFOLLOW.
+export function noFollowAnyFlag(platform = process.platform, release = os.release()) {
+  return platform === "darwin" && Number.parseInt(release, 10) >= 20 ? 0x20000000 : 0;
+}
+const NOFOLLOW_ANY = noFollowAnyFlag();
 function openFlags(directory, anyComponent) {
   const nofollow = (anyComponent && NOFOLLOW_ANY) || (constants.O_NOFOLLOW ?? 0);
   return constants.O_RDONLY | nofollow | (directory ? constants.O_DIRECTORY ?? 0 : constants.O_NONBLOCK ?? 0);
@@ -255,11 +261,11 @@ async function openFile(root, relative, hooks, handlePaths) {
 
 // Opens `real`, a canonical path inside `root`, and proves that what was
 // opened is inside the root even if a component was replaced by a link after
-// it was resolved. macOS refuses a link anywhere in the path; Linux reads the
+// it was resolved. macOS 11+ refuses a link anywhere in the path; Linux reads the
 // descriptor's own location from /proc. A folder is then read through that
 // descriptor (/proc/self/fd/N, or the volume's file-ID path /.vol/dev/ino on
 // macOS), never by name again. Where the opened location cannot be proven
-// (Windows, Linux without /proc) nothing is read: a name checked before and
+// (Windows, macOS 10.15, Linux without /proc) nothing is read: a name checked before and
 // after opening or reading could still point elsewhere in between. So there
 // folders are not listed and files are not previewed, and a macOS volume
 // without /.vol lists no folders (owner decision: these platforms are

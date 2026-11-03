@@ -18,7 +18,7 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
   const [retry, setRetry] = useState(0);
   const target = { projectId: project.id, path: worktree.path };
   // What the effect below may keep: the preview shown at the last render,
-  // unless its image or PDF failed and needs a fresh start.
+  // unless its image or PDF failed (mediaFailed) and needs a fresh start.
   const shownRef = useRef(null);
   shownRef.current = state.status === "ready" && state.file === file && !mediaFailed ? state : null;
 
@@ -68,9 +68,9 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
   let body;
   if (preview.previewType === "markdown" && mode === "rendered") body = <MarkdownView source={preview.text} file={preview.link?.target ?? file} imageUrl={imageUrl} onNavigate={onNavigate} />;
   else if (preview.previewType === "markdown" || preview.previewType === "text") body = <pre className="file-text" tabIndex={0} aria-label={`Contents of ${name}`}>{preview.text}</pre>;
-  else if (mediaFailed) body = <div className="preview-state" role="alert"><WarningCircle /><p>{name} could not be shown. It may have changed since it was opened.</p><Button variant="outline" size="xs" onClick={reload}><ArrowsClockwise />Retry</Button></div>;
+  else if (mediaFailed) body = <div className="preview-state" role="alert"><WarningCircle /><p>{typeof mediaFailed === "string" ? `${name} could not be read: ${mediaFailed}` : `${name} could not be shown. It may have changed since it was opened.`}</p><Button variant="outline" size="xs" onClick={reload}><ArrowsClockwise />Retry</Button></div>;
   else if (preview.previewType === "image") body = <div className="image-preview"><img src={raw} alt={`Preview of ${name}`} onError={() => setMediaFailed(true)} /></div>;
-  else if (preview.previewType === "pdf") body = <Suspense fallback={<div className="preview-state" role="status"><SpinnerGap className="spin" />Loading PDF viewer…</div>}><PdfPreview url={raw} name={name} /></Suspense>;
+  else if (preview.previewType === "pdf") body = <Suspense fallback={<div className="preview-state" role="status"><SpinnerGap className="spin" />Loading PDF viewer…</div>}><PdfPreview url={raw} name={name} refreshKey={refreshKey} onFailed={(message) => setMediaFailed(message || true)} /></Suspense>;
   else if (preview.previewType === "oversized") body = <div className="preview-state" role="status"><Prohibit /><p>{name} is {formatBytes(preview.size)}, over the {formatBytes(preview.limit)} preview limit for this type.</p>{editorButton}</div>;
   else body = <div className="preview-state" role="status"><Prohibit /><p>{name} has no preview. {preview.reason ?? ""}</p>{editorButton}</div>;
 

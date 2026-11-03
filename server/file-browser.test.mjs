@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, mkdirSync, openSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
 import test from "node:test";
-import { FILE_BROWSER_LIMITS, createFileBrowser } from "./file-browser.mjs";
+import { FILE_BROWSER_LIMITS, createFileBrowser, noFollowAnyFlag } from "./file-browser.mjs";
 
 const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da63f8ffff3f0005fe02fea7d6a4a70000000049454e44ae426082", "hex");
 const posixOnly = { skip: process.platform === "win32" && "symlinks and FIFOs need POSIX semantics" };
@@ -297,6 +297,24 @@ test("a file whose ancestor is swapped around each check by name is refused, and
   assert.equal((await refusal(plain.preview(root, "docs/inner/guide.md"))).code, "PREVIEW_UNAVAILABLE");
   // With nothing swapped, a proven location previews normally.
   assert.equal((await createFileBrowser().preview(root, "docs/inner/guide.md")).text, "# Inside\n");
+});
+
+test("O_NOFOLLOW_ANY is trusted only on macOS kernels that enforce it", (t) => {
+  // macOS 10.15 is Darwin 19, whose kernel ignores the flag; macOS 11 is Darwin 20.
+  assert.equal(noFollowAnyFlag("darwin", "19.6.0"), 0);
+  assert.equal(noFollowAnyFlag("darwin", "20.1.0"), 0x20000000);
+  assert.equal(noFollowAnyFlag("darwin", "25.0.0"), 0x20000000);
+  assert.equal(noFollowAnyFlag("darwin", "unknown"), 0);
+  assert.equal(noFollowAnyFlag("linux", "6.8.0"), 0);
+  assert.equal(noFollowAnyFlag("win32", "10.0.22631"), 0);
+  // Where it is trusted, this kernel refuses a link in an ancestor.
+  const flag = noFollowAnyFlag();
+  if (!flag) return;
+  const { base, root, write } = fixture(t);
+  write("docs/guide.md", "# Inside\n");
+  symlinkSync(path.join(root, "docs"), path.join(base, "via"));
+  assert.throws(() => closeSync(openSync(path.join(base, "via", "guide.md"), constants.O_RDONLY | flag)), { code: "ELOOP" });
+  closeSync(openSync(path.join(root, "docs", "guide.md"), constants.O_RDONLY | flag));
 });
 
 test("names that merely begin with two dots are inside the worktree", listable, async (t) => {

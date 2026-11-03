@@ -8993,6 +8993,7 @@ async function filesPaneRegression() {
   const gates = new Map();
   let flakyReads = 0;
   let listingUnavailable = false;
+  let rawFailures = 0;
   route = async (url) => {
     const parameters = Object.fromEntries(url.searchParams);
     requests.push({ ...parameters, route: url.pathname });
@@ -9019,6 +9020,7 @@ async function filesPaneRegression() {
       if (!previews[file]) return response({ error: `${file} no longer exists`, code: "MISSING" }, 404);
       return response({ path: file, name: file.split("/").at(-1), modifiedAt: "2026-11-03T00:00:00Z", version: "v1", link: null, ...previews[file] });
     }
+    if (url.pathname === "/api/files/raw" && parameters.file === "report.pdf" && rawFailures > 0) { rawFailures -= 1; return response({ error: "Too many previews are loading", code: "BUSY" }, 429); }
     if (url.pathname === "/api/files/raw" && parameters.file === "report.pdf") return new Response(pdf, { headers: { "Content-Type": "application/pdf", "Content-Length": String(pdf.length) } });
     return response({ error: "unexpected" }, 404);
   };
@@ -9259,6 +9261,54 @@ async function filesPaneRegression() {
     await remainsTrue(() => row("item-249.txt") && !moreRow() && document.activeElement === row("item-249.txt"), 150, "the refresh lost loaded pages or the focused row");
     assert(preview().querySelector(".pdf-toolbar [role=status]")?.textContent === "Page 2 of 2" && preview().querySelector(".pdf-frame canvas") === pdfCanvas, "the refresh reopened an unchanged PDF");
     assert(rawReads() === rawBefore, "the refresh downloaded an unchanged PDF again");
+
+    // Only a healthy PDF is kept. One whose download failed offers Retry,
+    // and a refresh or Retry downloads it again.
+    const pdfStatus = () => preview()?.querySelector(".pdf-toolbar [role=status]")?.textContent;
+    const previewAlert = () => preview()?.querySelector('[role="alert"]')?.textContent ?? "";
+    const previewButton = (label) => [...(preview()?.querySelectorAll("button") ?? [])].find((button) => button.textContent.trim() === label);
+    const reopenFailing = async (label) => {
+      row("notes.md").click();
+      await until(() => preview()?.querySelector(".markdown-preview h1"), `${label}: another file did not open`);
+      rawFailures = 1;
+      const reads = rawReads();
+      row("report.pdf").click();
+      await until(() => /report\.pdf could not be read/.test(previewAlert()) && previewButton("Retry"), `${label}: a failed PDF download was not reported with Retry`, 15_000);
+      assert(rawReads() === reads + 1 && rawFailures === 0, `${label}: the failing download was not requested once`);
+      return reads + 1;
+    };
+    let failedReads = await reopenFailing("refresh");
+    show({ type: "run.event", conversationId: "chat-A", runId: "run-3", payload: { type: "run.completed" } });
+    await until(() => pdfStatus() === "Page 1 of 2" && rawReads() === failedReads + 1, "a refresh kept a PDF whose download had failed", 15_000);
+    failedReads = await reopenFailing("Retry");
+    previewButton("Retry").click();
+    await until(() => pdfStatus() === "Page 1 of 2" && rawReads() === failedReads + 1, "Retry did not download the failed PDF again", 15_000);
+    // A page that fails to draw offers Retry, and a refresh draws it again,
+    // without downloading the document again.
+    const nativeGetContext = HTMLCanvasElement.prototype.getContext;
+    let drawFailures = 0;
+    HTMLCanvasElement.prototype.getContext = function getContext(...args) {
+      if (drawFailures > 0 && this.closest?.(".pdf-frame")) { drawFailures -= 1; throw new Error("The canvas is unavailable"); }
+      return nativeGetContext.apply(this, args);
+    };
+    try {
+      const pdfReads = rawReads();
+      const pageDrawn = () => !preview().querySelector(".pdf-frame canvas").hidden && !previewAlert();
+      await until(pageDrawn, "the reopened PDF did not draw its first page");
+      drawFailures = 1;
+      preview().querySelector('button[aria-label="Next page"]').click();
+      await until(() => /This page could not be drawn/.test(previewAlert()) && previewButton("Retry") && pdfStatus() === "Page 2 of 2", "a page that failed to draw did not offer Retry");
+      previewButton("Retry").click();
+      await until(() => pageDrawn() && preview().querySelector(".pdf-text p")?.textContent.includes("Second PDF"), "Retry did not draw the failed page");
+      drawFailures = 1;
+      preview().querySelector('button[aria-label="Previous page"]').click();
+      await until(() => /This page could not be drawn/.test(previewAlert()) && pdfStatus() === "Page 1 of 2", "the second page failure was not shown");
+      show({ type: "run.event", conversationId: "chat-A", runId: "run-4", payload: { type: "run.completed" } });
+      await until(() => pageDrawn() && pdfStatus() === "Page 1 of 2", "a refresh did not draw a page that had failed");
+      assert(rawReads() === pdfReads, "redrawing a page downloaded the PDF again");
+    } finally {
+      HTMLCanvasElement.prototype.getContext = nativeGetContext;
+    }
     assert(!errors.length, `the pane reported errors: ${errors.map((error) => error.message).join("; ")}`);
 
     // Where folders cannot be read through a checked handle, the tree says
