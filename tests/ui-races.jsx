@@ -9649,9 +9649,6 @@ async function filesPaneRegression() {
   return true;
 }
 
-// ⌘P (Ctrl+P elsewhere) shows Files and puts the cursor in Go to file with
-// its text selected, whether Files was closed, already open, or a tab in the
-// compact layout.
 // Storage that is full or refused never takes the workspace down: the
 // hidden-files choice stays in memory and the listing still follows it.
 async function filesHiddenPreferenceStorageRegression() {
@@ -9713,6 +9710,9 @@ async function filesHiddenPreferenceStorageRegression() {
   return true;
 }
 
+// ⌘P (Ctrl+P elsewhere) shows Files and puts the cursor in Go to file with
+// its text selected, whether Files was closed, already open, or a tab in the
+// compact layout.
 async function filesQuickOpenRegression() {
   if (!window.__fixtureSetViewport) return false;
   root.render(null);

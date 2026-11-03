@@ -375,9 +375,11 @@ async function linkTarget(root, logical) {
 
 // Accepts a relative path with "/" separators ("\\" too on Windows). An
 // absolute path, a parent segment, or Git's own metadata is refused before
-// the file system is touched.
+// the file system is touched. A drive prefix ("C:x" is drive-relative) is
+// refused only on Windows; elsewhere "C:docs" is an ordinary name.
 // A refused path is PATH_OUTSIDE; OUTSIDE_WORKTREE means a link leads out.
-function relativePath(value, limits, allowRoot) {
+export function relativePath(value, limits = FILE_BROWSER_LIMITS, allowRoot = false, platform = process.platform) {
+  const windows = platform === "win32";
   if (value === undefined || value === null || value === "") {
     if (allowRoot) return "";
     throw fileError(400, "A file path is required", "PATH_INVALID");
@@ -385,10 +387,10 @@ function relativePath(value, limits, allowRoot) {
   if (typeof value !== "string" || value.length > limits.maxPathLength || value.includes("\0")) {
     throw fileError(400, "The file path is invalid", "PATH_INVALID");
   }
-  if (path.isAbsolute(value) || path.posix.isAbsolute(value) || /^[A-Za-z]:/.test(value)) {
+  if (path.posix.isAbsolute(value) || (windows && (path.win32.isAbsolute(value) || /^[A-Za-z]:/.test(value)))) {
     throw fileError(403, "Paths must be relative to the worktree", "PATH_OUTSIDE");
   }
-  const segments = value.split(process.platform === "win32" ? /[\\/]/ : "/").filter((segment) => segment && segment !== ".");
+  const segments = value.split(windows ? /[\\/]/ : "/").filter((segment) => segment && segment !== ".");
   if (segments.includes("..")) throw fileError(403, "Paths must stay inside the worktree", "PATH_OUTSIDE");
   if (excludedSegments(segments)) throw fileError(403, "Git metadata is not browsable", "EXCLUDED");
   if (!segments.length && !allowRoot) throw fileError(400, "A file path is required", "PATH_INVALID");

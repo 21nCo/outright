@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
 import test from "node:test";
-import { FILE_BROWSER_LIMITS, createFileBrowser, noFollowAnyFlag } from "./file-browser.mjs";
+import { FILE_BROWSER_LIMITS, createFileBrowser, noFollowAnyFlag, relativePath } from "./file-browser.mjs";
 
 const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da63f8ffff3f0005fe02fea7d6a4a70000000049454e44ae426082", "hex");
 const posixOnly = { skip: process.platform === "win32" && "symlinks and FIFOs need POSIX semantics" };
@@ -353,6 +353,37 @@ test("a file whose ancestor is swapped around each check by name is refused, and
   assert.equal((await refusal(plain.preview(root, "docs/inner/guide.md"))).code, "PREVIEW_UNAVAILABLE");
   // With nothing swapped, a proven location previews normally.
   assert.equal((await createFileBrowser().preview(root, "docs/inner/guide.md")).text, "# Inside\n");
+});
+
+test("a name with a drive-like prefix is browsable outside Windows, where only real outside paths are refused", { skip: process.platform === "win32" && "a drive prefix is a real location on Windows" }, async (t) => {
+  const { base, root, write } = fixture(t);
+  write("a:notes.md", "# Colon\n");
+  write("C:docs/inner.txt", "inside");
+  write("README.md", "# Hello\n");
+  writeFileSync(path.join(base, "outside.txt"), "outside");
+  const files = createFileBrowser();
+  const shown = await files.list(root);
+  assert.deepEqual(shown.entries.map((entry) => [entry.path, entry.kind]), [["C:docs", "directory"], ["a:notes.md", "file"], ["README.md", "file"]]);
+  // A listed entry can be previewed and expanded, as any other name.
+  assert.equal((await files.preview(root, "a:notes.md")).text, "# Colon\n");
+  assert.deepEqual((await files.list(root, { directory: "C:docs" })).entries.map((entry) => entry.path), ["C:docs/inner.txt"]);
+  assert.equal((await files.preview(root, "C:docs/inner.txt")).text, "inside");
+  // The real outside routes stay refused.
+  for (const target of [path.join(base, "outside.txt"), "/etc/hosts", "../outside.txt", "C:docs/../../outside.txt"]) {
+    assert.equal((await refusal(files.preview(root, target))).code, "PATH_OUTSIDE", target);
+  }
+  assert.equal((await refusal(files.preview(root, "C:docs/.git/config"))).code, "EXCLUDED");
+});
+
+test("a drive prefix or a Windows absolute path is refused only on Windows", () => {
+  const outside = (value, platform) => assert.throws(() => relativePath(value, FILE_BROWSER_LIMITS, false, platform), (error) => error.details?.code === "PATH_OUTSIDE", `${platform}: ${value}`);
+  for (const value of ["C:x", "c:docs/a.md", "C:\\x", "\\\\server\\share\\x", "\\x", "/x", "a\\..\\..\\x"]) outside(value, "win32");
+  assert.equal(relativePath("docs\\a.md", FILE_BROWSER_LIMITS, false, "win32"), "docs/a.md");
+  for (const value of ["/x", "../x", "a/../b"]) outside(value, "linux");
+  for (const [value, expected] of [["C:x", "C:x"], ["a:notes.md", "a:notes.md"], ["C:docs/a.md", "C:docs/a.md"], ["a\\b", "a\\b"]]) {
+    assert.equal(relativePath(value, FILE_BROWSER_LIMITS, false, "linux"), expected, value);
+    assert.equal(relativePath(value, FILE_BROWSER_LIMITS, false, "darwin"), expected, value);
+  }
 });
 
 test("O_NOFOLLOW_ANY is trusted only on macOS kernels that enforce it", (t) => {
