@@ -4,7 +4,7 @@ import { MARKDOWN_NODE_BUDGET, linkTarget, parseInline, parseMarkdown, parseMark
 import { failedModuleUrl, retryingImport } from "../src/lib/module-retry.js";
 import { PDF_CANVAS_LIMITS, pdfCanvasSize } from "../src/lib/pdf-canvas.js";
 import { pdfWorkerStarter } from "../src/lib/pdf-worker.js";
-import { ancestorsOf, entryRowId, isExpandable, normalizeTypedPath, samePreview, treeKeyTarget, visibleRows } from "../src/lib/file-tree.js";
+import { HIDDEN_FILES_KEY, ancestorsOf, entryRowId, isExpandable, normalizeTypedPath, readHiddenPreference, samePreview, saveHiddenPreference, treeKeyTarget, visibleRows } from "../src/lib/file-tree.js";
 
 const types = (nodes) => nodes.map((node) => node.type);
 function collect(blocks, found = []) {
@@ -337,4 +337,22 @@ test("a pdf.js worker that fails before it is ready fails its document and is st
   assert.equal(third.worker.terminated, false);
   // A worker that started clears the failure: the next start uses the plain address.
   assert.equal(start("/assets/pdf.worker.mjs").worker.url, "http://app.test/assets/pdf.worker.mjs");
+});
+
+test("the hidden-files choice is saved when storage allows it, and storage that refuses never throws", () => {
+  const saved = new Map();
+  const working = () => ({ getItem: (key) => saved.get(key) ?? null, setItem: (key, value) => { saved.set(key, value); } });
+  assert.equal(readHiddenPreference(working), false);
+  assert.equal(saveHiddenPreference(working, true), true);
+  assert.equal(saved.get(HIDDEN_FILES_KEY), "true");
+  assert.equal(readHiddenPreference(working), true);
+  const quota = Object.assign(new Error("The quota has been exceeded."), { name: "QuotaExceededError" });
+  const security = Object.assign(new Error("Access is denied for this document."), { name: "SecurityError" });
+  const full = () => ({ getItem: () => { throw security; }, setItem: () => { throw quota; } });
+  assert.equal(readHiddenPreference(full), false);
+  assert.equal(saveHiddenPreference(full, true), false);
+  // A browser can refuse the localStorage property itself.
+  const refused = () => { throw security; };
+  assert.equal(readHiddenPreference(refused), false);
+  assert.equal(saveHiddenPreference(refused, false), false);
 });

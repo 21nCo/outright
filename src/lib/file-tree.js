@@ -24,6 +24,21 @@ export function rowElement(tree, id) {
   return null;
 }
 
+// The show-hidden choice is saved in the browser. Storage that is full,
+// unavailable or refused (a private window, a sandboxed frame) keeps the
+// choice in memory for this pane: reading gives false and saving returns
+// false, and neither throws into the workspace. `storage` returns the
+// Storage, so a refused localStorage getter is caught here too.
+export const HIDDEN_FILES_KEY = "outright.files.show-hidden";
+
+export function readHiddenPreference(storage) {
+  try { return storage().getItem(HIDDEN_FILES_KEY) === "true"; } catch { return false; }
+}
+
+export function saveHiddenPreference(storage, value) {
+  try { storage().setItem(HIDDEN_FILES_KEY, String(Boolean(value))); return true; } catch { return false; }
+}
+
 export function isFolderPath(path) { return typeof path === "string" && path !== ""; }
 
 export function visibleRows(folders, expanded) {

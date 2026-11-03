@@ -9652,6 +9652,67 @@ async function filesPaneRegression() {
 // ⌘P (Ctrl+P elsewhere) shows Files and puts the cursor in Go to file with
 // its text selected, whether Files was closed, already open, or a tab in the
 // compact layout.
+// Storage that is full or refused never takes the workspace down: the
+// hidden-files choice stays in memory and the listing still follows it.
+async function filesHiddenPreferenceStorageRegression() {
+  root.render(null);
+  await settle();
+  const project = { id: "A", name: "Review A", path: "/fixture/A" };
+  const worktree = { id: "A", name: "A", path: "/fixture/A", branch: "main" };
+  const listings = [];
+  route = async (url) => {
+    if (url.pathname !== "/api/files") return response({ error: "unexpected" }, 404);
+    const hidden = url.searchParams.get("hidden") === "true";
+    listings.push(hidden);
+    const entries = [...(hidden ? [{ name: ".env", path: ".env", kind: "file", hidden: true }] : []), { name: "notes.md", path: "notes.md", kind: "file", hidden: false }];
+    return response({ directory: "", entries, nextCursor: null, total: entries.length, remaining: 0, hiddenCount: 1, truncated: false });
+  };
+  const KEY = "outright.files.show-hidden";
+  const { getItem, setItem } = Storage.prototype;
+  const refusals = { read: 0, write: 0 };
+  Storage.prototype.getItem = function (key) {
+    if (key === KEY) { refusals.read += 1; throw new DOMException("Access is denied for this document.", "SecurityError"); }
+    return getItem.call(this, key);
+  };
+  Storage.prototype.setItem = function (key, value) {
+    if (key === KEY) { refusals.write += 1; throw new DOMException("The quota has been exceeded.", "QuotaExceededError"); }
+    return setItem.call(this, key, value);
+  };
+  const uncaught = [];
+  const onError = (event) => uncaught.push(event.error?.message ?? event.message);
+  const onRejection = (event) => uncaught.push(String(event.reason?.message ?? event.reason));
+  window.addEventListener("error", onError);
+  window.addEventListener("unhandledrejection", onRejection);
+  const errors = [];
+  const row = (name) => [...host.querySelectorAll('.files-pane [role="treeitem"]')].find((item) => item.querySelector(".tree-label")?.textContent === name);
+  const toggle = () => host.querySelector('.files-pane button[aria-label="Show hidden files"]');
+  const workspaceStays = () => host.querySelector(".conversation-fixture")?.textContent === "Conversation stays" && host.querySelector(".other-pane-fixture") && host.querySelector(".files-pane");
+  try {
+    root.render(<TooltipProvider><div className="workspace-fixture"><p className="conversation-fixture">Conversation stays</p><p className="other-pane-fixture">Terminal stays</p>
+      <FilesPane project={project} worktree={worktree} settings={{ editor: "zed" }} onError={(error) => errors.push(error)} /></div></TooltipProvider>);
+    await until(() => row("notes.md"), `the root was not listed when storage refused the saved choice: ${uncaught.join("; ") || host.textContent.slice(0, 160)}`);
+    assert(refusals.read > 0 && refusals.write > 0, "the fixture did not refuse the saved hidden-files choice");
+    assert(workspaceStays() && toggle()?.getAttribute("aria-pressed") === "false" && !row(".env"), "refused storage did not start with hidden files off");
+    toggle().click();
+    await until(() => row(".env") && toggle().getAttribute("aria-pressed") === "true", `turning on hidden files with full storage did not list the dotfile: ${uncaught.join("; ")}`);
+    assert(listings.at(-1) === true, "turning on hidden files did not reread the folder");
+    toggle().click();
+    await until(() => !row(".env") && row("notes.md") && toggle().getAttribute("aria-pressed") === "false", "turning hidden files off again with full storage did not hide the dotfile");
+    await settle();
+    assert(workspaceStays(), "full or refused storage took down the workspace");
+    assert(!uncaught.length, `full or refused storage threw out of Files: ${uncaught.join("; ")}`);
+    assert(!errors.length, `full or refused storage was reported as a Files error: ${errors.map((error) => error.message)}`);
+  } finally {
+    Storage.prototype.getItem = getItem;
+    Storage.prototype.setItem = setItem;
+    window.removeEventListener("error", onError);
+    window.removeEventListener("unhandledrejection", onRejection);
+    root.render(null);
+    await settle();
+  }
+  return true;
+}
+
 async function filesQuickOpenRegression() {
   if (!window.__fixtureSetViewport) return false;
   root.render(null);
@@ -10975,6 +11036,7 @@ try {
     ["files pdf library load", filesPdfLibraryLoadRegression, "a pdf.js library that does not load is reported in the preview, and Retry loads it without a page reload"],
     ["files pdf worker load", filesPdfWorkerLoadRegression, "a pdf.js worker that does not load is reported in the preview, Retry starts a new one without a page reload, and no PDF parses on the main thread"],
     ["files pane", filesPaneRegression, "folders load lazily and page, the tree is keyboard navigable, hidden files are a control, previews never run their content, and missing, outside, oversized and unsupported files say so"],
+    ["files hidden preference storage", filesHiddenPreferenceStorageRegression, "full or refused browser storage keeps the hidden-files choice in memory, the listing follows it and the workspace stays"],
     ["files quick open", filesQuickOpenRegression, "Cmd/Ctrl+P shows Files and focuses Go to file with its text selected, from a closed, open or compact Files pane", "the compact layout requires the CDP viewport bridge"],
     ["narrow toolbar", narrowToolbarRegression, "at 320px with the sidebar closed every toolbar action stays inside the window, with and without a lifecycle chip, and the Panes menu toggles panes", "toolbar geometry requires the CDP viewport bridge"],
     ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],

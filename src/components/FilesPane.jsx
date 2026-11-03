@@ -3,10 +3,11 @@ import { ArrowsClockwise, CaretDown, CaretRight, Eye, EyeSlash, File, FileImage,
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { FilePreview } from "@/components/FilePreview";
-import { ancestorsOf, isFolderPath, normalizeTypedPath, rowElement, treeKeyTarget, visibleRows } from "@/lib/file-tree";
+import { ancestorsOf, isFolderPath, normalizeTypedPath, readHiddenPreference, rowElement, saveHiddenPreference, treeKeyTarget, visibleRows } from "@/lib/file-tree";
 import { api, query } from "@/lib/runtime-api";
 
-const HIDDEN_KEY = "outright.files.show-hidden";
+// Read inside the helpers, so a browser that refuses storage access is caught there.
+const browserStorage = () => window.localStorage;
 const REFRESH_EVENTS = new Set(["run.completed", "run.failed", "run.stopped"]);
 // The runtime's default and largest folder page sizes.
 const PAGE_SIZE = 200;
@@ -16,7 +17,7 @@ const MAX_PAGE_SIZE = 500;
 // loaded can appear for another one; each folder's request is fenced by a
 // token, so a reload or a hidden-file change supersedes answers in flight.
 export function FilesPane({ project, worktree, settings, runtimeEvent, conversationIds, quickOpen, onQuickOpenHandled, onError }) {
-  const [showHidden, setShowHidden] = useState(() => localStorage.getItem(HIDDEN_KEY) === "true");
+  const [showHidden, setShowHidden] = useState(() => readHiddenPreference(browserStorage));
   const [folders, setFolders] = useState(() => new Map());
   const [expanded, setExpanded] = useState(() => new Set());
   const [focusedId, setFocusedId] = useState("");
@@ -104,7 +105,7 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, conversat
   useEffect(() => { void loadFolder(""); }, [loadFolder]);
   const listedHiddenRef = useRef(showHidden);
   useEffect(() => {
-    localStorage.setItem(HIDDEN_KEY, String(showHidden));
+    saveHiddenPreference(browserStorage, showHidden);
     if (listedHiddenRef.current === showHidden) return;
     listedHiddenRef.current = showHidden;
     reloadAll();
