@@ -3,7 +3,7 @@ import { ArrowsClockwise, CaretDown, CaretRight, Eye, EyeSlash, File, FileImage,
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { FilePreview } from "@/components/FilePreview";
-import { ancestorsOf, normalizeTypedPath, treeKeyTarget, visibleRows } from "@/lib/file-tree";
+import { ancestorsOf, isFolderPath, normalizeTypedPath, treeKeyTarget, visibleRows } from "@/lib/file-tree";
 import { api, query } from "@/lib/runtime-api";
 
 const HIDDEN_KEY = "outright.files.show-hidden";
@@ -31,24 +31,47 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen
   useLayoutEffect(() => { foldersRef.current = folders; expandedRef.current = expanded; hiddenRef.current = showHidden; });
   useEffect(() => () => { aliveRef.current = false; }, []);
 
-  const loadFolder = useCallback(async (directory, cursor = null) => {
-    const token = (tokensRef.current.get(directory) ?? 0) + 1;
-    tokensRef.current.set(directory, token);
-    setFolders((current) => withFolder(current, directory, cursor
-      ? { ...current.get(directory), loadingMore: true, moreError: "" }
-      : { ...current.get(directory), status: "loading" }));
-    const fresh = () => aliveRef.current && tokensRef.current.get(directory) === token;
+  const reportable = (error) => error.status === 429 || (error.status >= 500 && error.payload?.code !== "LISTING_UNAVAILABLE");
+
+  // Reads a folder's first page. Each read starts a new listing generation:
+  // an older first page or a "load more" from an older listing is dropped.
+  const loadFolder = useCallback(async (directory) => {
+    if (typeof directory !== "string") return;
+    const generation = (tokensRef.current.get(directory) ?? 0) + 1;
+    tokensRef.current.set(directory, generation);
+    const hidden = hiddenRef.current;
+    setFolders((current) => withFolder(current, directory, { ...current.get(directory), status: "loading", loadingMore: false, moreError: "" }));
+    const fresh = () => aliveRef.current && tokensRef.current.get(directory) === generation;
     try {
-      const page = await api(query("/api/files", { projectId: project.id, path: worktree.path, dir: directory, cursor, hidden: hiddenRef.current ? "true" : undefined }));
+      const page = await api(query("/api/files", { projectId: project.id, path: worktree.path, dir: directory, hidden: hidden ? "true" : undefined }));
       if (!fresh()) return;
-      setFolders((current) => withFolder(current, directory, { status: "loaded", entries: cursor ? [...(current.get(directory)?.entries ?? []), ...page.entries] : page.entries,
+      setFolders((current) => withFolder(current, directory, { status: "loaded", generation, hidden, entries: page.entries,
         nextCursor: page.nextCursor, total: page.total, hiddenCount: page.hiddenCount, truncated: page.truncated, scanLimit: page.scanLimit }));
     } catch (error) {
       if (!fresh()) return;
-      if (error.status === 429 || error.status >= 500) onError(error);
-      setFolders((current) => withFolder(current, directory, cursor
-        ? { ...current.get(directory), loadingMore: false, moreError: error.message }
-        : { status: "error", error: { message: error.message, code: error.payload?.code ?? "" } }));
+      if (reportable(error)) onError(error);
+      setFolders((current) => withFolder(current, directory, { status: "error", error: { message: error.message, code: error.payload?.code ?? "" } }));
+    }
+  }, [project.id, worktree.path, onError]);
+
+  // Reads the next page of the listing that is shown, with that listing's
+  // cursor and hidden-file policy. It never supersedes a first-page read.
+  const loadMore = useCallback(async (directory) => {
+    const folder = foldersRef.current.get(directory);
+    const generation = tokensRef.current.get(directory);
+    if (!folder || folder.status !== "loaded" || !folder.nextCursor || folder.loadingMore || folder.generation !== generation) return;
+    const installed = (current) => current.get(directory)?.status === "loaded" && current.get(directory).generation === generation;
+    setFolders((current) => installed(current) ? withFolder(current, directory, { ...current.get(directory), loadingMore: true, moreError: "" }) : current);
+    const fresh = () => aliveRef.current && tokensRef.current.get(directory) === generation;
+    try {
+      const page = await api(query("/api/files", { projectId: project.id, path: worktree.path, dir: directory, cursor: folder.nextCursor, hidden: folder.hidden ? "true" : undefined }));
+      if (!fresh()) return;
+      setFolders((current) => installed(current) ? withFolder(current, directory, { ...current.get(directory), loadingMore: false, entries: [...current.get(directory).entries, ...page.entries],
+        nextCursor: page.nextCursor, total: page.total, hiddenCount: page.hiddenCount, truncated: page.truncated, scanLimit: page.scanLimit }) : current);
+    } catch (error) {
+      if (!fresh()) return;
+      if (reportable(error)) onError(error);
+      setFolders((current) => installed(current) ? withFolder(current, directory, { ...current.get(directory), loadingMore: false, moreError: error.message }) : current);
     }
   }, [project.id, worktree.path, onError]);
 
@@ -146,6 +169,7 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen
   }, [activeId, foundIndex, focusedId, rows]);
 
   const toggleFolder = useCallback((path, open) => {
+    if (!isFolderPath(path)) return;
     setExpanded((current) => {
       const next = new Set(current);
       if (open) next.add(path); else next.delete(path);
@@ -156,7 +180,7 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen
   }, [loadFolder]);
 
   const activate = (row) => {
-    if (row.type === "more" && !row.loading) void loadFolder(row.directory, foldersRef.current.get(row.directory)?.nextCursor);
+    if (row.type === "more" && !row.loading) void loadMore(row.directory);
     else if (row.type === "error") void loadFolder(row.directory);
     else if (row.type === "entry" && row.entry.path) {
       if (row.expandable) toggleFolder(row.entry.path, !row.open);
@@ -217,6 +241,7 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen
   const root = folders.get("");
   const rowLabel = (row) => {
     if (row.type === "loading") return "Loading…";
+    if (row.type === "unavailable") return `${row.error.message}.`;
     if (row.type === "error") return row.error.code === "MISSING" ? `${row.directory || "This worktree"} no longer exists. Retry` : `Could not open ${row.directory || "the worktree"}: ${row.error.message}. Retry`;
     if (row.type === "empty") return row.hiddenCount && !showHidden ? `Empty, ${row.hiddenCount} hidden` : "Empty folder";
     if (row.type === "more") return row.loading ? "Loading more…" : row.error ? `Could not load more: ${row.error}. Retry` : `Load ${Math.min(row.remaining, 200)} more of ${row.remaining}`;
@@ -259,7 +284,7 @@ function TreeRow({ row, label, active, selected, onFocus, onActivate }) {
   const isEntry = row.type === "entry";
   let icon = null;
   let note = "";
-  if (!isEntry) icon = row.type === "loading" || row.loading ? <SpinnerGap className="spin" /> : row.type === "error" || row.error ? <WarningCircle /> : null;
+  if (!isEntry) icon = row.type === "loading" || row.loading ? <SpinnerGap className="spin" /> : row.type === "error" || row.type === "unavailable" || row.error ? <WarningCircle /> : null;
   else if (entry.kind === "symlink") {
     const state = entry.target?.state;
     icon = state === "outside" || state === "missing" ? <LinkBreak /> : <LinkSimple />;
@@ -271,7 +296,7 @@ function TreeRow({ row, label, active, selected, onFocus, onActivate }) {
   return <div role="treeitem" data-row-id={row.id} tabIndex={active ? 0 : -1} aria-level={row.level}
     aria-setsize={isEntry ? row.setSize : undefined} aria-posinset={isEntry ? row.position : undefined}
     aria-expanded={row.expandable ? row.open : undefined} aria-selected={isEntry && !row.expandable ? selected : undefined}
-    aria-disabled={(isEntry && !entry.path) || row.type === "empty" || row.type === "truncated" || row.type === "loading" || undefined}
+    aria-disabled={(isEntry && !entry.path) || row.type === "empty" || row.type === "unavailable" || row.type === "truncated" || row.type === "loading" || undefined}
     className={`tree-row tree-${row.type}${selected ? " is-selected" : ""}${entry?.hidden ? " is-hidden" : ""}`}
     style={{ "--tree-level": row.level - 1 }} onFocus={onFocus} onClick={onActivate}>
     <span className="tree-caret" aria-hidden="true">{row.expandable ? (row.open ? <CaretDown /> : <CaretRight />) : null}</span>

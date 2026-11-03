@@ -2,25 +2,36 @@
 // row is an entry, or a folder's loading, failure, empty, "load more" or
 // scan-limit state; each is reachable from the keyboard. Folders are kept in
 // a Map keyed by path, so a folder named "constructor" or "__proto__" is an
-// ordinary key rather than an inherited property.
+// ordinary key rather than an inherited property. An entry without a path
+// (a name that is not UTF-8) cannot be addressed, so it never expands.
 
-export function isExpandable(entry) { return entry?.kind === "directory" || (entry?.kind === "symlink" && entry.target?.state === "directory"); }
+export function isExpandable(entry) {
+  return isFolderPath(entry?.path) && (entry.kind === "directory" || (entry.kind === "symlink" && entry.target?.state === "directory"));
+}
+
+export function isFolderPath(path) { return typeof path === "string" && path !== ""; }
 
 export function visibleRows(folders, expanded) {
   const rows = [];
+  // A folder is shown once per tree, however its entries name it.
+  const visited = new Set();
   const visit = (directory, level) => {
+    visited.add(directory);
     const folder = folders.get(directory);
     if (!folder || (folder.status === "loading" && !folder.entries)) { rows.push({ id: `loading:${directory}`, type: "loading", directory, level }); return; }
+    if (folder.status === "error" && folder.error?.code === "LISTING_UNAVAILABLE") { rows.push({ id: `unavailable:${directory}`, type: "unavailable", directory, level, error: folder.error }); return; }
     if (folder.status === "error") { rows.push({ id: `error:${directory}`, type: "error", directory, level, error: folder.error }); return; }
     if (!folder.entries.length) rows.push({ id: `empty:${directory}`, type: "empty", directory, level, hiddenCount: folder.hiddenCount });
     folder.entries.forEach((entry, index) => {
       const expandable = isExpandable(entry);
-      const open = expandable && expanded.has(entry.path);
+      const open = expandable && expanded.has(entry.path) && !visited.has(entry.path);
       rows.push({ id: `entry:${entry.path ?? `${directory}\u0000${entry.name}`}`, type: "entry", entry, directory, level, expandable, open,
         setSize: Math.max(folder.total, folder.entries.length), position: index + 1 });
       if (open) visit(entry.path, level + 1);
     });
-    if (folder.nextCursor) rows.push({ id: `more:${directory}`, type: "more", directory, level, loading: Boolean(folder.loadingMore), error: folder.moreError, remaining: folder.total - folder.entries.length });
+    // While the first page reloads, the old cursor belongs to a listing that
+    // is being replaced, so "load more" waits for the new one.
+    if (folder.nextCursor) rows.push({ id: `more:${directory}`, type: "more", directory, level, loading: Boolean(folder.loadingMore) || folder.status === "loading", error: folder.moreError, remaining: folder.total - folder.entries.length });
     if (folder.truncated) rows.push({ id: `truncated:${directory}`, type: "truncated", directory, level, limit: folder.scanLimit });
   };
   visit("", 1);

@@ -8971,7 +8971,8 @@ async function filesPaneRegression() {
   const worktree = { id: "A", name: "A", path: "/fixture/A", branch: "main" };
   const many = Array.from({ length: 250 }, (_, index) => ({ name: `item-${String(index).padStart(3, "0")}.txt`, path: `many/item-${String(index).padStart(3, "0")}.txt`, kind: "file", hidden: false }));
   const entry = (name, kind = "file", extra = {}) => ({ name, path: name, kind, hidden: name.startsWith("."), ...extra });
-  const rootEntries = (hidden) => [entry("docs", "directory"), entry("flaky", "directory"), entry("many", "directory"), ...(hidden ? [entry(".env")] : []), entry("app.bin"),
+  const unnamed = { name: "caf\uFFFD", path: null, kind: "directory", hidden: false };
+  const rootEntries = (hidden) => [entry("docs", "directory"), entry("flaky", "directory"), entry("many", "directory"), unnamed, ...(hidden ? [entry(".env")] : []), entry("app.bin"),
     entry("escape.txt", "symlink", { target: { state: "outside" } }), entry("huge.log"), entry("notes.md"), entry("report.pdf"), entry("slow.md")];
   const pdf = new TextEncoder().encode(["%PDF-1.4", "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj", "2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj",
     "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj",
@@ -8989,12 +8990,16 @@ async function filesPaneRegression() {
   const requests = [];
   const gates = new Map();
   let flakyReads = 0;
+  let listingUnavailable = false;
   route = async (url) => {
     const parameters = Object.fromEntries(url.searchParams);
     requests.push({ ...parameters, route: url.pathname });
-    if (gates.has(`${url.pathname}:${parameters.dir ?? parameters.file}`)) await gates.get(`${url.pathname}:${parameters.dir ?? parameters.file}`).promise;
+    // A gate holds one folder's first page, or (":more") its next page.
+    const gate = `${url.pathname}:${parameters.dir ?? parameters.file}${parameters.cursor ? ":more" : ""}`;
+    if (gates.has(gate)) await gates.get(gate).promise;
     if (url.pathname === "/api/files") {
       const hidden = parameters.hidden === "true";
+      if (listingUnavailable) return response({ error: "Folder listing is unavailable on this file system", code: "LISTING_UNAVAILABLE" }, 501);
       if (!parameters.dir) return response({ directory: "", entries: rootEntries(hidden), nextCursor: null, total: rootEntries(hidden).length, hiddenCount: 1, truncated: false });
       if (parameters.dir === "docs") return response({ directory: "docs", entries: [{ name: "guide.md", path: "docs/guide.md", kind: "file", hidden: false }], nextCursor: null, total: 1, hiddenCount: 0, truncated: false });
       if (parameters.dir === "flaky") {
@@ -9002,8 +9007,9 @@ async function filesPaneRegression() {
         if (flakyReads === 1) return response({ error: "flaky cannot be read", code: "UNREADABLE" }, 403);
         return response({ directory: "flaky", entries: [{ name: "steady.txt", path: "flaky/steady.txt", kind: "file", hidden: false }], nextCursor: null, total: 1, hiddenCount: 0, truncated: false });
       }
-      if (parameters.dir === "many") return response(parameters.cursor ? { entries: many.slice(200), nextCursor: null, total: 250, hiddenCount: 0, truncated: false }
-        : { entries: many.slice(0, 200), nextCursor: "page-2", total: 250, hiddenCount: 0, truncated: false });
+      const manyHidden = hidden ? [{ name: ".many-cache", path: "many/.many-cache", kind: "file", hidden: true }] : [];
+      if (parameters.dir === "many") return response(parameters.cursor ? { entries: many.slice(200), nextCursor: null, total: 250 + manyHidden.length, hiddenCount: 1, truncated: false }
+        : { entries: [...manyHidden, ...many.slice(0, 200)], nextCursor: "page-2", total: 250 + manyHidden.length, hiddenCount: 1, truncated: false });
     }
     if (url.pathname === "/api/files/preview") {
       const file = parameters.file;
@@ -9040,7 +9046,7 @@ async function filesPaneRegression() {
     assert(!row(".env"), "a dotfile was shown before hidden files were turned on");
     assert(tree().querySelectorAll('[role="treeitem"][tabindex="0"]').length === 1, "the tree does not have exactly one tab stop");
     const docs = row("docs");
-    assert(docs.getAttribute("aria-expanded") === "false" && docs.getAttribute("aria-level") === "1" && docs.getAttribute("aria-setsize") === "9", "a folder row lacks its tree state");
+    assert(docs.getAttribute("aria-expanded") === "false" && docs.getAttribute("aria-level") === "1" && docs.getAttribute("aria-setsize") === "10", "a folder row lacks its tree state");
     docs.focus();
     const docsGate = deferred();
     gates.set("/api/files:docs", docsGate);
@@ -9063,6 +9069,18 @@ async function filesPaneRegression() {
     await until(() => document.activeElement === row("docs"), "Home did not reach the first row");
     pressKey(document.activeElement, "n");
     await until(() => document.activeElement === row("notes.md"), "type-ahead did not find the next matching row");
+
+    // A folder whose name is not UTF-8 has no path, so it cannot be opened.
+    const unnamedRow = row("caf\uFFFD");
+    assert(unnamedRow.getAttribute("aria-expanded") === null && unnamedRow.getAttribute("aria-disabled") === "true", "a folder without a path is offered as expandable");
+    unnamedRow.focus();
+    const readsBefore = requests.length;
+    pressKey(unnamedRow, "ArrowRight");
+    pressKey(unnamedRow, "Enter");
+    unnamedRow.click();
+    await remainsTrue(() => requests.length === readsBefore && row("caf\uFFFD") && row("docs"), 150, "a folder without a path was read or broke the tree");
+    pressKey(document.activeElement, "ArrowDown");
+    await until(() => document.activeElement?.querySelector(".tree-label")?.textContent !== "caf\uFFFD", "the keyboard did not move on from a folder without a path");
 
     // A large folder pages on request.
     row("many").focus();
@@ -9173,7 +9191,59 @@ async function filesPaneRegression() {
     await settle();
     show({ type: "run.event", payload: { type: "message.delta" } });
     await until(() => listed("").length > rootReads && listed("docs").length > listedDocs + 2, "a completed run did not refresh the open folders");
+
+    // While a folder's first page reloads, its old "load more" waits: the old
+    // cursor and hidden-file policy never add to the replacing listing.
+    row("many").click();
+    await until(() => row(".many-cache") && tree().querySelector('[data-row-id="more:many"]'), "the large folder did not list its hidden entry");
+    const moreRow = () => tree().querySelector('[data-row-id="more:many"]');
+    const cursorReads = () => listed("many").filter((request) => request.cursor).length;
+    for (const [label, reload] of [["hiding dotfiles", () => toggle.click()], ["Refresh", () => host.querySelector('.files-pane button[aria-label="Refresh files"]').click()]]) {
+      const firstPage = deferred();
+      gates.set("/api/files:many", firstPage);
+      const pages = cursorReads();
+      const firstReads = listed("many").length;
+      reload();
+      await until(() => listed("many").length === firstReads + 1 && moreRow()?.textContent.includes("Loading more"), `${label}: Load more stayed available while the folder reloaded`);
+      moreRow().click();
+      pressKey(moreRow(), "Enter");
+      await remainsTrue(() => cursorReads() === pages, 100, `${label}: Load more read the old listing's next page during a reload`);
+      firstPage.resolve();
+      gates.delete("/api/files:many");
+      await until(() => moreRow()?.textContent === "Load 50 more of 50", `${label}: the reloaded first page was not installed`);
+      assert(!row(".many-cache") && row("item-000.txt") && !row("item-200.txt"), `${label}: the reloaded listing kept entries from the old one`);
+      assert(cursorReads() === pages, `${label}: a stale next page was requested`);
+    }
+    // A next page in flight when a reload starts is dropped.
+    const nextPage = deferred();
+    gates.set("/api/files:many:more", nextPage);
+    const pagesBefore = cursorReads();
+    moreRow().click();
+    await until(() => cursorReads() === pagesBefore + 1 && moreRow()?.textContent.includes("Loading more"), "Load more did not start");
+    host.querySelector('.files-pane button[aria-label="Refresh files"]').click();
+    await until(() => moreRow()?.textContent === "Load 50 more of 50", "Refresh did not replace a listing with a page in flight");
+    nextPage.resolve();
+    gates.delete("/api/files:many:more");
+    await remainsTrue(() => !row("item-200.txt") && moreRow()?.textContent === "Load 50 more of 50", 150, "a page from the replaced listing was appended");
     assert(!errors.length, `the pane reported errors: ${errors.map((error) => error.message).join("; ")}`);
+
+    // Where folders cannot be read through a checked handle, the tree says
+    // so in place; it is not a runtime error, and Go to file still works.
+    root.render(null);
+    await settle();
+    listingUnavailable = true;
+    root.render(<TooltipProvider><FilesPane project={project} worktree={worktree} settings={{ editor: "zed" }} onError={(error) => errors.push(error)} /></TooltipProvider>);
+    const unavailable = () => tree()?.querySelector('[data-row-id="unavailable:"]');
+    await until(() => unavailable(), "an unavailable listing was not shown in the tree");
+    assert(/Folder listing is unavailable on this file system/.test(unavailable().textContent) && unavailable().getAttribute("aria-disabled") === "true", "the unavailable listing is not an explicit state");
+    const listedBefore = listed("").length;
+    unavailable().click();
+    await remainsTrue(() => listed("").length === listedBefore && unavailable(), 100, "the unavailable state retried the listing");
+    assert(!errors.length, `an unavailable listing was reported as a runtime error: ${errors.map((error) => error.message).join("; ")}`);
+    const goTo = host.querySelector('.files-pane input[aria-label="Go to file path"]');
+    setControlValue(goTo, "notes.md");
+    goTo.form.requestSubmit();
+    await until(() => preview()?.querySelector(".markdown-preview h1")?.textContent === "Fixture notes", "Go to file did not preview a file while listing was unavailable");
   } finally {
     window.Worker = NativeWorker;
     localStorage.removeItem("outright.files.show-hidden");

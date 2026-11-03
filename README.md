@@ -14,7 +14,7 @@ Outright is a local-first workspace for running coding agents across Git project
 - Worktree checkpoints that keep staged, unstaged and untracked work, with an exact restore preview, selective restore and a checkpoint of what a restore replaces
 - Project spaces, searchable conversations/messages, draggable/pinnable/renamable/archivable tabs, cross-worktree conversation moves, prompt templates, notifications, and keyboard shortcuts
 - Repository context for AGENTS/Claude/Copilot instructions, local skills, and the current GitHub pull request
-- Split panes: place the conversation beside the terminal, changes, and context views; resize, move, and close panes; each worktree restores its own arrangement
+- Split panes: place the conversation beside the terminal, changes, context, and files views; resize, move, and close panes; each worktree restores its own arrangement
 - Light, dark, and system themes using DM Sans, Tailwind, shadcn/Base UI, and Phosphor icons
 
 ## Requirements
@@ -60,9 +60,24 @@ Outright only accepts Git and terminal operations for worktrees found by this sc
 
 ## Split panes
 
-The main view is a pane layout for the selected worktree. The conversation, controlled by the chat tabs above it, is always present; the Changes, Terminal, and Context toolbar buttons open or close their panes, and each pane's options menu splits it right or down, moves it, or closes it. Drag a pane's title onto an edge of another pane to dock it there. Each view appears at most once, so a layout has at most four panes, and moving a pane keeps its view mounted: a terminal keeps its session and output, and the conversation keeps its draft. Closing a pane leaves its shell running; reopening the Terminal pane reattaches to it.
+The main view is a pane layout for the selected worktree. The conversation, controlled by the chat tabs above it, is always present; the Changes, Terminal, Context, and Files toolbar buttons open or close their panes, and each pane's options menu splits it right or down, moves it, or closes it. Drag a pane's title onto an edge of another pane to dock it there. Each view appears at most once, so a layout has at most five panes, and moving a pane keeps its view mounted: a terminal keeps its session and output, and the conversation keeps its draft. Closing a pane leaves its shell running; reopening the Terminal pane reattaches to it.
 
 Separators resize with the pointer or, when focused, with the arrow keys, `Home`, and `End`; every pane keeps a minimum usable size that fits its view's own controls plus several message, diff, or terminal lines, and each view compacts its chrome to the size of its pane rather than the window. A conversation's notices (a recovery decision, an unsent first prompt, history navigation, live output) share one bounded, scrollable region above the composer with their actions kept in view, so the transcript always keeps several lines. When the window is too small for every pane's minimum, or narrower than 760px, panes are shown one at a time with tabs, and their views stay mounted; focus on a separator, pane tab, pane options button, or open pane options menu that this switch removes moves to the shown pane, and keyboard selection scrolls a clipped pane tab into view within the tab strip. Layouts are saved under each worktree's path, so worktrees whose names collide keep their own.
+
+## Files
+
+The Files pane browses the selected worktree without leaving it. Folders load when opened, 200 entries at a time with **Load more**; a folder with more than 10,000 entries lists only the first 10,000 and says so. Dotfiles are hidden until the eye control shows them, and `.git` is never listed or previewed. Symbolic links are marked as pointing inside the worktree, outside it, or nowhere; Files never follows a link out of the worktree and never opens a FIFO or other special file. **Go to file** (`Cmd/Ctrl P`) opens a path typed relative to the worktree. The tree is a single tab stop: arrow keys move and open or close folders, `Home` and `End` jump, `Enter` opens, and typing a letter moves to the next matching name.
+
+Previews never run the file's content:
+
+- Markdown, up to 1 MB, rendered without raw HTML (shown as text); only `http(s)` and `mailto` links leave the worktree, relative links open in Files, and only images inside the worktree load
+- Plain text, up to 1 MB
+- PNG, JPEG, GIF, WebP, AVIF, BMP, ICO and SVG images, up to 20 MB, served only when the bytes match the type; SVG is shown as an image, so its scripts never run
+- PDFs, up to 50 MB, drawn page by page by pdf.js without scripts, forms or annotations, with each page's text beside it
+
+Larger files, binary files and other types show an explicit oversized or unsupported state with a way to open them in your editor; a missing file or a link outside the worktree is reported in place.
+
+Folders are read only through the handle Outright checked, so a folder swapped for a link while it is read cannot expose files outside the worktree. That is possible on Linux (through `/proc`) and on macOS APFS volumes (through `/.vol`). On Windows and other file systems, the tree says that folder listing is unavailable, and Go to file and previews still work.
 
 Layouts are saved in the browser's local storage per worktree, for the 64 most recently arranged worktrees. A saved layout with an unknown or duplicate view or an invalid size is repaired on restore, and an unreadable one falls back to the conversation alone; Outright names the repair it made, and says only once per session when the saved layouts cannot be read at all.
 
@@ -112,6 +127,7 @@ A restore is refused while an agent run in the worktree is queued or running, wh
 - `Cmd/Ctrl K`: project, worktree, and conversation search
 - `Cmd/Ctrl N`: new conversation
 - `Cmd/Ctrl Shift T`: open or focus the terminal pane
+- `Cmd/Ctrl P`: show the Files pane and focus Go to file
 - `Cmd F` on macOS, `Ctrl Shift F` elsewhere, with focus in the terminal pane: find in its scrollback; `Enter` / `Shift Enter` move to the next (newer) or previous (older) match and `Escape` closes Find and returns to the terminal
 - `F6` / `Shift F6`: move focus to the next or previous pane
 - `Enter`: send a prompt

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { MARKDOWN_NODE_BUDGET, linkTarget, parseInline, parseMarkdown, parseMarkdownPreview } from "../src/lib/markdown.js";
 import { PDF_CANVAS_LIMITS, pdfCanvasSize } from "../src/lib/pdf-canvas.js";
-import { ancestorsOf, normalizeTypedPath, treeKeyTarget, visibleRows } from "../src/lib/file-tree.js";
+import { ancestorsOf, isExpandable, normalizeTypedPath, treeKeyTarget, visibleRows } from "../src/lib/file-tree.js";
 
 const types = (nodes) => nodes.map((node) => node.type);
 function collect(blocks, found = []) {
@@ -129,6 +129,29 @@ test("folders named like object properties are ordinary folders", () => {
   assert.deepEqual(visibleRows(folders, new Set(names)).map((row) => row.type), names.flatMap(() => ["entry", "loading"]));
   for (const name of names) folders.set(name, { status: "loaded", entries: [{ name: "inner.txt", path: `${name}/inner.txt`, kind: "file" }], total: 1, nextCursor: null });
   assert.deepEqual(visibleRows(folders, new Set(names)).filter((row) => row.level === 2).map((row) => row.entry.path), names.map((name) => `${name}/inner.txt`));
+});
+
+test("a folder without an addressable path never expands, and no folder is shown twice", () => {
+  // A non-UTF-8 folder name has no path. Before this rule, expanding it put
+  // null in the open set and the root, listed again under null, recursed.
+  const unnamed = { name: "caf\uFFFD", path: null, kind: "directory" };
+  const folders = new Map([["", { status: "loaded", entries: [unnamed, { name: "src", path: "src", kind: "directory" }], total: 2, nextCursor: null }]]);
+  folders.set(null, folders.get(""));
+  const rows = visibleRows(folders, new Set([null, "src"]));
+  assert.deepEqual(rows.map((row) => [row.type, row.expandable ?? null, row.open ?? null]), [["entry", false, false], ["entry", true, true], ["loading", null, null]]);
+  assert.equal(isExpandable(unnamed), false);
+  assert.equal(isExpandable({ name: "x", path: "", kind: "directory" }), false);
+  // A folder whose listing names an already-open ancestor is shown closed there.
+  folders.set("src", { status: "loaded", entries: [{ name: "loop", path: "src", kind: "symlink", target: { state: "directory", path: "src" } }], total: 1, nextCursor: null });
+  assert.deepEqual(visibleRows(folders, new Set(["src"])).map((row) => [row.id, row.open ?? null]), [["entry:\u0000caf\uFFFD", false], ["entry:src", true], ["entry:src", false]]);
+});
+
+test("a folder's next page waits while its first page reloads, and listing unavailable is its own state", () => {
+  const folder = (status) => ({ status, entries: [{ name: "a", path: "a", kind: "file" }], total: 300, nextCursor: "page-2" });
+  assert.equal(visibleRows(new Map([["", folder("loaded")]]), new Set()).at(-1).loading, false);
+  assert.equal(visibleRows(new Map([["", folder("loading")]]), new Set()).at(-1).loading, true);
+  const unavailable = visibleRows(new Map([["", { status: "error", error: { message: "Folder listing is unavailable", code: "LISTING_UNAVAILABLE" } }]]), new Set());
+  assert.deepEqual(unavailable.map((row) => [row.id, row.type]), [["unavailable:", "unavailable"]]);
 });
 
 test("a PDF page canvas stays within its per-side and total pixel budget, or the page is reported too large", () => {
