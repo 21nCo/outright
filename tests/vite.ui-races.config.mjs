@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { defineConfig } from "vite";
+import { pdfjsAssetsPlugin } from "../server/pdfjs-assets-plugin.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 // Images load through <img>, not the page's fetch, so the Files fixture's
@@ -27,5 +28,5 @@ export default defineConfig({
       "@": path.join(root, "src"),
     },
   },
-  plugins: [tailwindcss(), react(), fixtureRawFiles],
+  plugins: [tailwindcss(), react(), fixtureRawFiles, pdfjsAssetsPlugin()],
 });

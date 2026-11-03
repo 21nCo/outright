@@ -14,14 +14,14 @@ const REFRESH_EVENTS = new Set(["run.completed", "run.failed", "run.stopped"]);
 // token, so a reload or a hidden-file change supersedes answers in flight.
 export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen, onQuickOpenHandled, onError }) {
   const [showHidden, setShowHidden] = useState(() => localStorage.getItem(HIDDEN_KEY) === "true");
-  const [folders, setFolders] = useState({});
+  const [folders, setFolders] = useState(() => new Map());
   const [expanded, setExpanded] = useState(() => new Set());
   const [focusedId, setFocusedId] = useState("");
   const [selected, setSelected] = useState("");
   const [refreshKey, setRefreshKey] = useState(0);
   const [jump, setJump] = useState("");
   const [announcement, setAnnouncement] = useState("");
-  const tokensRef = useRef({});
+  const tokensRef = useRef(new Map());
   const foldersRef = useRef(folders);
   const expandedRef = useRef(expanded);
   const hiddenRef = useRef(showHidden);
@@ -32,32 +32,32 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen
   useEffect(() => () => { aliveRef.current = false; }, []);
 
   const loadFolder = useCallback(async (directory, cursor = null) => {
-    const token = (tokensRef.current[directory] ?? 0) + 1;
-    tokensRef.current[directory] = token;
-    setFolders((current) => ({ ...current, [directory]: cursor
-      ? { ...current[directory], loadingMore: true, moreError: "" }
-      : { ...current[directory], status: "loading" } }));
-    const fresh = () => aliveRef.current && tokensRef.current[directory] === token;
+    const token = (tokensRef.current.get(directory) ?? 0) + 1;
+    tokensRef.current.set(directory, token);
+    setFolders((current) => withFolder(current, directory, cursor
+      ? { ...current.get(directory), loadingMore: true, moreError: "" }
+      : { ...current.get(directory), status: "loading" }));
+    const fresh = () => aliveRef.current && tokensRef.current.get(directory) === token;
     try {
       const page = await api(query("/api/files", { projectId: project.id, path: worktree.path, dir: directory, cursor, hidden: hiddenRef.current ? "true" : undefined }));
       if (!fresh()) return;
-      setFolders((current) => ({ ...current, [directory]: { status: "loaded", entries: cursor ? [...(current[directory]?.entries ?? []), ...page.entries] : page.entries,
-        nextCursor: page.nextCursor, total: page.total, hiddenCount: page.hiddenCount, truncated: page.truncated, scanLimit: page.scanLimit } }));
+      setFolders((current) => withFolder(current, directory, { status: "loaded", entries: cursor ? [...(current.get(directory)?.entries ?? []), ...page.entries] : page.entries,
+        nextCursor: page.nextCursor, total: page.total, hiddenCount: page.hiddenCount, truncated: page.truncated, scanLimit: page.scanLimit }));
     } catch (error) {
       if (!fresh()) return;
       if (error.status === 429 || error.status >= 500) onError(error);
-      setFolders((current) => ({ ...current, [directory]: cursor
-        ? { ...current[directory], loadingMore: false, moreError: error.message }
-        : { status: "error", error: { message: error.message, code: error.payload?.code ?? "" } } }));
+      setFolders((current) => withFolder(current, directory, cursor
+        ? { ...current.get(directory), loadingMore: false, moreError: error.message }
+        : { status: "error", error: { message: error.message, code: error.payload?.code ?? "" } }));
     }
   }, [project.id, worktree.path, onError]);
 
   // Reloads the root and every open folder from their first page.
   const reloadAll = useCallback(() => {
-    for (const directory of Object.keys(foldersRef.current)) {
-      if (directory && !expandedRef.current.has(directory)) { tokensRef.current[directory] = (tokensRef.current[directory] ?? 0) + 1; }
+    for (const directory of foldersRef.current.keys()) {
+      if (directory && !expandedRef.current.has(directory)) tokensRef.current.set(directory, (tokensRef.current.get(directory) ?? 0) + 1);
     }
-    setFolders((current) => Object.fromEntries(Object.entries(current).filter(([directory]) => !directory || expandedRef.current.has(directory))));
+    setFolders((current) => new Map([...current].filter(([directory]) => !directory || expandedRef.current.has(directory))));
     for (const directory of ["", ...expandedRef.current]) void loadFolder(directory);
   }, [loadFolder]);
 
@@ -85,16 +85,65 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen
   useEffect(() => () => clearTimeout(refreshTimerRef.current), []);
 
   const rows = useMemo(() => visibleRows(folders, expanded), [folders, expanded]);
-  const activeIndex = Math.max(0, rows.findIndex((row) => row.id === focusedId));
+  // The active row is the tree's one tab stop. A target that has not appeared
+  // yet (Go to file, while its folder loads) is waited for; a row that was
+  // shown and then removed gives way to the row now at its position, so the
+  // first newly loaded entry follows a final "load more".
+  const activeIndexRef = useRef(0);
+  const shownIdRef = useRef("");
+  const foundIndex = rows.findIndex((row) => row.id === focusedId);
+  const activeIndex = foundIndex >= 0 ? foundIndex : Math.max(0, Math.min(activeIndexRef.current, rows.length - 1));
   const activeId = rows[activeIndex]?.id ?? "";
-
-  // Keyboard moves keep focus on the active row as rows load around it.
-  useLayoutEffect(() => {
+  // A keyboard move is pending until its row has focus. Otherwise the active
+  // row follows whichever row has focus.
+  const moveRef = useRef(false);
+  const moveFocus = useCallback((id) => { moveRef.current = true; setFocusedId(id); }, []);
+  // The row that had focus at the last commit, and whether focus is in the
+  // tree. A row removed while focused leaves focus on the page body, with no
+  // focus event in some browsers, so the last commit's focus is the evidence.
+  const lastFocusRef = useRef(null);
+  const rowsRef = useRef(rows);
+  const treeFocusedRef = useRef(false);
+  const noteFocusedRow = (element) => {
+    const focusedRow = element?.closest?.("[data-row-id]");
+    if (!focusedRow) return;
+    treeFocusedRef.current = true;
+    lastFocusRef.current = { id: focusedRow.dataset.rowId, index: rowsRef.current.findIndex((row) => row.id === focusedRow.dataset.rowId) };
+  };
+  const onTreeFocus = (event) => noteFocusedRow(event.target);
+  const onTreeBlur = (event) => {
     const tree = treeRef.current;
-    if (!tree?.contains(document.activeElement) || document.activeElement === tree) return;
-    const element = tree.querySelector(`[data-row-id="${CSS.escape(activeId)}"]`);
-    if (element && element !== document.activeElement) element.focus({ preventScroll: false });
-  }, [activeId, rows]);
+    if (event.relatedTarget) { treeFocusedRef.current = Boolean(tree?.contains(event.relatedTarget)); return; }
+    const left = event.target;
+    // Focus that leaves for nothing is kept only if its row was removed.
+    setTimeout(() => { if (left.isConnected && !tree?.contains(document.activeElement)) treeFocusedRef.current = false; });
+  };
+
+  useLayoutEffect(() => {
+    if (foundIndex >= 0) { activeIndexRef.current = foundIndex; shownIdRef.current = focusedId; }
+    else if (activeId && shownIdRef.current === focusedId) setFocusedId(activeId);
+    const tree = treeRef.current;
+    if (!tree) return;
+    const current = document.activeElement;
+    const currentRow = current && tree.contains(current) ? current.closest("[data-row-id]") : null;
+    let target = "";
+    if (currentRow) {
+      if (moveRef.current) target = activeId;
+      else if (currentRow.dataset.rowId !== focusedId && rows.some((row) => row.id === currentRow.dataset.rowId)) setFocusedId(currentRow.dataset.rowId);
+    } else if ((!current || current === document.body) && treeFocusedRef.current && lastFocusRef.current && rows.length) {
+      const { id, index } = lastFocusRef.current;
+      target = rows.some((row) => row.id === id) ? id : rows[Math.min(index, rows.length - 1)].id;
+      if (target !== focusedId) setFocusedId(target);
+    }
+    if (target) {
+      const element = tree.querySelector(`[data-row-id="${CSS.escape(target)}"]`);
+      if (element && element !== current) element.focus({ preventScroll: false });
+      if (element && target === activeId) moveRef.current = false;
+    }
+    rowsRef.current = rows;
+    if (tree.contains(document.activeElement)) noteFocusedRow(document.activeElement);
+    else if (document.activeElement && document.activeElement !== document.body) treeFocusedRef.current = false;
+  }, [activeId, foundIndex, focusedId, rows]);
 
   const toggleFolder = useCallback((path, open) => {
     setExpanded((current) => {
@@ -102,12 +151,12 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen
       if (open) next.add(path); else next.delete(path);
       return next;
     });
-    const folder = foldersRef.current[path];
+    const folder = foldersRef.current.get(path);
     if (open && (!folder || folder.status === "error")) void loadFolder(path);
   }, [loadFolder]);
 
   const activate = (row) => {
-    if (row.type === "more" && !row.loading) void loadFolder(row.directory, foldersRef.current[row.directory]?.nextCursor);
+    if (row.type === "more" && !row.loading) void loadFolder(row.directory, foldersRef.current.get(row.directory)?.nextCursor);
     else if (row.type === "error") void loadFolder(row.directory);
     else if (row.type === "entry" && row.entry.path) {
       if (row.expandable) toggleFolder(row.entry.path, !row.open);
@@ -116,6 +165,7 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen
   };
 
   const onTreeKeyDown = (event) => {
+    noteFocusedRow(event.target);
     if (event.altKey || event.ctrlKey || event.metaKey) return;
     // The row that has focus owns the key, even before its focus is rendered.
     const focusedIndex = rows.findIndex((item) => item.id === event.target.closest?.("[data-row-id]")?.dataset.rowId);
@@ -128,7 +178,7 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen
     const target = treeKeyTarget(rows, index, event.key);
     if (target < 0) return;
     event.preventDefault();
-    setFocusedId(rows[target].id);
+    moveFocus(rows[target].id);
   };
 
   const openPath = useCallback((value) => {
@@ -136,19 +186,19 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen
     if (!file) return;
     const ancestors = ancestorsOf(file);
     setExpanded((current) => new Set([...current, ...ancestors]));
-    for (const directory of ancestors) if (!foldersRef.current[directory]) void loadFolder(directory);
+    for (const directory of ancestors) if (!foldersRef.current.has(directory)) void loadFolder(directory);
     setSelected(file);
-    setFocusedId(`entry:${file}`);
+    moveFocus(`entry:${file}`);
     setAnnouncement(`Opening ${file}`);
-  }, [loadFolder]);
+  }, [loadFolder, moveFocus]);
 
   const revealFolder = useCallback((path) => {
     setSelected((current) => (current === path ? "" : current));
     setExpanded((current) => new Set([...current, ...ancestorsOf(path), path]));
-    for (const directory of [...ancestorsOf(path), path]) if (!foldersRef.current[directory]) void loadFolder(directory);
-    setFocusedId(`entry:${path}`);
+    for (const directory of [...ancestorsOf(path), path]) if (!foldersRef.current.has(directory)) void loadFolder(directory);
+    moveFocus(`entry:${path}`);
     setAnnouncement(`${path} is a folder; it is open in the tree`);
-  }, [loadFolder]);
+  }, [loadFolder, moveFocus]);
 
   const refreshFolderOf = useCallback((file) => {
     const directory = ancestorsOf(file).at(-1) ?? "";
@@ -164,7 +214,7 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen
     onQuickOpenHandled?.();
   }, [quickOpen, onQuickOpenHandled]);
 
-  const root = folders[""];
+  const root = folders.get("");
   const rowLabel = (row) => {
     if (row.type === "loading") return "Loading…";
     if (row.type === "error") return row.error.code === "MISSING" ? `${row.directory || "This worktree"} no longer exists. Retry` : `Could not open ${row.directory || "the worktree"}: ${row.error.message}. Retry`;
@@ -187,15 +237,21 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, quickOpen
     </form>
     <span className="sr-only" role="status" aria-live="polite">{announcement}</span>
     <div className="files-layout">
-      <div className="file-tree" role="tree" aria-label={`Files in ${worktree.name}`} aria-busy={root?.status === "loading"} ref={treeRef} onKeyDown={onTreeKeyDown}>
+      <div className="file-tree" role="tree" aria-label={`Files in ${worktree.name}`} aria-busy={root?.status === "loading"} ref={treeRef} onKeyDown={onTreeKeyDown} onFocus={onTreeFocus} onBlur={onTreeBlur}>
         {rows.map((row) => <TreeRow key={row.id} row={row} label={rowLabel(row)} active={row.id === activeId} selected={row.type === "entry" && row.entry.path === selected}
-          onFocus={() => setFocusedId(row.id)} onActivate={() => { setFocusedId(row.id); activate(row); }} />)}
+          onFocus={() => { moveRef.current = false; setFocusedId(row.id); }} onActivate={() => { moveRef.current = false; setFocusedId(row.id); activate(row); }} />)}
       </div>
       {selected ? <FilePreview key={selected} project={project} worktree={worktree} file={selected} refreshKey={refreshKey} settings={settings} onError={onError}
         onNavigate={openPath} onFolder={revealFolder} onRefreshFolder={refreshFolderOf} />
         : <div className="file-preview preview-state" role="note">Choose a file to preview it. Markdown, text, images and PDFs open here.</div>}
     </div>
   </section>;
+}
+
+function withFolder(folders, directory, folder) {
+  const next = new Map(folders);
+  next.set(directory, folder);
+  return next;
 }
 
 function TreeRow({ row, label, active, selected, onFocus, onActivate }) {

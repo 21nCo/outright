@@ -3,6 +3,7 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "node:path";
 import { outrightApiPlugin } from "./server/outright-vite-plugin.mjs";
+import { pdfjsAssetsPlugin } from "./server/pdfjs-assets-plugin.mjs";
 
 export default defineConfig({
   resolve: {
@@ -38,6 +39,7 @@ export default defineConfig({
   plugins: [
     tailwindcss(),
     react(),
+    pdfjsAssetsPlugin(),
     outrightApiPlugin({ configUrl: new URL("./outright.config.json", import.meta.url) }),
   ],
 });

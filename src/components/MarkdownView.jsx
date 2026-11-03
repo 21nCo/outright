@@ -1,12 +1,19 @@
-import { useMemo } from "react";
-import { linkTarget, parseMarkdown } from "@/lib/markdown";
+import { useMemo, useState } from "react";
+import { MARKDOWN_NODE_BUDGET, linkTarget, parseMarkdownPreview } from "@/lib/markdown";
 
 // Renders parsed Markdown as React elements only, so text is always escaped.
 // Relative links open the file in the preview; relative images load through
 // the runtime's verified image route; nothing loads from another origin.
+// A document that would render more than the node budget is shown as source.
 export function MarkdownView({ source, file, imageUrl, onNavigate }) {
-  const blocks = useMemo(() => parseMarkdown(source), [source]);
+  const { blocks, overBudget } = useMemo(() => parseMarkdownPreview(source), [source]);
   const context = { file, imageUrl, onNavigate };
+  if (overBudget) {
+    return <div className="markdown-over-budget">
+      <p className="preview-notice" role="status">This Markdown would render more than {MARKDOWN_NODE_BUDGET.toLocaleString()} elements, so its source is shown instead.</p>
+      <pre className="file-text" tabIndex={0} aria-label="Markdown source">{source}</pre>
+    </div>;
+  }
   return <div className="markdown-preview">{blocks.map((block, index) => <Block key={index} block={block} context={context} />)}</div>;
 }
 
@@ -51,10 +58,24 @@ function Inline({ nodes, context }) {
       }
       case "image": {
         const target = linkTarget(node.url, context.file);
-        if (target.kind === "file" && context.imageUrl) return <img key={index} src={context.imageUrl(target.path)} alt={node.alt} title={node.title || undefined} loading="lazy" />;
+        if (target.kind === "file" && context.imageUrl) return <MarkdownImage key={index} src={context.imageUrl(target.path)} alt={node.alt} title={node.title} path={target.path} />;
         return <span key={index} className="markdown-image-placeholder" title="Images from other sites are not loaded in previews">[Image not loaded{node.alt ? `: ${node.alt}` : ""}]</span>;
       }
       default: return null;
     }
   });
+}
+
+// A worktree image that cannot be loaded (missing, not an image, or refused
+// while the runtime is busy) says so and can be tried again.
+function MarkdownImage({ src, alt, title, path }) {
+  const [attempt, setAttempt] = useState(0);
+  const [failed, setFailed] = useState(false);
+  if (failed) {
+    return <span className="markdown-image-failed" role="note">
+      [Image could not be loaded{alt ? `: ${alt}` : ""}]
+      <button type="button" className="markdown-link" aria-label={`Retry image ${alt || path}`} onClick={() => { setFailed(false); setAttempt((value) => value + 1); }}>Retry</button>
+    </span>;
+  }
+  return <img key={attempt} src={src} alt={alt} title={title || undefined} loading="lazy" onError={() => setFailed(true)} />;
 }

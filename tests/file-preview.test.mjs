@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { linkTarget, parseInline, parseMarkdown } from "../src/lib/markdown.js";
+import { MARKDOWN_NODE_BUDGET, linkTarget, parseInline, parseMarkdown, parseMarkdownPreview } from "../src/lib/markdown.js";
 import { ancestorsOf, normalizeTypedPath, treeKeyTarget, visibleRows } from "../src/lib/file-tree.js";
 
 const types = (nodes) => nodes.map((node) => node.type);
@@ -45,23 +45,73 @@ test("only http(s) and mailto links leave a preview; relative links stay inside 
   assert.deepEqual([link.type, link.url, image.type, image.url], ["link", "https://example.com", "image", "https://tracker.example/p.png"]);
 });
 
-test("adversarial Markdown parses in bounded time", () => {
+// Each input is close to the 1 MiB text preview limit. A quadratic step
+// takes tens of seconds on any of them; linear parsing takes milliseconds.
+test("adversarial Markdown near the preview size limit parses in linear time", () => {
+  const size = 1024 * 1024 - 64;
+  const fill = (unit, tail = "") => unit.repeat(Math.floor((size - tail.length) / unit.length)) + tail;
+  const inputs = {
+    "unclosed emphasis": fill("*a "), "open brackets": fill("["), "backticks": fill("`"), "underscores": fill("_a "), "strong runs": fill("**"), "quotes": fill("> "),
+    "brackets before a rejected link": `${fill("[", "]x](t)")}`,
+    "brackets before an unclosed destination": `${fill("[", `](${"a".repeat(2000)} x`)}`,
+    "rejected closers": fill("[a]x](t) "),
+    "heading with trailing spaces": `# a${fill(" ", "b")}`,
+    "heading closing run": `# a ${fill("#", "x")}`,
+    "table delimiter with spaces": `| a |\n-${fill(" ", "x")}`,
+    "list item with spaces": `- ${fill(" ", "\u2028")}`,
+    "rule with spaces": `-${fill(" ", "- x")}`,
+    "fence with spaces": `\`\`\`\n\`\`\`${fill(" ", "x")}`,
+    "setext with spaces": `a\n=${fill(" ", "x")}`,
+    "many short lines": fill("# h\n| a |\n- b\n> c\n"),
+  };
+  for (const [name, source] of Object.entries(inputs)) {
+    const started = performance.now();
+    parseMarkdownPreview(source);
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 1500, `${name} took ${Math.round(elapsed)}ms`);
+  }
+});
+
+test("a wide table repeated over many rows is reported over budget instead of rendered", () => {
+  const header = `|${"h|".repeat(1000)}`;
+  const delimiter = `|${"-|".repeat(1000)}`;
+  const amplified = [header, delimiter, ...Array(10_000).fill("|x|")].join("\n");
+  assert.ok(amplified.length < 60_000);
   const started = performance.now();
-  for (const source of ["*a ".repeat(40_000), "[".repeat(80_000), "`".repeat(80_000), "_a ".repeat(40_000), "**".repeat(40_000), "> ".repeat(20_000)]) parseMarkdown(source);
-  assert.ok(performance.now() - started < 3000, `parsing took ${Math.round(performance.now() - started)}ms`);
+  const limited = parseMarkdownPreview(amplified);
+  assert.deepEqual([limited.overBudget, limited.blocks.length], [true, 0]);
+  assert.ok(performance.now() - started < 500);
+  // An ordinary table is rendered with one cell per header column.
+  const table = parseMarkdownPreview("| a | b |\n| - | - |\n| 1 | 2 | 3 |\n| 4 |");
+  assert.equal(table.overBudget, false);
+  assert.deepEqual(table.blocks[0].rows.map((row) => row.length), [2, 1]);
+  // A delimiter row with a different number of cells is not a table.
+  assert.equal(parseMarkdown("| a | b |\n| - |").at(0).type, "paragraph");
+  assert.equal(parseMarkdownPreview("word ".repeat(10)).overBudget, false);
+  assert.equal(parseMarkdownPreview("- a\n".repeat(MARKDOWN_NODE_BUDGET)).overBudget, true);
+});
+
+test("headings, list items and links parse as before after the linear rewrite", () => {
+  const blocks = parseMarkdown(["# foo #", "## bar#", "### ###", "#", "#nope", "-   spaced item", "1)  numbered", "[a [b] c](x) [ok](y \"T\")"].join("\n\n"));
+  assert.deepEqual(blocks.slice(0, 4).map((block) => [block.type, block.level, block.children.map((node) => node.value).join("")]),
+    [["heading", 1, "foo"], ["heading", 2, "bar#"], ["heading", 3, ""], ["heading", 1, ""]]);
+  assert.equal(blocks[4].type, "paragraph");
+  assert.deepEqual([blocks[5].items[0].blocks[0].children[0].value, blocks[6].ordered, blocks[6].items[0].blocks[0].children[0].value], ["spaced item", true, "numbered"]);
+  const inline = blocks[7].children;
+  assert.deepEqual(inline.filter((node) => node.type === "link").map((node) => [node.url, node.title]), [["y", "T"]]);
 });
 
 test("tree rows follow open folders lazily and keyboard moves stay within them", () => {
-  const folders = {
+  const folders = new Map(Object.entries({
     "": { status: "loaded", entries: [{ name: "src", path: "src", kind: "directory" }, { name: "link", path: "link", kind: "symlink", target: { state: "directory", path: "src" } }, { name: "a.md", path: "a.md", kind: "file" }], total: 3, nextCursor: null },
     src: { status: "loaded", entries: [{ name: "b.js", path: "src/b.js", kind: "file" }], total: 450, nextCursor: "next" },
     link: { status: "error", error: { message: "gone", code: "MISSING" } },
-  };
+  }));
   const rows = visibleRows(folders, new Set(["src", "link"]));
   assert.deepEqual(rows.map((row) => row.id), ["entry:src", "entry:src/b.js", "more:src", "entry:link", "error:link", "entry:a.md"]);
   assert.deepEqual([rows[1].level, rows[1].setSize, rows[2].remaining, rows[3].expandable], [2, 450, 449, true]);
   assert.deepEqual(visibleRows(folders, new Set()).map((row) => row.id), ["entry:src", "entry:link", "entry:a.md"]);
-  assert.deepEqual(visibleRows({}, new Set()).map((row) => row.type), ["loading"]);
+  assert.deepEqual(visibleRows(new Map(), new Set()).map((row) => row.type), ["loading"]);
   assert.equal(treeKeyTarget(rows, 1, "ArrowLeft"), 0);
   assert.equal(treeKeyTarget(rows, 0, "ArrowRight"), 1);
   assert.equal(treeKeyTarget(rows, 5, "ArrowRight"), -1);
@@ -69,4 +119,13 @@ test("tree rows follow open folders lazily and keyboard moves stay within them",
   assert.equal(treeKeyTarget(rows, 0, "a"), 5);
   assert.equal(treeKeyTarget(rows, 5, "ArrowDown"), 5);
   assert.deepEqual([normalizeTypedPath(" ./src//b.js/ "), normalizeTypedPath("/README.md"), ancestorsOf("a/b/c.md")], ["src/b.js", "README.md", ["a", "a/b"]]);
+});
+
+test("folders named like object properties are ordinary folders", () => {
+  const names = ["constructor", "__proto__", "hasOwnProperty", "toString"];
+  const folders = new Map([["", { status: "loaded", entries: names.map((name) => ({ name, path: name, kind: "directory" })), total: names.length, nextCursor: null }]]);
+  // Opened but not loaded yet: each shows a loading row, not an inherited value.
+  assert.deepEqual(visibleRows(folders, new Set(names)).map((row) => row.type), names.flatMap(() => ["entry", "loading"]));
+  for (const name of names) folders.set(name, { status: "loaded", entries: [{ name: "inner.txt", path: `${name}/inner.txt`, kind: "file" }], total: 1, nextCursor: null });
+  assert.deepEqual(visibleRows(folders, new Set(names)).filter((row) => row.level === 2).map((row) => row.entry.path), names.map((name) => `${name}/inner.txt`));
 });

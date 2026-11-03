@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { lstat, open, opendir, realpath, stat } from "node:fs/promises";
+import { lstat, open, opendir, readlink, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 
@@ -20,7 +20,10 @@ export const FILE_BROWSER_LIMITS = Object.freeze({
   textBytes: 1024 * 1024,
   imageBytes: 20 * 1024 * 1024,
   pdfBytes: 50 * 1024 * 1024,
-  maxRawStreams: 4,
+  // Above a browser's six connections per host, so one preview's images all
+  // load; further requests wait their turn, and only a full queue is refused.
+  maxRawStreams: 8,
+  maxRawQueue: 64,
 });
 
 const MARKDOWN = new Set([".md", ".markdown", ".mdown", ".mkd"]);
@@ -46,18 +49,34 @@ const RAW_HEADERS = Object.freeze({
   "Cross-Origin-Resource-Policy": "same-origin",
   "Content-Disposition": "inline",
 });
-const OPEN_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+// macOS refuses a link in any component of the path (O_NOFOLLOW_ANY, macOS
+// 11+). Elsewhere only the last component is guarded by O_NOFOLLOW, so the
+// opened descriptor's location is checked afterwards. O_NOFOLLOW_ANY covers
+// the last component too, and macOS rejects it combined with O_NOFOLLOW.
+const NOFOLLOW_ANY = process.platform === "darwin" ? 0x20000000 : 0;
+const NOFOLLOW = NOFOLLOW_ANY || (constants.O_NOFOLLOW ?? 0);
+const FILE_FLAGS = constants.O_RDONLY | NOFOLLOW | (constants.O_NONBLOCK ?? 0);
+const DIRECTORY_FLAGS = constants.O_RDONLY | NOFOLLOW | (constants.O_DIRECTORY ?? 0);
 
-export function createFileBrowser({ limits = FILE_BROWSER_LIMITS } = {}) {
+// `hooks.beforeOpen(real)` runs between resolving a path and opening it; it
+// exists so tests can replace a path component at exactly that moment.
+export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {} } = {}) {
   let rawStreams = 0;
+  const waiting = [];
 
   async function list(root, { directory = "", cursor, limit, showHidden = false } = {}) {
     const relative = relativePath(directory, limits, true);
     const pageSize = pageLimit(limit, limits);
     const after = parseCursor(cursor);
     const real = relative ? (await resolveInside(root, relative)).real : root;
+    const folder = await openVerified(root, real, relative, true, hooks);
+    try { return await listOpened(root, relative, folder, { pageSize, after, showHidden }); }
+    finally { await folder.handle.close(); }
+  }
+
+  async function listOpened(root, relative, folder, { pageSize, after, showHidden }) {
     let entries;
-    try { entries = await opendir(real, { encoding: "buffer", bufferSize: 256 }); }
+    try { entries = await opendir(folder.readPath, { encoding: "buffer", bufferSize: 256 }); }
     catch (error) { throw fileSystemError(error, relative, "Folder"); }
     const visible = [];
     let hiddenCount = 0;
@@ -76,6 +95,9 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS } = {}) {
         visible.push({ name, hidden, readable, kind: direntKind(entry), group: entry.isDirectory() ? 0 : 1 });
       }
     } catch (error) { throw fileSystemError(error, relative, "Folder"); }
+    // Where the folder could only be read by name, it must still be the one
+    // that was opened and checked.
+    await folder.confirm?.();
     visible.sort(compareEntries);
     const remaining = after ? visible.filter((item) => compareEntries(item, after) > 0) : visible;
     const page = remaining.slice(0, pageSize);
@@ -83,7 +105,7 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS } = {}) {
       const entryPath = relative ? `${relative}/${item.name}` : item.name;
       let { kind } = item;
       // Some file systems report no type with the name.
-      if (kind === "unknown" && item.readable) kind = await lstat(path.join(real, item.name)).then(statKind, () => "other");
+      if (kind === "unknown" && item.readable) kind = await lstat(path.join(folder.readPath, item.name)).then(statKind, () => "other");
       const result = { name: item.name, path: item.readable ? entryPath : null, kind, hidden: item.hidden };
       if (kind === "symlink" && item.readable) result.target = await linkTarget(root, path.join(root, ...entryPath.split("/")));
       return result;
@@ -102,7 +124,7 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS } = {}) {
 
   async function preview(root, file) {
     const relative = relativePath(file, limits, false);
-    const opened = await openFile(root, relative);
+    const opened = await openFile(root, relative, hooks);
     try { return describe(relative, opened, await classify(relative, opened, limits, true)); }
     finally { await opened.handle?.close(); }
   }
@@ -111,11 +133,10 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS } = {}) {
     const site = request.headers?.["sec-fetch-site"];
     if (site && site !== "same-origin" && site !== "none") throw fileError(403, "File previews are only served to Outright", "CROSS_SITE");
     const relative = relativePath(file, limits, false);
-    if (rawStreams >= limits.maxRawStreams) throw fileError(429, "Too many previews are loading; retry shortly", "PREVIEW_BUSY");
-    rawStreams += 1;
+    await acquireRawSlot(response);
     let opened;
     try {
-      opened = await openFile(root, relative);
+      opened = await openFile(root, relative, hooks);
       const kind = await classify(relative, opened, limits, false);
       if (kind.previewType !== "image" && kind.previewType !== "pdf") {
         throw fileError(415, "Only verified image and PDF previews are served as files", "NOT_RAW_PREVIEW");
@@ -130,12 +151,38 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS } = {}) {
       try { await pipeline(stream, response); }
       catch (error) { if (!response.destroyed) response.destroy(error); }
     } finally {
-      rawStreams -= 1;
+      releaseRawSlot();
       await opened?.handle?.close();
     }
   }
 
-  return { list, preview, raw };
+  // At most maxRawStreams files stream at once; later requests queue in
+  // arrival order, leave the queue if their client goes away, and are
+  // refused only when the queue is full.
+  function acquireRawSlot(response) {
+    if (rawStreams < limits.maxRawStreams) { rawStreams += 1; return Promise.resolve(); }
+    if (waiting.length >= limits.maxRawQueue) return Promise.reject(fileError(429, "Too many previews are loading; retry shortly", "PREVIEW_BUSY"));
+    return new Promise((resolve, reject) => {
+      const entry = {
+        resolve: () => { response.off?.("close", abandon); resolve(); },
+      };
+      function abandon() {
+        const index = waiting.indexOf(entry);
+        if (index < 0) return;
+        waiting.splice(index, 1);
+        reject(fileError(499, "The preview request was closed", "CLIENT_CLOSED"));
+      }
+      response.once?.("close", abandon);
+      waiting.push(entry);
+    });
+  }
+  // A finished stream hands its slot straight to the next waiting request.
+  function releaseRawSlot() {
+    const next = waiting.shift();
+    if (next) next.resolve(); else rawStreams -= 1;
+  }
+
+  return { list, preview, raw, rawStats: () => ({ active: rawStreams, waiting: waiting.length }) };
 }
 
 function describe(relative, opened, kind) {
@@ -180,18 +227,18 @@ async function classify(relative, { handle, info }, limits, withText) {
 
 // Opens the canonical target, never a link. A target that is not a regular
 // file is described without being opened, so a FIFO cannot block a read.
-async function openFile(root, relative) {
+async function openFile(root, relative, hooks) {
   const logical = path.join(root, ...relative.split("/"));
   let linkInfo;
   try { linkInfo = await lstat(logical); } catch (error) { throw fileSystemError(error, relative, "File"); }
   const { real } = await resolveInside(root, relative);
   let info;
-  try { info = await stat(real); } catch (error) { throw fileSystemError(error, relative, "File"); }
+  try { info = await lstat(real); } catch (error) { throw fileSystemError(error, relative, "File"); }
   const link = linkInfo.isSymbolicLink() ? { target: toPosix(path.relative(root, real)) } : null;
+  if (info.isSymbolicLink()) throw pathChanged();
   if (info.isDirectory()) throw fileError(409, `${relative} is a folder`, "IS_DIRECTORY");
   if (!info.isFile()) return { handle: null, info, link };
-  let handle;
-  try { handle = await open(real, OPEN_FLAGS); } catch (error) { throw fileSystemError(error, relative, "File"); }
+  const { handle } = await openVerified(root, real, relative, false, hooks);
   const opened = await handle.stat();
   // The file at the canonical path must be the one that was checked.
   if (!opened.isFile() || opened.ino !== info.ino || opened.dev !== info.dev) {
@@ -200,6 +247,53 @@ async function openFile(root, relative) {
   }
   return { handle, info: opened, link };
 }
+
+// Opens `real`, a canonical path inside `root`, and proves that what was
+// opened is inside the root even if a component was replaced by a link after
+// it was resolved. macOS refuses a link anywhere in the path; Linux reads the
+// descriptor's own location from /proc. A folder is then read through that
+// descriptor (/proc/self/fd/N, or the volume's file-ID path /.vol/dev/ino on
+// macOS), never by name again. Elsewhere the name is checked again after
+// opening and after reading, which narrows the race but cannot close it.
+async function openVerified(root, real, relative, directory, hooks) {
+  const noun = directory ? "Folder" : "File";
+  await hooks.beforeOpen?.(real);
+  let handle;
+  try { handle = await open(real, directory ? DIRECTORY_FLAGS : FILE_FLAGS); }
+  catch (error) {
+    // The path was resolved without links, so a link here is a replacement.
+    if (error?.code === "ELOOP") throw pathChanged();
+    throw fileSystemError(error, relative, noun);
+  }
+  try {
+    const procPath = `/proc/self/fd/${handle.fd}`;
+    if (process.platform === "linux") {
+      const location = await readlink(procPath).catch(() => null);
+      if (location !== null) {
+        if (!isWithin(root, location) || excludedSegments(path.relative(root, location).split(path.sep))) throw pathChanged();
+        return { handle, readPath: procPath };
+      }
+    }
+    if (NOFOLLOW_ANY) {
+      if (!directory) return { handle };
+      const info = await handle.stat({ bigint: true });
+      const volumePath = `/.vol/${info.dev}/${info.ino}`;
+      const usable = await stat(volumePath, { bigint: true }).then((found) => found.ino === info.ino && found.dev === info.dev, () => false);
+      if (usable) return { handle, readPath: volumePath };
+    }
+    const confirm = async () => {
+      const [again, now, held] = await Promise.all([realpath(real).catch(() => null), stat(real).catch(() => null), handle.stat()]);
+      if (again !== real || !now || now.ino !== held.ino || now.dev !== held.dev) throw pathChanged();
+    };
+    await confirm();
+    return { handle, readPath: real, confirm: directory ? confirm : null };
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+function pathChanged() { return fileError(409, "The path changed while it was being opened; retry", "PATH_CHANGED"); }
 
 async function resolveInside(root, relative) {
   let real;
@@ -295,7 +389,11 @@ function fileVersion(info) { return `${info.size.toString(36)}-${Math.trunc(info
 function startsWith(bytes, prefix) { return bytes.length >= prefix.length && prefix.every((value, index) => bytes[index] === value); }
 function ascii(bytes, start, end) { return bytes.length >= end ? bytes.toString("latin1", start, end) : ""; }
 function toPosix(value) { return value.split(path.sep).join("/"); }
-function isWithin(root, target) { const relative = path.relative(root, target); return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative)); }
+// Inside means no ".." segment leads out; a name such as "..notes.md" is inside.
+function isWithin(root, target) {
+  const relative = path.relative(root, target);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
 
 function fileSystemError(error, relative, noun) {
   const name = relative || "The worktree root";

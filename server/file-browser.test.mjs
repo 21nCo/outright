@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
@@ -29,9 +29,9 @@ async function refusal(promise) {
   assert.fail("the request was not refused");
 }
 
-function capture(headers = { "sec-fetch-site": "same-origin" }) {
+function capture(headers = { "sec-fetch-site": "same-origin" }, gate = Promise.resolve()) {
   const chunks = [];
-  const response = new Writable({ write(chunk, _encoding, done) { chunks.push(chunk); done(); } });
+  const response = new Writable({ write(chunk, _encoding, done) { chunks.push(chunk); void gate.then(() => done()); } });
   response.headers = {};
   response.setHeader = (name, value) => { response.headers[name.toLowerCase()] = value; };
   return { request: { headers }, response, body: () => Buffer.concat(chunks) };
@@ -184,4 +184,82 @@ test("raw bytes are served only for verified images and PDFs, sandboxed, same-si
   assert.equal(await refused("logo.png", version, { "sec-fetch-site": "cross-site" }), "CROSS_SITE");
   write("logo.png", Buffer.concat([PNG, Buffer.from([0])]));
   assert.equal(await refused("logo.png", version), "FILE_CHANGED");
+});
+
+test("a folder replaced by a link after it was resolved is never read through, for listing, preview or raw", posixOnly, async (t) => {
+  const { base, root, write } = fixture(t);
+  write("docs/inner/guide.md", "# Inside\n");
+  write("docs/inner/logo.png", PNG);
+  // The outside tree has the same shape, so following the link would succeed.
+  mkdirSync(path.join(base, "outside", "inner"), { recursive: true });
+  writeFileSync(path.join(base, "outside", "inner", "guide.md"), "# Private\n");
+  writeFileSync(path.join(base, "outside", "inner", "logo.png"), PNG);
+  writeFileSync(path.join(base, "outside", "inner", "secret-name.txt"), "");
+  let swaps = 0;
+  const swapAncestor = () => {
+    swaps += 1;
+    renameSync(path.join(root, "docs"), path.join(root, "docs-moved"));
+    symlinkSync(path.join(base, "outside"), path.join(root, "docs"));
+  };
+  const restore = () => {
+    unlinkSync(path.join(root, "docs"));
+    renameSync(path.join(root, "docs-moved"), path.join(root, "docs"));
+  };
+  const files = createFileBrowser({ hooks: { beforeOpen: swapAncestor } });
+  const operations = {
+    list: () => files.list(root, { directory: "docs/inner" }),
+    preview: () => files.preview(root, "docs/inner/guide.md"),
+    raw: () => { const { request, response } = capture(); return files.raw(root, "docs/inner/logo.png", null, request, response); },
+  };
+  for (const [name, operation] of Object.entries(operations)) {
+    const refused = await refusal(operation());
+    restore();
+    assert.deepEqual([refused.status, refused.code], [409, "PATH_CHANGED"], name);
+  }
+  assert.equal(swaps, 3);
+  // Without a replacement the same requests succeed.
+  const plain = createFileBrowser();
+  assert.deepEqual((await plain.list(root, { directory: "docs/inner" })).entries.map((entry) => entry.name), ["guide.md", "logo.png"]);
+  assert.equal((await plain.preview(root, "docs/inner/guide.md")).text, "# Inside\n");
+});
+
+test("names that merely begin with two dots are inside the worktree", async (t) => {
+  const { root, write } = fixture(t);
+  write("..notes.md", "# Dots\n");
+  write("..cache/entry.txt", "cached");
+  const files = createFileBrowser();
+  assert.deepEqual((await files.list(root, { showHidden: true })).entries.map((entry) => entry.path), ["..cache", "..notes.md"]);
+  assert.equal((await files.preview(root, "..notes.md")).text, "# Dots\n");
+  assert.deepEqual((await files.list(root, { directory: "..cache" })).entries.map((entry) => entry.path), ["..cache/entry.txt"]);
+});
+
+test("raw requests beyond the stream limit wait their turn, and only a full queue is refused", async (t) => {
+  const { root, write } = fixture(t);
+  write("logo.png", PNG);
+  const files = createFileBrowser({ limits: { ...FILE_BROWSER_LIMITS, maxRawStreams: 2, maxRawQueue: 3 } });
+  // Responses that accept no bytes until released hold their stream slot.
+  const gates = [];
+  const held = () => {
+    const release = new Promise((resolve) => gates.push(resolve));
+    return capture(undefined, release);
+  };
+  const requests = Array.from({ length: 5 }, () => held());
+  const settled = Promise.allSettled(requests.map(({ request, response }) => files.raw(root, "logo.png", null, request, response)));
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(files.rawStats(), { active: 2, waiting: 3 });
+  const extra = capture();
+  assert.equal((await refusal(files.raw(root, "logo.png", null, extra.request, extra.response))).code, "PREVIEW_BUSY");
+  // A queued request whose client leaves gives up its place.
+  requests[4].response.destroy();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(files.rawStats(), { active: 2, waiting: 2 });
+  while (gates.length) gates.shift()();
+  for (let round = 0; round < 10 && files.rawStats().active; round += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    while (gates.length) gates.shift()();
+  }
+  const results = await settled;
+  assert.deepEqual(results.map((result) => result.status), ["fulfilled", "fulfilled", "fulfilled", "fulfilled", "rejected"]);
+  assert.deepEqual(requests.slice(0, 4).map(({ body }) => body().equals(PNG)), [true, true, true, true]);
+  assert.deepEqual(files.rawStats(), { active: 0, waiting: 0 });
 });

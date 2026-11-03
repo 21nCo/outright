@@ -536,7 +536,10 @@ select { height: 34px; padding: 0 28px 0 10px; border: 1px solid var(--input); b
 .markdown-preview a, .markdown-link { color: var(--foreground); text-decoration: underline; text-underline-offset: 2px; }
 .markdown-link { padding: 0; border: 0; background: none; font: inherit; cursor: pointer; }
 .markdown-preview img { display: inline-block; max-width: 100%; vertical-align: middle; }
-.markdown-image-placeholder { color: var(--muted-foreground); font-style: italic; }
+.markdown-image-placeholder, .markdown-image-failed { color: var(--muted-foreground); font-style: italic; }
+.markdown-image-failed .markdown-link { margin-left: 6px; font-style: normal; }
+.markdown-over-budget { display: grid; gap: 8px; }
+.preview-notice { margin: 0; color: var(--muted-foreground); font-size: 12px; }
 .markdown-table { overflow-x: auto; }
 .markdown-table table { border-collapse: collapse; }
 .markdown-table th, .markdown-table td { padding: 4px 8px; border: 1px solid var(--line-soft); }

@@ -1,13 +1,15 @@
 // The Files tree's visible rows, in reading order. Folders load lazily, so a
 // row is an entry, or a folder's loading, failure, empty, "load more" or
-// scan-limit state; each is reachable from the keyboard.
+// scan-limit state; each is reachable from the keyboard. Folders are kept in
+// a Map keyed by path, so a folder named "constructor" or "__proto__" is an
+// ordinary key rather than an inherited property.
 
 export function isExpandable(entry) { return entry?.kind === "directory" || (entry?.kind === "symlink" && entry.target?.state === "directory"); }
 
 export function visibleRows(folders, expanded) {
   const rows = [];
   const visit = (directory, level) => {
-    const folder = folders[directory];
+    const folder = folders.get(directory);
     if (!folder || (folder.status === "loading" && !folder.entries)) { rows.push({ id: `loading:${directory}`, type: "loading", directory, level }); return; }
     if (folder.status === "error") { rows.push({ id: `error:${directory}`, type: "error", directory, level, error: folder.error }); return; }
     if (!folder.entries.length) rows.push({ id: `empty:${directory}`, type: "empty", directory, level, hiddenCount: folder.hiddenCount });

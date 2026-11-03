@@ -8971,13 +8971,13 @@ async function filesPaneRegression() {
   const worktree = { id: "A", name: "A", path: "/fixture/A", branch: "main" };
   const many = Array.from({ length: 250 }, (_, index) => ({ name: `item-${String(index).padStart(3, "0")}.txt`, path: `many/item-${String(index).padStart(3, "0")}.txt`, kind: "file", hidden: false }));
   const entry = (name, kind = "file", extra = {}) => ({ name, path: name, kind, hidden: name.startsWith("."), ...extra });
-  const rootEntries = (hidden) => [entry("docs", "directory"), entry("many", "directory"), ...(hidden ? [entry(".env")] : []), entry("app.bin"),
+  const rootEntries = (hidden) => [entry("docs", "directory"), entry("flaky", "directory"), entry("many", "directory"), ...(hidden ? [entry(".env")] : []), entry("app.bin"),
     entry("escape.txt", "symlink", { target: { state: "outside" } }), entry("huge.log"), entry("notes.md"), entry("report.pdf"), entry("slow.md")];
   const pdf = new TextEncoder().encode(["%PDF-1.4", "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj", "2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj",
     "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj",
     "4 0 obj<</Length 40>>stream", "BT /F1 18 Tf 20 40 Td (Hello PDF) Tj ET", "endstream endobj", "5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj",
     "trailer<</Root 1 0 R>>", "%%EOF"].join("\n"));
-  const markdown = "# Fixture notes\n\n<script>window.outrightFilesInjected = 1</script>\n<img src=x onerror=\"window.outrightFilesInjected = 2\">\n\n[unsafe](javascript:window.outrightFilesInjected=3) [site](https://example.com) [guide](docs/guide.md)\n\n![logo](logo.png) ![tracker](https://tracker.example/p.png)\n";
+  const markdown = "# Fixture notes\n\n<script>window.outrightFilesInjected = 1</script>\n<img src=x onerror=\"window.outrightFilesInjected = 2\">\n\n[unsafe](javascript:window.outrightFilesInjected=3) [site](https://example.com) [guide](docs/guide.md)\n\n![logo](logo.png) ![tracker](https://tracker.example/p.png) ![gone image](gone.png)\n";
   const previews = {
     "notes.md": { previewType: "markdown", text: markdown, size: markdown.length },
     "docs/guide.md": { previewType: "markdown", text: "# Guide\n", size: 8 },
@@ -8988,6 +8988,7 @@ async function filesPaneRegression() {
   };
   const requests = [];
   const gates = new Map();
+  let flakyReads = 0;
   route = async (url) => {
     const parameters = Object.fromEntries(url.searchParams);
     requests.push({ ...parameters, route: url.pathname });
@@ -8996,6 +8997,11 @@ async function filesPaneRegression() {
       const hidden = parameters.hidden === "true";
       if (!parameters.dir) return response({ directory: "", entries: rootEntries(hidden), nextCursor: null, total: rootEntries(hidden).length, hiddenCount: 1, truncated: false });
       if (parameters.dir === "docs") return response({ directory: "docs", entries: [{ name: "guide.md", path: "docs/guide.md", kind: "file", hidden: false }], nextCursor: null, total: 1, hiddenCount: 0, truncated: false });
+      if (parameters.dir === "flaky") {
+        flakyReads += 1;
+        if (flakyReads === 1) return response({ error: "flaky cannot be read", code: "UNREADABLE" }, 403);
+        return response({ directory: "flaky", entries: [{ name: "steady.txt", path: "flaky/steady.txt", kind: "file", hidden: false }], nextCursor: null, total: 1, hiddenCount: 0, truncated: false });
+      }
       if (parameters.dir === "many") return response(parameters.cursor ? { entries: many.slice(200), nextCursor: null, total: 250, hiddenCount: 0, truncated: false }
         : { entries: many.slice(0, 200), nextCursor: "page-2", total: 250, hiddenCount: 0, truncated: false });
     }
@@ -9010,6 +9016,18 @@ async function filesPaneRegression() {
   };
   delete window.outrightFilesInjected;
   const errors = [];
+  // Counts pdf.js workers that are running.
+  const NativeWorker = window.Worker;
+  let liveWorkers = 0;
+  window.Worker = class CountedWorker extends NativeWorker {
+    constructor(...args) {
+      super(...args);
+      liveWorkers += 1;
+      const terminate = this.terminate.bind(this);
+      let ended = false;
+      this.terminate = () => { if (!ended) { ended = true; liveWorkers -= 1; } terminate(); };
+    }
+  };
   root.render(<TooltipProvider><FilesPane project={project} worktree={worktree} settings={{ editor: "zed" }} onError={(error) => errors.push(error)} /></TooltipProvider>);
   const tree = () => host.querySelector('.files-pane [role="tree"]');
   const row = (label) => [...(tree()?.querySelectorAll('[role="treeitem"]') ?? [])].find((item) => item.querySelector(".tree-label")?.textContent === label);
@@ -9022,7 +9040,7 @@ async function filesPaneRegression() {
     assert(!row(".env"), "a dotfile was shown before hidden files were turned on");
     assert(tree().querySelectorAll('[role="treeitem"][tabindex="0"]').length === 1, "the tree does not have exactly one tab stop");
     const docs = row("docs");
-    assert(docs.getAttribute("aria-expanded") === "false" && docs.getAttribute("aria-level") === "1" && docs.getAttribute("aria-setsize") === "8", "a folder row lacks its tree state");
+    assert(docs.getAttribute("aria-expanded") === "false" && docs.getAttribute("aria-level") === "1" && docs.getAttribute("aria-setsize") === "9", "a folder row lacks its tree state");
     docs.focus();
     const docsGate = deferred();
     gates.set("/api/files:docs", docsGate);
@@ -9054,9 +9072,27 @@ async function filesPaneRegression() {
     row("Load 50 more of 50").focus();
     pressKey(document.activeElement, "Enter");
     await until(() => row("item-249.txt") && !tree().querySelector(".tree-more"), "Load more did not append the next page");
+    // The final "load more" row is gone; focus moves to the first entry it loaded.
+    await until(() => document.activeElement === row("item-200.txt"), "focus did not move to the first entry loaded by the final Load more");
+    pressKey(document.activeElement, "ArrowDown");
+    await until(() => document.activeElement === row("item-201.txt"), "the keyboard did not keep working after Load more");
     assert(listed("many").at(-1).cursor === "page-2", "Load more did not send the folder's cursor");
     pressKey(row("many"), "Enter");
     await until(() => !row("item-000.txt"), "the large folder did not collapse");
+
+    // A folder that failed to load retries from its error row, and focus
+    // follows the row that replaces it.
+    row("flaky").focus();
+    pressKey(row("flaky"), "ArrowRight");
+    const failed = () => tree().querySelector('[data-row-id="error:flaky"]');
+    await until(() => failed(), "a folder that could not be read did not say so");
+    failed().focus();
+    pressKey(failed(), "Enter");
+    await until(() => document.activeElement === row("steady.txt"), "focus did not move to the entry that replaced the retried folder's error row");
+    pressKey(document.activeElement, "ArrowUp");
+    await until(() => document.activeElement === row("flaky"), "the keyboard did not keep working after a retry");
+    pressKey(row("flaky"), "ArrowLeft");
+    await until(() => !row("steady.txt"), "the retried folder did not collapse");
 
     // A slow preview for an earlier choice never replaces a later one.
     const slowGate = deferred();
@@ -9081,6 +9117,7 @@ async function filesPaneRegression() {
     const image = rendered.querySelector('img[alt="logo"]');
     assert(new URL(image.src).searchParams.get("file") === "logo.png", `a relative image did not load through the raw route: ${image?.src}`);
     await until(() => image.complete && image.naturalWidth === 1, "the relative image did not load");
+    await until(() => /Image could not be loaded: gone image/.test(rendered.textContent), "an image that failed to load did not say so");
     await remainsTrue(() => window.outrightFilesInjected === undefined, 100, "content from the previewed file ran");
     [...preview().querySelectorAll("button")].find((button) => button.textContent === "Source").click();
     await until(() => preview().querySelector(".file-text")?.textContent === markdown, "Source did not show the file's text");
@@ -9089,16 +9126,25 @@ async function filesPaneRegression() {
     preview().querySelector(".markdown-link").click();
     await until(() => preview()?.querySelector("h1")?.textContent === "Guide" && row("guide.md")?.getAttribute("aria-selected") === "true", "a relative link did not open its file in the tree");
 
+    // A PDF closed while its viewer loads starts no worker that outlives it.
+    row("report.pdf").click();
+    await until(() => /Reading PDF/.test(preview()?.textContent ?? ""), "the PDF viewer did not start loading", 15_000);
+    row("app.bin").click();
+    await until(() => /has no preview/.test(preview()?.textContent ?? ""), "the next file did not replace a loading PDF");
+    await remainsTrue(() => liveWorkers === 0, 1000, "a PDF closed while loading left a worker running");
+
     // A PDF is drawn by the viewer, with its text beside the page.
     row("report.pdf").click();
     await until(() => preview()?.querySelector(".pdf-toolbar [role=status]")?.textContent === "Page 1 of 1", "the PDF did not open", 15_000);
     await until(() => preview().querySelector(".pdf-text p")?.textContent.includes("Hello PDF"), "the PDF page text was not offered");
     const canvas = preview().querySelector(".pdf-frame canvas");
     assert(canvas.width > 0 && canvas.getAttribute("aria-label") === "Page 1 of 1 of report.pdf", "the PDF page was not drawn with a label");
+    assert(liveWorkers === 1, `the open PDF has ${liveWorkers} workers`);
 
     // Explicit states for what cannot be shown.
     row("huge.log").click();
     await until(() => /3\.0 MB, over the 1\.0 MB preview limit/.test(preview()?.textContent ?? ""), "an oversized file did not state its limit");
+    await until(() => liveWorkers === 0, "closing a PDF did not end its worker");
     assert([...preview().querySelectorAll("button")].some((button) => button.textContent === "Open in zed"), "an oversized file offered no way to open it");
     row("app.bin").click();
     await until(() => /has no preview\. Binary files have no preview/.test(preview()?.textContent ?? ""), "an unsupported file was not explained");
@@ -9129,6 +9175,7 @@ async function filesPaneRegression() {
     await until(() => listed("").length > rootReads && listed("docs").length > listedDocs + 2, "a completed run did not refresh the open folders");
     assert(!errors.length, `the pane reported errors: ${errors.map((error) => error.message).join("; ")}`);
   } finally {
+    window.Worker = NativeWorker;
     localStorage.removeItem("outright.files.show-hidden");
     delete window.outrightFilesInjected;
     root.render(null);
