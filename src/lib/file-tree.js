@@ -10,9 +10,18 @@ export function isExpandable(entry) {
 }
 
 // A path names one entry; an entry without one is named by its folder and
-// its raw name bytes (nameKey), since two such names can decode alike.
+// its raw name bytes (nameKey), since two such names can decode alike. Ids
+// carry no NUL or other control character (JSON escapes them), since a row
+// id is a DOM attribute value.
 export function entryRowId(directory, entry) {
-  return typeof entry.path === "string" ? `entry:${entry.path}` : `entry:${directory}\u0000${entry.nameKey ?? entry.name}`;
+  return typeof entry.path === "string" ? `entry:${entry.path}` : `raw:${JSON.stringify([directory, entry.nameKey ?? entry.name])}`;
+}
+
+// The row element with `id`, compared as a string rather than through a CSS
+// selector, which cannot match every attribute value.
+export function rowElement(tree, id) {
+  for (const element of tree.querySelectorAll("[data-row-id]")) if (element.dataset.rowId === id) return element;
+  return null;
 }
 
 export function isFolderPath(path) { return typeof path === "string" && path !== ""; }

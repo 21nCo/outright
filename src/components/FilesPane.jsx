@@ -3,7 +3,7 @@ import { ArrowsClockwise, CaretDown, CaretRight, Eye, EyeSlash, File, FileImage,
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { FilePreview } from "@/components/FilePreview";
-import { ancestorsOf, isFolderPath, normalizeTypedPath, treeKeyTarget, visibleRows } from "@/lib/file-tree";
+import { ancestorsOf, isFolderPath, normalizeTypedPath, rowElement, treeKeyTarget, visibleRows } from "@/lib/file-tree";
 import { api, query } from "@/lib/runtime-api";
 
 const HIDDEN_KEY = "outright.files.show-hidden";
@@ -178,7 +178,7 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, conversat
       if (target !== focusedId) setFocusedId(target);
     }
     if (target) {
-      const element = tree.querySelector(`[data-row-id="${CSS.escape(target)}"]`);
+      const element = rowElement(tree, target);
       if (element && element !== current) element.focus({ preventScroll: false });
       if (element && target === activeId) moveRef.current = false;
     }

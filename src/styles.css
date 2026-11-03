@@ -223,6 +223,8 @@ button, input, textarea, select { font: inherit; }
 .workspace-context strong { color: var(--foreground); font-weight: 600; }
 .workspace-context svg { width: 13px; height: 13px; flex: none; }
 .workspace-tools { display: flex; align-items: center; gap: 3px; }
+.workspace-tools .pane-toggles { display: contents; }
+.workspace-tools .pane-menu-trigger { display: none; }
 .worktree-state { height: 25px; padding: 0 9px; margin-right: 3px; border: 1px solid var(--line-soft); border-radius: 999px; display: inline-flex; align-items: center; gap: 5px; font-size: 10px; }
 .worktree-state svg { width: 13px; height: 13px; }
 .worktree-state.clean { color: var(--green); }
@@ -663,6 +665,9 @@ kbd { min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--lin
   .workspace-context { min-width: 48px; }
   .workspace-context strong { max-width: 78px; }
   .workspace-tools [data-slot="button"] { width: 34px; }
+  /* Four pane toggles become one Panes menu, so the toolbar fits 320px. */
+  .workspace-tools .pane-toggles { display: none; }
+  .workspace-tools .pane-menu-trigger { display: inline-flex; }
   .chat-tab { min-width: 138px; }
   .manage-actions { align-items: stretch; flex-direction: column; gap: 7px; }
   .manage-actions button { width: 100%; }

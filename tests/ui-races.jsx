@@ -8895,8 +8895,14 @@ async function responsiveFocusRegression() {
     await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "true", "narrow sidebar after closed selection");
     assert(document.activeElement === composerB, "Selecting a project while the drawer was closed left stale focus restoration state");
 
-    const terminalTrigger = host.querySelector('[aria-label="Terminal"]');
-    terminalTrigger.click();
+    // At 390px the pane toggles are items in the toolbar's Panes menu.
+    const terminalTrigger = host.querySelector('[aria-label="Show or hide panes"]');
+    const togglePane = async (label) => {
+      terminalTrigger.click();
+      await until(() => [...document.querySelectorAll('[role="menuitemcheckbox"]')].some((item) => item.textContent === label), `the narrow Panes menu did not offer ${label}`);
+      [...document.querySelectorAll('[role="menuitemcheckbox"]')].find((item) => item.textContent === label).click();
+    };
+    await togglePane("Terminal");
     await until(() => host.querySelector('#pane-tab-terminal[aria-selected="true"]'), "narrow terminal pane tab");
     await until(() => document.activeElement === host.querySelector("#pane-terminal"), "narrow terminal pane focus");
     const conversationPane = host.querySelector("#pane-conversation");
@@ -8942,9 +8948,9 @@ async function responsiveFocusRegression() {
     await until(() => !terminalPane.inert && conversationPane.inert, "pane tab click shows the terminal after the new chat");
 
     terminalTrigger.focus();
-    terminalTrigger.click();
+    await togglePane("Terminal");
     await until(() => !host.querySelector("#pane-terminal") && !host.querySelector('[role="tablist"][aria-label="Panes"]'), "toolbar closes the narrow terminal pane");
-    assert(document.activeElement === terminalTrigger, "Closing from the toolbar moved focus away from its toggle");
+    await until(() => document.activeElement === terminalTrigger, "Closing from the toolbar moved focus away from its toggle");
     assert(!host.querySelector("#pane-conversation").inert, "The remaining conversation pane stayed inert");
   } finally {
     root.render(null);
@@ -8971,7 +8977,8 @@ async function filesPaneRegression() {
   const worktree = { id: "A", name: "A", path: "/fixture/A", branch: "main" };
   const many = Array.from({ length: 250 }, (_, index) => ({ name: `item-${String(index).padStart(3, "0")}.txt`, path: `many/item-${String(index).padStart(3, "0")}.txt`, kind: "file", hidden: false }));
   const entry = (name, kind = "file", extra = {}) => ({ name, path: name, kind, hidden: name.startsWith("."), ...extra });
-  const unnamed = { name: "caf\uFFFD", path: null, kind: "directory", hidden: false };
+  // The server names an entry without a path by its raw bytes, here "caf\xff".
+  const unnamed = { name: "caf\uFFFD", path: null, nameKey: "Y2Fm_w", kind: "directory", hidden: false };
   const rootEntries = (hidden) => [entry("docs", "directory"), entry("flaky", "directory"), entry("many", "directory"), unnamed, ...(hidden ? [entry(".env")] : []), entry("app.bin"),
     entry("escape.txt", "symlink", { target: { state: "outside" } }), entry("huge.log"), entry("notes.md"), entry("report.pdf"), entry("slow.md")];
   const pdf = new TextEncoder().encode(["%PDF-1.4", "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj", "2 0 obj<</Type/Pages/Kids[3 0 R 6 0 R]/Count 2>>endobj",
@@ -9080,6 +9087,12 @@ async function filesPaneRegression() {
     // A folder whose name is not UTF-8 has no path, so it cannot be opened.
     const unnamedRow = row("caf\uFFFD");
     assert(unnamedRow.getAttribute("aria-expanded") === null && unnamedRow.getAttribute("aria-disabled") === "true", "a folder without a path is offered as expandable");
+    // Arrows pass through it with focus following each step.
+    row("many").focus();
+    for (const [key, label] of [["ArrowDown", "caf\uFFFD"], ["ArrowDown", "app.bin"], ["ArrowUp", "caf\uFFFD"], ["ArrowUp", "many"]]) {
+      pressKey(document.activeElement, key);
+      await until(() => document.activeElement === row(label), `${key} did not move focus to ${label} through a row without a path`); // NOSONAR S9382: each key moves from the row the last one reached
+    }
     unnamedRow.focus();
     const readsBefore = requests.length;
     pressKey(unnamedRow, "ArrowRight");
@@ -9156,7 +9169,9 @@ async function filesPaneRegression() {
     await until(() => /Reading PDF/.test(preview()?.textContent ?? ""), "the PDF viewer did not start loading", 15_000);
     row("app.bin").click();
     await until(() => /has no preview/.test(preview()?.textContent ?? ""), "the next file did not replace a loading PDF");
-    await remainsTrue(() => liveWorkers === 0, 1000, "a PDF closed while loading left a worker running");
+    // pdf.js ends its worker after an async destroy, so it ends, then stays ended.
+    await until(() => liveWorkers === 0, "a PDF closed while loading left a worker running");
+    await remainsTrue(() => liveWorkers === 0, 1000, "a PDF closed while loading started a worker later");
 
     // A PDF is drawn by the viewer, with its text beside the page.
     row("report.pdf").click();
@@ -9426,6 +9441,77 @@ async function filesQuickOpenRegression() {
     await settle();
   }
   return true;
+}
+
+// At 320px with the sidebar closed, every toolbar action is inside the
+// window and operable, with and without a lifecycle chip (WCAG 1.4.10): the
+// pane toggles move into one Panes menu at 520px or less.
+async function narrowToolbarRegression() {
+  if (!window.__fixtureSetViewport || !window.__fixtureSendKey) return false;
+  root.render(null);
+  await settle();
+  keys.forEach((key, index) => localStorage.setItem(key, index === 2 ? "chat-A" : "A"));
+  const worktree = projects[0].worktrees[0];
+  route = async (url) => {
+    if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium", editor: "code" },
+      providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [], worktreeLifecycle: [], worktreeLifecycleRevision: 1 });
+    if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
+    if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    if (url.pathname === "/api/files") return response({ directory: "", entries: [], nextCursor: null, total: 0, hiddenCount: 0, truncated: false });
+    return response({});
+  };
+  const send = (event) => fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify(event) }));
+  const bar = () => host.querySelector(".workspace-bar");
+  const controls = () => [...bar().querySelectorAll("button")].filter((button) => button.getClientRects().length);
+  const label = (button) => button.getAttribute("aria-label") ?? button.textContent;
+  const assertContained = (width, chip) => {
+    const workspace = host.querySelector("#main-workspace").getBoundingClientRect();
+    assert(workspace.right <= window.innerWidth + 0.5, `the workspace is wider than ${width}px: ${workspace.right}`);
+    const outside = controls().map((button) => [label(button), button.getBoundingClientRect()])
+      .filter(([, rect]) => rect.width < 24 || rect.height < 24 || rect.left < workspace.left - 0.5 || rect.right > workspace.right + 0.5);
+    assert(!outside.length, `toolbar controls are clipped at ${width}px${chip ? " with a lifecycle chip" : ""}: ${JSON.stringify(outside.map(([name, rect]) => [name, rect.left, rect.right]))}`);
+  };
+  const sockets = fixtureSockets.length;
+  try {
+    await window.__fixtureSetViewport(320);
+    await until(() => window.innerWidth === 320, "real 320px layout");
+    root.render(<TooltipProvider><App /></TooltipProvider>);
+    await until(() => host.querySelector(".workspace-bar") && fixtureSockets.length > sockets && host.querySelector('[aria-label="Open projects sidebar"]'), "the narrow workspace with a closed sidebar");
+    await settle();
+    assertContained(320, false);
+    send({ type: "worktree.lifecycle", payload: { worktreePath: worktree.path, discoveredPath: worktree.path, projectId: "A", phase: "setup", status: "failed", steps: ["Install"], stepIndex: 0, runId: "run-1", revision: 5 } });
+    await until(() => bar().querySelector(".lifecycle-state"), "the lifecycle chip was not shown");
+    await settle();
+    assertContained(320, true);
+    const names = controls().map(label);
+    for (const name of ["Open projects sidebar", "Show or hide panes", "Pane layout", "Worktree options"]) assert(names.includes(name), `${name} is not shown at 320px: ${JSON.stringify(names)}`);
+    for (const name of ["Changes", "Terminal", "Project context", "Files"]) assert(!names.includes(name), `the ${name} toggle stayed in the 320px toolbar: ${JSON.stringify(names)}`);
+    // The Panes menu shows each pane's state and toggles it.
+    const panes = controls().find((button) => label(button) === "Show or hide panes");
+    panes.click();
+    await until(() => document.querySelectorAll('[role="menuitemcheckbox"]').length === 4, "the Panes menu did not list the four panes");
+    const items = [...document.querySelectorAll('[role="menuitemcheckbox"]')];
+    assert(JSON.stringify(items.map((item) => item.textContent)) === JSON.stringify(["Changes", "Terminal", "Project context", "Files"]), `the Panes menu lists ${JSON.stringify(items.map((item) => item.textContent))}`);
+    const files = items.at(-1);
+    assert(files.getAttribute("aria-checked") === "false", "the Files pane was reported shown before it was opened");
+    files.click();
+    // Opening a pane closes the menu and focuses the pane, as a toggle does.
+    await until(() => host.querySelector("#pane-files .files-pane") && !document.querySelector('[role="menuitemcheckbox"]')
+      && host.querySelector("#pane-files").contains(document.activeElement), "the Panes menu did not show and focus Files");
+    panes.click();
+    await until(() => [...document.querySelectorAll('[role="menuitemcheckbox"]')].at(-1)?.getAttribute("aria-checked") === "true", "the Panes menu did not report Files as shown");
+    await window.__fixtureSendKey("Escape");
+    await until(() => !document.querySelector('[role="menuitemcheckbox"]') && document.activeElement === panes, "Escape did not close the Panes menu onto its trigger");
+    // A wide window keeps the separate pane toggles and no Panes menu.
+    await window.__fixtureSetViewport(1280);
+    await until(() => window.innerWidth === 1280, "real 1280px layout");
+    window.dispatchEvent(new Event("resize"));
+    await settle();
+    const wide = controls().map(label);
+    assert(["Changes", "Terminal", "Project context", "Files"].every((name) => wide.includes(name)) && !wide.includes("Show or hide panes"), `the wide toolbar is ${JSON.stringify(wide)}`);
+  } finally {
+    await window.__fixtureSetViewport(1280);
+  }
 }
 
 async function recoveryActionsRegression() {
@@ -10600,6 +10686,7 @@ try {
     ["responsive focus", responsiveFocusRegression, "narrow drawer and one-at-a-time panes contain and restore focus", "responsive transition requires the CDP viewport bridge"],
     ["files pane", filesPaneRegression, "folders load lazily and page, the tree is keyboard navigable, hidden files are a control, previews never run their content, and missing, outside, oversized and unsupported files say so"],
     ["files quick open", filesQuickOpenRegression, "Cmd/Ctrl+P shows Files and focuses Go to file with its text selected, from a closed, open or compact Files pane", "the compact layout requires the CDP viewport bridge"],
+    ["narrow toolbar", narrowToolbarRegression, "at 320px with the sidebar closed every toolbar action stays inside the window, with and without a lifecycle chip, and the Panes menu toggles panes", "toolbar geometry requires the CDP viewport bridge"],
     ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],
   ];
   // The harness runs every step with reduced motion, as hosted macOS and

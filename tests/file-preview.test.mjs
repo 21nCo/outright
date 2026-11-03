@@ -129,7 +129,11 @@ test("entries without a path keep distinct row ids when their names decode alike
   const folders = new Map([["", { status: "loaded", entries: [{ name: "odd", path: "odd", kind: "directory" }], total: 1 }], ["odd", { status: "loaded", entries, total: 3 }]]);
   const ids = visibleRows(folders, new Set(["odd"])).map((row) => row.id);
   assert.equal(new Set(ids).size, ids.length);
-  assert.deepEqual(entries.map((entry) => entryRowId("odd", entry)), ["entry:odd/a\uFFFD", "entry:odd\u0000Yf4", "entry:odd\u0000Yf8"]);
+  assert.deepEqual(entries.map((entry) => entryRowId("odd", entry)), ["entry:odd/a\uFFFD", 'raw:["odd","Yf4"]', 'raw:["odd","Yf8"]']);
+  // A row id is a DOM attribute value, so it holds no NUL or control character.
+  assert.ok(ids.every((id) => !/[\u0000-\u001f]/.test(id)), JSON.stringify(ids));
+  // A folder path and a name key cannot combine into another row's id.
+  assert.notEqual(entryRowId("a", { path: null, nameKey: "b" }), entryRowId("a\",\"b", { path: null, nameKey: "" }));
   assert.deepEqual(visibleRows(folders, new Set(["odd"])).filter((row) => row.type === "entry").map((row) => row.expandable), [true, false, false, false]);
 });
 
@@ -174,7 +178,7 @@ test("a folder without an addressable path never expands, and no folder is shown
   assert.equal(isExpandable({ name: "x", path: "", kind: "directory" }), false);
   // A folder whose listing names an already-open ancestor is shown closed there.
   folders.set("src", { status: "loaded", entries: [{ name: "loop", path: "src", kind: "symlink", target: { state: "directory", path: "src" } }], total: 1, nextCursor: null });
-  assert.deepEqual(visibleRows(folders, new Set(["src"])).map((row) => [row.id, row.open ?? null]), [["entry:\u0000caf\uFFFD", false], ["entry:src", true], ["entry:src", false]]);
+  assert.deepEqual(visibleRows(folders, new Set(["src"])).map((row) => [row.id, row.open ?? null]), [['raw:["","caf\uFFFD"]', false], ["entry:src", true], ["entry:src", false]]);
 });
 
 test("a folder's next page waits while its first page reloads, and listing unavailable is its own state", () => {
