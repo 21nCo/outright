@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { open } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -540,6 +540,129 @@ test("a readable file in a folder that can be entered but not listed previews an
     // Its own entries stay unlisted.
     assert.equal((await refusal(files.list(root, { directory: "private" }))).code, "UNREADABLE");
   } finally { chmodSync(folder, 0o755); }
+});
+
+test("a folder moved away after it was opened serves nothing read through it, for listing, preview and raw", linkable, async (t) => {
+  const { base, root, write } = fixture(t);
+  write("d/y.md", "# inside y\n");
+  write("d/logo.png", PNG);
+  write("a/b/x.md", "# inside x\n");
+  mkdirSync(path.join(base, "outside"));
+  const d = path.join(root, "d");
+  const away = path.join(base, "outside", "d");
+  let moves = 0;
+  // d leaves the worktree (or moves within it); then private content is
+  // written in it, in place, so an opened file sees it too.
+  const move = (to = away) => () => {
+    if (!existsSync(d)) return;
+    moves += 1;
+    renameSync(d, to);
+    writeFileSync(path.join(to, "z-private.md"), "PRIVATE");
+    writeFileSync(path.join(to, "y.md"), "# PRIVATE\n");
+    writeFileSync(path.join(to, "logo.png"), Buffer.concat([PNG, Buffer.from("PRIVATE")]));
+  };
+  const restore = () => {
+    for (const from of [away, path.join(root, "e")]) if (existsSync(from)) renameSync(from, d);
+    if (existsSync(path.join(base, "outside", "a"))) renameSync(path.join(base, "outside", "a"), path.join(root, "a"));
+    rmSync(path.join(d, "z-private.md"), { force: true });
+    writeFileSync(path.join(d, "y.md"), "# inside y\n");
+    writeFileSync(path.join(d, "logo.png"), PNG);
+  };
+  const at = (target, act) => (real) => { if (real === target) act(); };
+  const raw = (files, file) => { const { request, response, body } = capture(); return files.raw(root, file, null, request, response).then(() => body().toString("latin1")); };
+  const list = (directory) => (files) => files.list(root, { directory });
+  const cases = [
+    ["list, moved out after open", { afterOpen: at(d, move()) }, list("d")],
+    ["list, moved out before read", { beforeRead: move() }, list("d")],
+    ["list, moved out after read", { afterRead: move() }, list("d")],
+    ["list, moved within the worktree after open", { afterOpen: at(d, move(path.join(root, "e"))) }, list("d")],
+    ["list, its parent moved out after open", { afterOpen: at(path.join(root, "a", "b"), () => { moves += 1; renameSync(path.join(root, "a"), path.join(base, "outside", "a")); }) }, list("a/b")],
+    ["preview, moved out before inspect", { beforeInspect: move() }, (files) => files.preview(root, "d/y.md")],
+    ["preview, moved out after the file opened", { afterOpen: at(path.join(d, "y.md"), move()) }, (files) => files.preview(root, "d/y.md")],
+    ["raw, moved out before inspect", { beforeInspect: move() }, (files) => raw(files, "d/logo.png")],
+  ];
+  const before = openDescriptors();
+  for (const [label, hooks, operation] of cases) {
+    const counted = moves;
+    const outcome = await operation(createFileBrowser({ hooks })).then((value) => ({ served: JSON.stringify(value) }), (error) => ({ status: error.statusCode, code: error.details?.code }));
+    restore();
+    assert.equal(moves, counted + 1, `${label}: the move ran`);
+    assert.deepEqual(outcome, { status: 409, code: "PATH_CHANGED" }, `${label}: ${JSON.stringify(outcome)}`);
+  }
+  assert.equal(openDescriptors(), before, "a refused request left a descriptor open");
+  // Unmoved, the same requests serve the worktree.
+  const plain = createFileBrowser();
+  assert.deepEqual((await plain.list(root, { directory: "d" })).entries.map((entry) => entry.name), ["logo.png", "y.md"]);
+  assert.equal((await plain.preview(root, "d/y.md")).text, "# inside y\n");
+  assert.equal(await raw(plain, "d/logo.png"), PNG.toString("latin1"));
+});
+
+test("a \"..\" link whose folder moved within the worktree is PATH_CHANGED, never resolved by the stale names", linkable, async (t) => {
+  const { root, write } = fixture(t);
+  write("a/x.md", "# a x\n");
+  mkdirSync(path.join(root, "a", "b"));
+  symlinkSync("../x.md", path.join(root, "a", "b", "l"));
+  const b = path.join(root, "a", "b");
+  // After b is opened, a is renamed and a new a takes its name. The kernel
+  // follows l from b's real parent (a2/x.md); the stale names lead to a/x.md.
+  const relocate = (real) => { if (real !== b || existsSync(path.join(root, "a2"))) return; renameSync(path.join(root, "a"), path.join(root, "a2")); write("a/x.md", "# stale place\n"); };
+  const files = createFileBrowser({ hooks: { afterOpen: relocate } });
+  const outcome = await files.preview(root, "a/b/l").then((value) => value.text, (error) => error.details?.code);
+  assert.equal(outcome, "PATH_CHANGED");
+  rmSync(path.join(root, "a"), { recursive: true });
+  renameSync(path.join(root, "a2"), path.join(root, "a"));
+  const plain = await createFileBrowser().preview(root, "a/b/l");
+  assert.deepEqual([plain.text, plain.link], ["# a x\n", { target: "a/x.md" }]);
+});
+
+test("a link destination ending in \"/\" or \"/.\" needs a folder, as the kernel does, also through other links", linkable, async (t) => {
+  const { root, write } = fixture(t);
+  write("f.txt", "plain\n");
+  write("d/in.md", "# in\n");
+  const links = {
+    slash: "f.txt/", slashdot: "f.txt/.", absolute: `${root}/f.txt/`, alias: "f.txt", chained: "alias/", "via-slash": "slash",
+    "dir-slash": "d/", "dir-absolute": `${root}/d/.`,
+  };
+  for (const [name, destination] of Object.entries(links)) symlinkSync(destination, path.join(root, name));
+  const files = createFileBrowser();
+  const targets = Object.fromEntries((await files.list(root)).entries.map((entry) => [entry.name, entry.target]));
+  for (const name of ["slash", "slashdot", "absolute", "chained", "via-slash"]) {
+    // The independent oracle: the kernel refuses each of them.
+    assert.throws(() => statSync(path.join(root, name)), { code: "ENOTDIR" }, name);
+    assert.deepEqual((await refusal(files.preview(root, name))).code, "MISSING", name);
+    assert.deepEqual((await refusal(files.list(root, { directory: name }))).code, "NOT_DIRECTORY", name);
+    assert.deepEqual(targets[name], { state: "missing" }, name);
+  }
+  assert.deepEqual(targets.alias, { state: "file", path: "f.txt" });
+  for (const name of ["dir-slash", "dir-absolute"]) {
+    assert.ok(statSync(path.join(root, name)).isDirectory(), name);
+    assert.deepEqual((await files.list(root, { directory: name })).entries.map((entry) => entry.name), ["in.md"], name);
+    assert.equal((await files.preview(root, `${name}/in.md`)).text, "# in\n", name);
+    assert.deepEqual(targets[name], { state: "directory", path: "d" }, name);
+  }
+});
+
+test("a worktree root that can be entered but not listed still previews and streams its readable files", { skip: linkable.skip || (process.getuid?.() === 0 && "root ignores folder permissions") }, async (t) => {
+  const { root, write } = fixture(t);
+  write("a.md", "# root file\n");
+  write("logo.png", PNG);
+  write("d/b.md", "# nested\n");
+  chmodSync(path.join(root, "d"), 0o111);
+  chmodSync(root, 0o111);
+  try {
+    const files = createFileBrowser();
+    assert.equal((await files.preview(root, "a.md")).text, "# root file\n");
+    assert.equal((await files.preview(root, "d/b.md")).text, "# nested\n");
+    const { request, response, body } = capture();
+    await files.raw(root, "logo.png", null, request, response);
+    assert.deepEqual(body(), PNG);
+    // Neither folder's own entries are listed.
+    assert.equal((await refusal(files.list(root))).code, "UNREADABLE");
+    assert.equal((await refusal(files.list(root, { directory: "d" }))).code, "UNREADABLE");
+  } finally {
+    chmodSync(root, 0o755);
+    chmodSync(path.join(root, "d"), 0o755);
+  }
 });
 
 test("a folder of 500 links lists every target with a bounded number of descriptors, also twice at once", linkable, async (t) => {
