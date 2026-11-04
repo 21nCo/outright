@@ -5,12 +5,27 @@ import sirv from "sirv";
 import { recoverArchiveBeforeStartup, runtimeLaunchDirectory } from "./database.mjs";
 import { withdrawReattachRecords } from "./managed-terminal.mjs";
 import { createOutrightRuntime } from "./outright-runtime.mjs";
+import { pdfjsAssetHeaders } from "./pdfjs-assets-plugin.mjs";
 import { writeStartupUnavailable } from "./startup-response.mjs";
 
 // One Ctrl-C can reach this process twice at once: the terminal signals its
 // whole process group and `npm run` forwards the same signal. A repeat this
 // soon after the first is the same quit; a later one forces the exit.
 export const REPEATED_SIGNAL_MS = 1000;
+
+// The built client. pdf.js assets carry the headers the development server
+// gives them, and a missing one is a 404, not the app's page.
+export function clientFiles(directory) {
+  return sirv(directory, {
+    dev: false,
+    etag: true,
+    single: true,
+    ignores: [/^\/pdfjs\//],
+    setHeaders(response, pathname) {
+      for (const [header, value] of Object.entries(pdfjsAssetHeaders(pathname) ?? {})) response.setHeader(header, value);
+    },
+  });
+}
 
 export function startStandalone({ recoverArchive = recoverArchiveBeforeStartup, createRuntime = createOutrightRuntime } = {}) {
   const port = Number(process.env.PORT || 4173);
@@ -38,11 +53,7 @@ export function startStandalone({ recoverArchive = recoverArchiveBeforeStartup, 
     }
   });
 
-  app.use(sirv(process.env.OUTRIGHT_CLIENT_DIR || path.resolve(import.meta.dirname, "../dist/client"), {
-    dev: false,
-    etag: true,
-    single: true,
-  }));
+  app.use(clientFiles(process.env.OUTRIGHT_CLIENT_DIR || path.resolve(import.meta.dirname, "../dist/client")));
 
   httpServer.listen(port, host, () => {
     console.info(`Outright is running at http://${host}:${httpServer.address()?.port ?? port}`);

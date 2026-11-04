@@ -672,12 +672,12 @@ test("nested runner deadline exceeds its child's full browser budget", () => {
 
 test("the per-file deadline outlives the browser fixture and the file's earlier tests", () => {
   // macOS CI spent 17 seconds on this file's earlier tests and needs about
-  // 232 seconds for the 156-step interaction phase.
+  // 280 seconds for the 167-step interaction phase.
   for (const budget of [ordinaryBudget, wheelBudget]) {
     assert(budget.fixtureMs >= budget.phaseMs + 25_000);
     assert(budget.fileMs >= budget.fixtureMs + 30_000);
   }
-  assert(ordinaryBudget.phaseMs >= 232_000 + 30_000);
+  assert(ordinaryBudget.phaseMs >= 280_000 + 45_000);
   assert(wheelBudget.phaseMs > ordinaryBudget.phaseMs);
   for (const cap of [Number.NaN, -1, 0, 1001, 5000]) assert.deepEqual(uiFixtureBudget(cap), ordinaryBudget, `cap=${cap}`);
   for (const cap of [1, 120, 1000]) assert.deepEqual(uiFixtureBudget(cap), wheelBudget, `cap=${cap}`);
@@ -751,7 +751,23 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
   };
   const port = await unusedPort();
   const profile = process.env.OUTRIGHT_TEST_UI_PROFILE ?? mkdtempSync(path.join(tmpdir(), "outright-ui-races-"));
-  const vite = spawn(process.execPath, [viteCli, "--config", "tests/vite.ui-races.config.mjs", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
+  // OUTRIGHT_UI_BUILD=1 builds the fixture as the app is built and serves
+  // the build (tests/preview-build.test.mjs), so a step loads production
+  // chunks instead of the development server's modules.
+  const built = process.env.OUTRIGHT_UI_BUILD === "1" ? mkdtempSync(path.join(tmpdir(), "outright-ui-build-")) : null;
+  if (built) {
+    phase = "build the fixture";
+    const result = spawnSync(process.execPath, [viteCli, "build", "--config", "tests/vite.ui-races.config.mjs", "--outDir", built, "--emptyOutDir", "--logLevel", "warn"], {
+      cwd: root, env: { ...process.env, NO_COLOR: "1" }, encoding: "utf8", timeout: Math.min(120_000, remaining()), windowsHide: true,
+    });
+    if (result.status !== 0) {
+      rmSync(built, { recursive: true, force: true });
+      if (!process.env.OUTRIGHT_TEST_UI_PROFILE) rmSync(profile, { recursive: true, force: true });
+      throw new Error(`The fixture did not build: ${result.error?.message ?? ""}${result.stderr?.slice(-2000) ?? ""}`);
+    }
+  }
+  const server = built ? ["preview", "--outDir", built] : [];
+  const vite = spawn(process.execPath, [viteCli, ...server, "--config", "tests/vite.ui-races.config.mjs", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
     cwd: root,
     env: { ...process.env, NO_COLOR: "1" },
     stdio: ["ignore", "pipe", "pipe"],
@@ -988,7 +1004,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
         }
         if (event.params.name !== "__requestFixtureViewport") return;
         const width = Number(event.params.payload);
-        if (![1280, 1200, 900, 760, 640, 620, 390, 360].includes(width)) throw new Error(`Unexpected fixture viewport: ${width}`);
+        if (![1280, 1200, 900, 760, 640, 620, 390, 360, 320].includes(width)) throw new Error(`Unexpected fixture viewport: ${width}`);
         await send("Emulation.setDeviceMetricsOverride", { width, height: 844, deviceScaleFactor: 1, mobile: false });
         await send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-viewport-ready", { detail: ${width} }))` });
       })().catch((error) => { viewportError = error; });
@@ -1009,7 +1025,8 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       devtoolsReady: devtools?.socket.readyState, viteOutput: output.slice(-500) }));
     assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
     const selectedCount = process.env.OUTRIGHT_UI_STEP?.split(",").length;
-    const expectedCount = selectedCount ?? 154 + motionStepCount;
+    // A built fixture adds its one production-only step ("files pdf build load").
+    const expectedCount = selectedCount ?? 161 + (built ? 1 : 0) + motionStepCount;
     const completedCount = Number(state.text.match(/(\d+) interaction regressions passed/)?.[1]);
     assert.equal(completedCount, expectedCount,
       `browser fixture completed ${completedCount || 0} of ${expectedCount} expected interactions; last step: ${state.progress?.step ?? "unknown"}`);
@@ -1030,6 +1047,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
         ["Chrome tree", () => stop(browser)],
         ["Vite tree", () => stop(vite)],
         ["Chrome profile", () => rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })],
+        ["fixture build", () => built && rmSync(built, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })],
       ]);
     } catch (error) {
       if (failure) throw new AggregateError([failure, error], `UI fixture failed: ${failure.message}; ${error.message}`);

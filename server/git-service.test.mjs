@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { access, chmod, copyFile, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -155,6 +156,110 @@ test("stage, unstage and commit pass the checkpoint writer fence: refused before
       assert.equal(after.holding(repository), null, `${name} stayed held once its process was proven gone`);
       await assert.rejects(access(path.join(repository, ".git", WRITE_MARKER)), { code: "ENOENT" });
     }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("open in editor accepts dot-prefixed names inside the worktree and refuses paths outside it", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-editor-paths-"));
+  try {
+    const cwd = await realpath(root);
+    const launched = [];
+    const subprocesses = createSubprocessBudget({ limit: 1, launch: (file, args) => {
+      const child = new EventEmitter();
+      child.pid = 7;
+      child.unref = () => {};
+      launched.push(args.at(-1));
+      queueMicrotask(() => child.emit("spawn"));
+      return child;
+    } });
+    const service = createGitService({ database: { getSettings: () => ({ editor: "code" }), auditAdmission() {}, auditCritical() {} },
+      getProjects: () => [{ worktrees: [{ path: cwd }] }], getConfig: async () => ({ scanRoots: [cwd] }), subprocesses });
+    // Before, any relative path starting with ".." was refused as an escape.
+    for (const name of ["..large.log", path.join("..cache", "x"), "...", "a/../b.txt"]) {
+      assert.equal((await service.openInEditor(cwd, name)).target, path.resolve(cwd, name), `${name} was refused`);
+    }
+    for (const name of ["..", "../x", path.join("..", "..cache"), path.join(os.tmpdir(), "elsewhere.txt"), "a/../../x"]) {
+      await assert.rejects(service.openInEditor(cwd, name), (error) => error.statusCode === 403, `${name} was opened`);
+    }
+    assert.deepEqual(launched, ["..large.log", path.join("..cache", "x"), "...", "a/../b.txt"].map((name) => path.resolve(cwd, name)));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("open in editor refuses a link inside the worktree that leads out, through the file or a folder above it", { skip: process.platform === "win32" && "symlinks need POSIX semantics" }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-editor-links-"));
+  try {
+    const base = await realpath(root);
+    const cwd = path.join(base, "worktree");
+    await mkdir(path.join(cwd, "docs"), { recursive: true });
+    await mkdir(path.join(base, "outside"));
+    await writeFile(path.join(cwd, "docs", "guide.md"), "# Guide\n");
+    await writeFile(path.join(base, "outside", "secret.txt"), "private");
+    await symlink(path.join(base, "outside", "secret.txt"), path.join(cwd, "escape.txt"));
+    await symlink(path.join(base, "outside"), path.join(cwd, "escape-dir"));
+    await symlink("docs/guide.md", path.join(cwd, "guide-link.md"));
+    // Dangling links: a save through one would create its target, inside or out.
+    await symlink(path.join(base, "outside", "new.md"), path.join(cwd, "out.md"));
+    await symlink(path.join(base, "outside", "missing"), path.join(cwd, "dangling-dir"));
+    await symlink("docs/later.md", path.join(cwd, "later-link.md"));
+    await symlink("docs", path.join(cwd, "docs-link"));
+    const launched = [];
+    const subprocesses = createSubprocessBudget({ limit: 1, launch: (file, args) => {
+      const child = new EventEmitter();
+      child.pid = 9;
+      child.unref = () => {};
+      launched.push(args.at(-1));
+      queueMicrotask(() => child.emit("spawn"));
+      return child;
+    } });
+    const service = createGitService({ database: { getSettings: () => ({ editor: "code" }), auditAdmission() {}, auditCritical() {} },
+      getProjects: () => [{ worktrees: [{ path: cwd }] }], getConfig: async () => ({ scanRoots: [cwd] }), subprocesses });
+    for (const name of ["escape.txt", "escape-dir", "escape-dir/secret.txt", "escape-dir/not-yet.txt",
+      "out.md", "dangling-dir", "dangling-dir/new.md", "later-link.md"]) {
+      await assert.rejects(service.openInEditor(cwd, name), (error) => error.statusCode === 403, `${name} was opened`);
+    }
+    assert.equal(existsSync(path.join(base, "outside", "new.md")), false);
+    // A link that stays inside opens its target; a new name opens where it would be.
+    assert.equal((await service.openInEditor(cwd, "guide-link.md")).target, path.join(cwd, "docs", "guide.md"));
+    assert.equal((await service.openInEditor(cwd, "docs/new.md")).target, path.join(cwd, "docs", "new.md"));
+    assert.equal((await service.openInEditor(cwd, "docs-link/new/deeper.md")).target, path.join(cwd, "docs", "new", "deeper.md"));
+    assert.deepEqual(launched, [path.join(cwd, "docs", "guide.md"), path.join(cwd, "docs", "new.md"), path.join(cwd, "docs", "new", "deeper.md")]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("open in editor refuses a path whose folder is swapped for an outside link while it is checked, and launches nothing", { skip: process.platform === "win32" && "symlinks need POSIX semantics" }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-editor-swap-"));
+  try {
+    const base = await realpath(root);
+    const cwd = path.join(base, "worktree");
+    await mkdir(path.join(cwd, "d"), { recursive: true });
+    await mkdir(path.join(base, "outside"));
+    await writeFile(path.join(cwd, "d", "x.md"), "inside\n");
+    await writeFile(path.join(base, "outside", "x.md"), "private\n");
+    const launched = [];
+    const subprocesses = { launchDetached: async (file, args) => { launched.push(args.at(-1)); }, run: async () => { throw new Error("unused"); } };
+    const d = path.join(cwd, "d");
+    let swapAt = null;
+    // d was looked at as a folder; it becomes a link out just before the name inside it is.
+    const beforeEditorLookup = async (next) => {
+      if (next !== swapAt) return;
+      swapAt = null;
+      await rename(d, `${d}-old`);
+      await symlink(path.join(base, "outside"), d);
+    };
+    const restore = async () => { if (existsSync(`${d}-old`)) { await rm(d); await rename(`${d}-old`, d); } };
+    const service = createGitService({ database: { getSettings: () => ({ editor: "code" }), auditAdmission() {}, auditCritical() {} },
+      getProjects: () => [{ worktrees: [{ path: cwd }] }], getConfig: async () => ({ scanRoots: [cwd] }), subprocesses, hooks: { beforeEditorLookup } });
+    for (const name of ["d/x.md", "d/new.md", "d/new/deeper.md"]) {
+      swapAt = path.join(cwd, ...name.split("/").slice(0, 2));
+      await assert.rejects(service.openInEditor(cwd, name), (error) => error.statusCode === 409, `${name} was opened`);
+      assert.equal(swapAt, null, `${name}: the swap did not run`);
+      await restore();
+    }
+    assert.deepEqual(launched, []);
+    assert.equal(existsSync(path.join(base, "outside", "new.md")), false);
+    // Unswapped, the same paths open inside.
+    assert.equal((await service.openInEditor(cwd, "d/x.md")).target, path.join(cwd, "d", "x.md"));
+    assert.equal((await service.openInEditor(cwd, "d/new.md")).target, path.join(cwd, "d", "new.md"));
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

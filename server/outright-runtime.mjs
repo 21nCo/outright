@@ -11,6 +11,7 @@ import { AGENT_SUPERVISOR, createAgentManager, defaultGroupMembers, hardenWindow
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { accountPin, createProviderAccounts } from "./provider-accounts.mjs";
 import { createGitService } from "./git-service.mjs";
+import { createFileBrowser } from "./file-browser.mjs";
 import { createWorktreeLifecycle } from "./worktree-lifecycle.mjs";
 import { createWorktreeCheckpoints, holdMessage } from "./worktree-checkpoints.mjs";
 import { loadOutrightConfig, scanProjects } from "./project-scanner.mjs";
@@ -157,6 +158,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       const release = checkpoints.admitWriter([cwd]);
       return (error) => { release(error); watchOwnerProof(); };
     } });
+  const files = createFileBrowser();
   // Setup and teardown never run beside agent work in the same worktree: the
   // agent manager holds queued runs while a worktree is held, including while
   // a step's processes are unconfirmed, and a run that waited launches when
@@ -381,6 +383,19 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     const project = (await projects()).projects.find((item) => item.id === projectId);
     for (const worktree of project?.worktrees ?? []) {
       if (await canonicalOf(worktree.path) === canonical) return { project, worktree, worktreePath: canonical };
+    }
+    throw apiError(400, "Destination is not a discovered project worktree");
+  }
+
+  // File browsing reads one worktree of the latest scan. Expanding a folder
+  // must not start a project rescan, so only a runtime with no scan yet waits
+  // for one.
+  async function resolveBrowseTarget(projectId, worktreePath) {
+    if (!latestScan) await projects();
+    const canonical = await git.requireWorktree(worktreePath);
+    const project = latestScan?.projects.find((item) => item.id === projectId);
+    for (const worktree of project?.worktrees ?? []) {
+      if (await canonicalOf(worktree.path) === canonical) return canonical;
     }
     throw apiError(400, "Destination is not a discovered project worktree");
   }
@@ -1171,6 +1186,14 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         if (lifecycleMatch[1] === "acknowledge") return json(response, 200, { state: lifecycle.acknowledge(target, acknowledgedRunId(body)) });
         return json(response, 202, { state: await lifecycle.setup(target, { acknowledgeUnconfirmed: acknowledgedRunId(body) }) });
       }
+      const filesMatch = /^\/api\/files(?:\/(preview|raw))?$/.exec(url.pathname);
+      if (filesMatch && request.method === "GET") {
+        const root = await resolveBrowseTarget(url.searchParams.get("projectId"), requiredQuery(url, "path"));
+        if (filesMatch[1] === "preview") return json(response, 200, await files.preview(root, url.searchParams.get("file")));
+        if (filesMatch[1] === "raw") { await files.raw(root, url.searchParams.get("file"), url.searchParams.get("version"), request, response); return true; }
+        return json(response, 200, await files.list(root, { directory: url.searchParams.get("dir") ?? "", cursor: url.searchParams.get("cursor"),
+          limit: url.searchParams.get("limit"), showHidden: url.searchParams.get("hidden") === "true" }));
+      }
       const checkpointMatch = /^\/api\/worktrees\/checkpoints(?:\/(inspect|diff|preview|restore|recover))?$/.exec(url.pathname);
       if (checkpointMatch && request.method === "GET" && ["inspect", "diff", undefined].includes(checkpointMatch[1])) {
         const target = await resolveLifecycleTarget({ projectId: url.searchParams.get("projectId"), worktreePath: requiredQuery(url, "path") });
@@ -1293,7 +1316,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     let disposed = false;
     shutdownPromise = (async () => {
       const shutdownErrors = [];
-      const preliminaries = await Promise.allSettled([watcher?.close(), agents.shutdown(), accounts.close(), lifecycle.shutdown(), checkpoints.shutdown()]);
+      const preliminaries = await Promise.allSettled([watcher?.close(), agents.shutdown(), accounts.close(), lifecycle.shutdown(), checkpoints.shutdown(), files.shutdown()]);
       for (const result of preliminaries) if (result.status === "rejected") shutdownErrors.push(result.reason);
       // A failed agent shutdown may be the sole owner of an exited provider's
       // result while both SQLite and its recovery sidecar are unavailable.
