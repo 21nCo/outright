@@ -2,6 +2,9 @@
   "name": "outright",
   "version": "0.0.1",
   "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
     "postinstall": "node scripts/fix-node-pty-permissions.mjs",
     "build:supervisor": "node scripts/build-agent-supervisor.mjs",

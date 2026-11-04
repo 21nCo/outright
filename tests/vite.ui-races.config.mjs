@@ -23,9 +23,12 @@ const failingModules = new Map();
 const failingPrefixes = new Map();
 const requestCounts = new Map();
 const prefixCount = (prefix) => [...requestCounts].reduce((sum, [pathname, count]) => sum + (pathname.startsWith(prefix) ? count : 0), 0);
+// Only the path and query of a request's address matter here; the loopback
+// origin just lets URL parse them.
+const requestUrl = (request) => new URL(request.url, "http://127.0.0.1");
 function fixtureMiddleware(server) {
     server.middlewares.use("/__fixture", (request, response) => {
-      const url = new URL(request.url, "http://fixture");
+      const url = requestUrl(request);
       if (url.pathname === "/raw") {
         for (const file of url.searchParams.getAll("serve")) servedPngs.add(file);
         for (const file of url.searchParams.getAll("unserve")) servedPngs.delete(file);
@@ -48,7 +51,7 @@ function fixtureMiddleware(server) {
       response.end("ok");
     });
     server.middlewares.use((request, response, next) => {
-      const pathname = new URL(request.url, "http://fixture").pathname;
+      const pathname = requestUrl(request).pathname;
       requestCounts.set(pathname, (requestCounts.get(pathname) ?? 0) + 1);
       const prefix = [...failingPrefixes.keys()].find((start) => pathname.startsWith(start) && failingPrefixes.get(start) > 0);
       const failing = prefix === undefined ? failingModules : failingPrefixes;
@@ -60,7 +63,7 @@ function fixtureMiddleware(server) {
       response.end();
     });
     server.middlewares.use("/api/files/raw", (request, response) => {
-      const url = new URL(request.url, "http://fixture");
+      const url = requestUrl(request);
       const file = url.searchParams.get("file");
       pngReads.set(file, [...(pngReads.get(file) ?? []), url.search]);
       if (servedPngs.has(file)) { response.setHeader("Content-Type", "image/png"); response.end(FIXTURE_PNG); return; }

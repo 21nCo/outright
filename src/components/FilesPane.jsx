@@ -208,6 +208,16 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, conversat
     }
   };
 
+  // A click on a row activates it like Enter; the tree, which owns keyboard
+  // handling for its rows, also owns their pointer activation.
+  const onTreeClick = (event) => {
+    const id = event.target.closest?.("[data-row-id]")?.dataset.rowId;
+    const row = rows.find((candidate) => candidate.id === id);
+    if (!row) return;
+    moveRef.current = false;
+    setFocusedId(row.id);
+    activate(row);
+  };
   const onTreeKeyDown = (event) => {
     noteFocusedRow(event.target);
     if (event.altKey || event.ctrlKey || event.metaKey) return;
@@ -282,9 +292,9 @@ export function FilesPane({ project, worktree, settings, runtimeEvent, conversat
     </form>
     <span className="sr-only" role="status" aria-live="polite">{announcement}</span>
     <div className="files-layout">
-      <div className="file-tree" role="tree" aria-label={`Files in ${worktree.name}`} aria-busy={root?.status === "loading"} ref={treeRef} onKeyDown={onTreeKeyDown} onFocus={onTreeFocus} onBlur={onTreeBlur}>
+      <div className="file-tree" role="tree" aria-label={`Files in ${worktree.name}`} aria-busy={root?.status === "loading"} ref={treeRef} onKeyDown={onTreeKeyDown} onClick={onTreeClick} onFocus={onTreeFocus} onBlur={onTreeBlur}>
         {rows.map((row) => <TreeRow key={row.id} row={row} label={rowLabel(row)} active={row.id === activeId} selected={row.type === "entry" && row.entry.path === selected}
-          onFocus={() => { moveRef.current = false; setFocusedId(row.id); }} onActivate={() => { moveRef.current = false; setFocusedId(row.id); activate(row); }} />)}
+          onFocus={() => { moveRef.current = false; setFocusedId(row.id); }} />)}
       </div>
       {selected ? <FilePreview key={selected} project={project} worktree={worktree} file={selected} refreshKey={refreshKey} settings={settings} onError={onError}
         onNavigate={openPath} onFolder={revealFolder} onRefreshFolder={refreshFolderOf} />
@@ -299,7 +309,7 @@ function withFolder(folders, directory, folder) {
   return next;
 }
 
-function TreeRow({ row, label, active, selected, onFocus, onActivate }) {
+function TreeRow({ row, label, active, selected, onFocus }) {
   const entry = row.entry;
   const isEntry = row.type === "entry";
   let icon = null;
@@ -318,7 +328,7 @@ function TreeRow({ row, label, active, selected, onFocus, onActivate }) {
     aria-expanded={row.expandable ? row.open : undefined} aria-selected={isEntry && !row.expandable ? selected : undefined}
     aria-disabled={(isEntry && !entry.path) || row.type === "empty" || row.type === "unavailable" || row.type === "truncated" || row.type === "loading" || undefined}
     className={`tree-row tree-${row.type}${selected ? " is-selected" : ""}${entry?.hidden ? " is-hidden" : ""}`}
-    style={{ "--tree-level": row.level - 1 }} onFocus={onFocus} onClick={onActivate}>
+    style={{ "--tree-level": row.level - 1 }} onFocus={onFocus}>
     <span className="tree-caret" aria-hidden="true">{row.expandable ? (row.open ? <CaretDown /> : <CaretRight />) : null}</span>
     <span className="tree-icon" aria-hidden="true">{icon}</span>
     <span className="tree-label">{label}</span>

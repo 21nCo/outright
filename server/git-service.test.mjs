@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -196,6 +197,11 @@ test("open in editor refuses a link inside the worktree that leads out, through 
     await symlink(path.join(base, "outside", "secret.txt"), path.join(cwd, "escape.txt"));
     await symlink(path.join(base, "outside"), path.join(cwd, "escape-dir"));
     await symlink("docs/guide.md", path.join(cwd, "guide-link.md"));
+    // Dangling links: a save through one would create its target, inside or out.
+    await symlink(path.join(base, "outside", "new.md"), path.join(cwd, "out.md"));
+    await symlink(path.join(base, "outside", "missing"), path.join(cwd, "dangling-dir"));
+    await symlink("docs/later.md", path.join(cwd, "later-link.md"));
+    await symlink("docs", path.join(cwd, "docs-link"));
     const launched = [];
     const subprocesses = createSubprocessBudget({ limit: 1, launch: (file, args) => {
       const child = new EventEmitter();
@@ -207,13 +213,16 @@ test("open in editor refuses a link inside the worktree that leads out, through 
     } });
     const service = createGitService({ database: { getSettings: () => ({ editor: "code" }), auditAdmission() {}, auditCritical() {} },
       getProjects: () => [{ worktrees: [{ path: cwd }] }], getConfig: async () => ({ scanRoots: [cwd] }), subprocesses });
-    for (const name of ["escape.txt", "escape-dir", "escape-dir/secret.txt", "escape-dir/not-yet.txt"]) {
+    for (const name of ["escape.txt", "escape-dir", "escape-dir/secret.txt", "escape-dir/not-yet.txt",
+      "out.md", "dangling-dir", "dangling-dir/new.md", "later-link.md"]) {
       await assert.rejects(service.openInEditor(cwd, name), (error) => error.statusCode === 403, `${name} was opened`);
     }
+    assert.equal(existsSync(path.join(base, "outside", "new.md")), false);
     // A link that stays inside opens its target; a new name opens where it would be.
     assert.equal((await service.openInEditor(cwd, "guide-link.md")).target, path.join(cwd, "docs", "guide.md"));
     assert.equal((await service.openInEditor(cwd, "docs/new.md")).target, path.join(cwd, "docs", "new.md"));
-    assert.deepEqual(launched, [path.join(cwd, "docs", "guide.md"), path.join(cwd, "docs", "new.md")]);
+    assert.equal((await service.openInEditor(cwd, "docs-link/new/deeper.md")).target, path.join(cwd, "docs", "new", "deeper.md"));
+    assert.deepEqual(launched, [path.join(cwd, "docs", "guide.md"), path.join(cwd, "docs", "new.md"), path.join(cwd, "docs", "new", "deeper.md")]);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

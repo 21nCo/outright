@@ -19,7 +19,7 @@ Outright is a local-first workspace for running coding agents across Git project
 
 ## Requirements
 
-- Node.js 20 or newer
+- Node.js 22.13 or newer (pdf.js, which renders PDF previews, requires it)
 - Git
 - A C11 compiler (`cc`, `clang`, or `gcc`) on Linux; the development, build,
   and production-start scripts compile the child-subreaper agent supervisor

@@ -17,6 +17,7 @@ import { AGENT_SUPERVISOR, createAgentManager, LAUNCH_AUTHORIZED_CONTROL } from 
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { openTerminalHistory } from "./terminal-history.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
+import { createFileBrowser } from "./file-browser.mjs";
 import { randomUUID } from "node:crypto";
 import { writeNodeCommand } from "../tests/fixtures/node-command.mjs";
 
@@ -3808,15 +3809,18 @@ test("file routes browse only a discovered project worktree and serve previews f
   mkdirSync(path.join(worktree.path, "docs"));
   const at = (route, parameters) => `${route}?${new URLSearchParams(parameters)}`;
   const listed = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: worktree.path }));
-  // Windows has no handle-bound folder path, so its folders are refused (OUT-144).
-  if (process.platform === "win32") assert.deepEqual([listed.statusCode, listed.body.code], [501, "LISTING_UNAVAILABLE"], listed.raw);
+  // A host without a handle-bound folder path (Windows, among others) refuses
+  // its folders and files (OUT-144); probed, not inferred from the platform.
+  const anchored = await createFileBrowser().list(worktree.path).then(() => true, (error) => error.details?.code !== "LISTING_UNAVAILABLE");
+  if (process.platform === "win32") assert.equal(anchored, false, "Windows cannot read through a root handle");
+  if (!anchored) assert.deepEqual([listed.statusCode, listed.body.code], [501, "LISTING_UNAVAILABLE"], listed.raw);
   else {
     assert.equal(listed.statusCode, 200, listed.raw);
     assert.deepEqual(listed.body.entries.map((entry) => [entry.name, entry.kind]), [["docs", "directory"], ["README.md", "file"]]);
   }
   const preview = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "README.md" }));
   // Nor can it prove where an opened file is, so files are not previewed.
-  if (process.platform === "win32") assert.deepEqual([preview.statusCode, preview.body.code], [501, "PREVIEW_UNAVAILABLE"], preview.raw);
+  if (!anchored) assert.deepEqual([preview.statusCode, preview.body.code], [501, "PREVIEW_UNAVAILABLE"], preview.raw);
   else assert.deepEqual([preview.statusCode, preview.body.previewType, preview.body.text], [200, "markdown", "# Fixture\n"]);
   const missing = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "gone.md" }));
   assert.deepEqual([missing.statusCode, missing.body.code], [404, "MISSING"]);

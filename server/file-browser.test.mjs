@@ -9,11 +9,19 @@ import test from "node:test";
 import { FILE_BROWSER_LIMITS, createFileBrowser, noFollowAnyFlag, relativePath } from "./file-browser.mjs";
 
 const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da63f8ffff3f0005fe02fea7d6a4a70000000049454e44ae426082", "hex");
-const posixOnly = { skip: process.platform === "win32" && "symlinks and FIFOs need POSIX semantics" };
-// Windows cannot prove where an opened descriptor is, so folders and files
-// are refused there (see the fail-closed tests below; OUT-144).
-const listable = { skip: process.platform === "win32" && "folders are not listed without a handle-bound path" };
-const previewable = { skip: process.platform === "win32" && "files are not previewed without a descriptor-bound location" };
+// Whether this host reads through a handle on the worktree root (Linux
+// /proc, macOS 11+ /.vol): probed, not inferred from the platform name. A
+// host that cannot refuses every folder and file instead (OUT-144), which
+// the fail-closed test below checks, so success tests run only where it can.
+const anchored = await (async () => {
+  const probe = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-anchor-")));
+  try { return await createFileBrowser().list(probe).then(() => true, (error) => error.details?.code !== "LISTING_UNAVAILABLE"); }
+  finally { rmSync(probe, { recursive: true, force: true }); }
+})();
+const unanchored = "this host cannot read through a root handle (OUT-144)";
+const listable = { skip: !anchored && unanchored };
+const previewable = listable;
+const linkable = { skip: (process.platform === "win32" && "symlinks and FIFOs need POSIX semantics") || (!anchored && unanchored) };
 
 function fixture(t) {
   const base = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-files-")));
@@ -101,7 +109,7 @@ test("a large folder pages without repeats or gaps while it changes, and stops s
   assert.deepEqual([capped.truncated, capped.total, capped.entries.length], [true, 100, 100]);
 });
 
-test("paths that leave the worktree are refused, and links are listed with where they lead", posixOnly, async (t) => {
+test("paths that leave the worktree are refused, and links are listed with where they lead", linkable, async (t) => {
   const { base, root, write } = fixture(t);
   write("docs/guide.md", "# Guide\n");
   writeFileSync(path.join(base, "outside.txt"), "private");
@@ -178,7 +186,7 @@ test("previews return text only for UTF-8 text, verify image and PDF contents, a
   assert.deepEqual([(await small.preview(root, "logo.png")).previewType, (await small.preview(root, "logo.png")).limit], ["oversized", 10]);
 });
 
-test("a FIFO is described without being opened, so a preview never blocks on it", posixOnly, async (t) => {
+test("a FIFO is described without being opened, so a preview never blocks on it", linkable, async (t) => {
   const { root } = fixture(t);
   execFileSync("mkfifo", [path.join(root, "pipe")]);
   const files = createFileBrowser();
@@ -247,7 +255,7 @@ test("an in-place rewrite of the same size with its mtime put back is a new vers
   assert.deepEqual(fresh.body(), changed);
 });
 
-test("a folder replaced by a link after it was resolved is never read through, for listing, preview or raw", posixOnly, async (t) => {
+test("a folder replaced by a link after it was resolved is never read through, for listing, preview or raw", linkable, async (t) => {
   const { base, root, write } = fixture(t);
   write("docs/inner/guide.md", "# Inside\n");
   write("docs/inner/logo.png", PNG);
@@ -284,7 +292,7 @@ test("a folder replaced by a link after it was resolved is never read through, f
   assert.equal((await plain.preview(root, "docs/inner/guide.md")).text, "# Inside\n");
 });
 
-test("a folder swapped for a link after it was checked is read through its handle, and without a handle-bound path is never listed", posixOnly, async (t) => {
+test("a folder swapped for a link after it was checked is read through its handle, and without a handle-bound path is never listed", linkable, async (t) => {
   const { base, root, write } = fixture(t);
   write("docs/inner/guide.md", "# Inside\n");
   mkdirSync(path.join(base, "outside", "inner"), { recursive: true });
@@ -320,7 +328,7 @@ test("a folder swapped for a link after it was checked is read through its handl
   assert.equal((await refusal(byName.list(root))).code, "LISTING_UNAVAILABLE");
 });
 
-test("a file whose ancestor is swapped around each check by name is refused, and without a descriptor-bound location is never read", posixOnly, async (t) => {
+test("a file whose ancestor is swapped around each check by name is refused, and without a descriptor-bound location is never read", linkable, async (t) => {
   const { base, root, write } = fixture(t);
   write("docs/inner/guide.md", "# Inside\n");
   write("docs/inner/logo.png", PNG);
@@ -359,15 +367,15 @@ test("a file whose ancestor is swapped around each check by name is refused, and
 // Open descriptors as the operating system lists them for this process.
 function openDescriptors() { return readdirSync(process.platform === "linux" ? "/proc/self/fd" : "/dev/fd").length; }
 
-// Whether this host can read through a handle on the root (Linux /proc,
-// macOS 11+ /.vol): probed, not inferred from the platform name.
-async function rootAnchored(t) {
-  const { root } = fixture(t);
-  return createFileBrowser().list(root).then(() => true, (error) => error.details?.code !== "LISTING_UNAVAILABLE");
-}
+test("a host that cannot read through a root handle lists no folder and previews no file", { skip: anchored && "this host reads through a root handle" }, async (t) => {
+  const { root, write } = fixture(t);
+  write("a.md", "# A\n");
+  assert.equal((await refusal(createFileBrowser().list(root))).code, "LISTING_UNAVAILABLE");
+  assert.equal((await refusal(createFileBrowser().preview(root, "a.md"))).code, "PREVIEW_UNAVAILABLE");
+  assert.equal((await refusal(createFileBrowser().preview(root, "gone.md"))).code, "MISSING");
+});
 
-test("a root whose parent is renamed and replaced, without links, never serves another directory's names or bytes", posixOnly, async (t) => {
-  if (!(await rootAnchored(t))) { t.skip("this host cannot read through a root handle (OUT-144)"); return; }
+test("a root whose parent is renamed and replaced, without links, never serves another directory's names or bytes", linkable, async (t) => {
   const base = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-root-swap-")));
   t.after(() => rmSync(base, { recursive: true, force: true }));
   const parent = path.join(base, "p");
@@ -421,6 +429,38 @@ test("a root whose parent is renamed and replaced, without links, never serves a
   assert.equal(openDescriptors(), before);
 });
 
+test("an intermediate folder swapped for an outside link after resolution never reveals the outside object's kind", linkable, async (t) => {
+  const { base, root, write } = fixture(t);
+  write("d/x", "inside file\n");
+  write("d/x.png", PNG);
+  symlinkSync("d/x", path.join(root, "l"));
+  symlinkSync("d/x.png", path.join(root, "image.png"));
+  // Outside, the same names are folders: following the swap would report one.
+  mkdirSync(path.join(base, "outside", "x"), { recursive: true });
+  mkdirSync(path.join(base, "outside", "x.png"));
+  const d = path.join(root, "d");
+  let inspected = 0;
+  const swap = () => { inspected += 1; if (existsSync(`${d}-old`)) return; renameSync(d, `${d}-old`); symlinkSync(path.join(base, "outside"), d); };
+  const restore = () => { if (!existsSync(`${d}-old`)) return; unlinkSync(d); renameSync(`${d}-old`, d); };
+  const before = openDescriptors();
+  // The swap runs after a target was resolved and before it is inspected.
+  const files = createFileBrowser({ hooks: { beforeInspect: swap } });
+  for (const [name, operation] of [["preview", () => files.preview(root, "l")], ["raw", () => { const { request, response } = capture(); return files.raw(root, "image.png", null, request, response); }]]) {
+    const outcome = await refusal(operation());
+    restore();
+    assert.deepEqual([outcome.status, outcome.code], [409, "PATH_CHANGED"], `${name}: ${JSON.stringify(outcome)}`);
+  }
+  const listed = (await files.list(root)).entries.filter((entry) => entry.kind === "symlink");
+  restore();
+  assert.equal(inspected, 4, "each listed link's target was inspected after the swap");
+  for (const entry of listed) assert.equal(entry.target.state, "unreadable", JSON.stringify(entry));
+  assert.equal(openDescriptors(), before, "a refused lookup left a descriptor open");
+  // Unswapped, the links lead to the inside files.
+  const plain = createFileBrowser();
+  assert.deepEqual((await plain.list(root)).entries.find((entry) => entry.name === "l").target, { state: "file", path: "d/x" });
+  assert.equal((await plain.preview(root, "l")).text, "inside file\n");
+});
+
 test("an opened file whose status cannot be read is closed before the error is reported", previewable, async (t) => {
   const { root, write } = fixture(t);
   write("a.md", "# A\n");
@@ -436,7 +476,8 @@ test("an opened file whose status cannot be read is closed before the error is r
     return original.apply(this, args);
   };
   const before = openDescriptors();
-  const files = createFileBrowser({ hooks: { afterOpen: () => { failing = true; } } });
+  // Only the file's own open arms the failure, not its folder's.
+  const files = createFileBrowser({ hooks: { afterOpen: (real) => { failing = real.endsWith("a.md"); } } });
   assert.deepEqual(await refusal(files.preview(root, "a.md")).then((error) => [error.status, error.code]), [500, "READ_FAILED"]);
   assert.equal(openDescriptors(), before, "the opened file was left open");
 });

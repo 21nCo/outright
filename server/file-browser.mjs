@@ -72,7 +72,8 @@ function openFlags(directory, anyComponent) {
 }
 
 // `hooks.beforeRoot(root)` runs before the root handle is opened,
-// `hooks.beforeInspect(real)` before a resolved file is inspected,
+// `hooks.beforeInspect(real)` after a file or a listed link's target is
+// resolved and before it is inspected,
 // `hooks.beforeOpen(real)` and `hooks.afterOpen(real)` around opening it, and
 // `hooks.beforeRead` and `hooks.afterRead` around reading a folder's entries;
 // they exist so tests can replace a path component at exactly those moments.
@@ -133,7 +134,7 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
       const result = { name: item.name, path: item.readable ? entryPath : null, kind, hidden: item.hidden };
       // An entry without a path is told apart by its raw name instead.
       if (!item.readable) result.nameKey = item.key;
-      if (kind === "symlink" && item.readable) result.target = await linkTarget(binding, entryPath);
+      if (kind === "symlink" && item.readable) result.target = await linkTarget(binding, entryPath, hooks);
       return result;
     }));
     const last = page.at(-1);
@@ -281,10 +282,18 @@ async function classify(relative, { handle, info }, limits, withText) {
 
 // Opens the canonical target, never a link. A target that is not a regular
 // file is described without being opened, so a FIFO cannot block a read.
-// Every look at the file goes through the request's root handle.
+// Every look at the file goes through the request's root handle, and names
+// only its last component inside a folder opened and proved inside the root.
+// Without a root anchor nothing past the name's existence is looked at.
 async function openFile(binding, relative, hooks) {
+  const name = relative.split("/").at(-1);
+  const parent = relative.slice(0, -name.length - 1);
   let linkInfo;
-  try { linkInfo = await lstat(binding.at(relative)); } catch (error) { throw fileSystemError(error, relative, "File"); }
+  try {
+    if (!binding.anchor) await lstat(binding.at(relative));
+    else linkInfo = await lookupName(binding, parent ? (await resolveInside(binding.root, parent)).real : binding.root, name, hooks);
+  } catch (error) { throw fileSystemError(parentGone(error) ? { code: "ENOENT" } : error, relative, "File"); }
+  if (!binding.anchor) throw previewUnavailable();
   let real;
   try { ({ real } = await resolveInside(binding.root, relative)); }
   catch (error) {
@@ -295,7 +304,7 @@ async function openFile(binding, relative, hooks) {
   const target = toPosix(path.relative(binding.root, real));
   let info;
   await hooks.beforeInspect?.(real);
-  try { info = await lstat(binding.at(target), { bigint: true }); } catch (error) { throw fileSystemError(error, relative, "File"); }
+  try { info = await inspectResolved(binding, real, hooks); } catch (error) { throw fileSystemError(error, relative, "File"); }
   const link = linkInfo.isSymbolicLink() ? { target } : null;
   if (info.isSymbolicLink()) throw pathChanged();
   if (info.isDirectory()) throw fileError(409, `${relative} is a folder`, "IS_DIRECTORY");
@@ -310,6 +319,25 @@ async function openFile(binding, relative, hooks) {
     throw fileError(409, "The file changed while it was being opened; retry", "FILE_CHANGED");
   }
   return { handle, info: fileFacts(opened), link };
+}
+
+// Looks up one name in a canonical folder inside the root. The folder is
+// opened through the root handle and proved inside it (openVerified), and
+// only the last name is looked up under that folder's handle path, so a link
+// swapped into any earlier component is never followed: such a swap is
+// PATH_CHANGED, never the other object's kind, size or existence.
+async function lookupName(binding, folder, name, hooks) {
+  const opened = await openVerified(binding, folder, toPosix(path.relative(binding.root, folder)), true, hooks);
+  try { return await lstat(`${opened.readPath}/${name}`, { bigint: true }); }
+  finally { await opened.handle.close(); }
+}
+// The same for a canonical path; the root itself is the root handle. Its
+// folder was resolved as a folder, so one that no longer is (Linux reports a
+// link opened with O_DIRECTORY | O_NOFOLLOW so) was replaced.
+async function inspectResolved(binding, real, hooks) {
+  if (real === binding.root) return binding.handle.stat({ bigint: true });
+  try { return await lookupName(binding, path.dirname(real), path.basename(real), hooks); }
+  catch (error) { throw error?.details?.code === "NOT_DIRECTORY" ? pathChanged() : error; }
 }
 
 // What a preview needs from a bigint stat: plain numbers, and a version that
@@ -394,7 +422,7 @@ async function openVerified(binding, real, relative, directory, hooks) {
     await hooks.afterOpen?.(real);
     if (!binding.anchor) {
       if (directory) throw fileError(501, "Folder listing is unavailable on this file system, because a folder cannot be read through the handle Outright checked", "LISTING_UNAVAILABLE");
-      throw fileError(501, "Previews are unavailable on this file system, because Outright cannot prove where an opened file is", "PREVIEW_UNAVAILABLE");
+      throw previewUnavailable();
     }
     let readPath;
     if (process.platform === "linux") {
@@ -421,6 +449,7 @@ async function requireRoot(binding) {
 
 function sameObject(left, right) { return left.ino === right.ino && left.dev === right.dev; }
 
+function previewUnavailable() { return fileError(501, "Previews are unavailable on this file system, because Outright cannot prove where an opened file is", "PREVIEW_UNAVAILABLE"); }
 function pathChanged() { return fileError(409, "The path changed while it was being opened; retry", "PATH_CHANGED"); }
 
 async function resolveInside(root, relative) {
@@ -433,20 +462,27 @@ async function resolveInside(root, relative) {
 }
 
 // Where a listed link leads. The link is resolved by name, but what is
-// reported comes from looking up its canonical target through the root
-// handle, so a swapped ancestor cannot reveal another directory's state.
-async function linkTarget(binding, entryPath) {
+// reported comes from looking up its canonical target's last name inside its
+// folder, opened through the root handle, so a swapped ancestor or
+// intermediate folder cannot reveal another directory's state: the target is
+// then unreadable.
+async function linkTarget(binding, entryPath, hooks) {
   const { root } = binding;
   let real;
   try { real = await realpath(path.join(root, ...entryPath.split("/"))); }
   catch (error) { return { state: missingCode(error) ? "missing" : "unreadable" }; }
   if (!isWithin(root, real) || excludedSegments(path.relative(root, real).split(path.sep))) return { state: "outside" };
   const target = toPosix(path.relative(root, real));
-  try {
-    const info = await lstat(binding.at(target));
-    return { state: info.isDirectory() ? "directory" : info.isFile() ? "file" : "other", path: target };
-  } catch (error) { return { state: missingCode(error) ? "missing" : "unreadable" }; }
+  await hooks.beforeInspect?.(real);
+  let info;
+  try { info = await inspectResolved(binding, real, hooks); }
+  catch (error) { return { state: missingCode(error) ? "missing" : "unreadable" }; }
+  const state = statKind(info);
+  if (state === "symlink") return { state: "unreadable" };
+  return { state, path: target };
 }
+// A folder on the way to a file that is gone, or is a file, means the file is missing.
+function parentGone(error) { return ["MISSING", "NOT_DIRECTORY"].includes(error?.details?.code); }
 function missingCode(error) { return ["ENOENT", "ENOTDIR", "ELOOP"].includes(error?.code); }
 
 // Accepts a relative path with "/" separators ("\\" too on Windows). An
@@ -512,7 +548,11 @@ function direntKind(entry) {
   if (entry.isSymbolicLink()) return "symlink";
   return entry.isFIFO() || entry.isSocket() || entry.isCharacterDevice() || entry.isBlockDevice() ? "other" : "unknown";
 }
-function statKind(info) { return info.isDirectory() ? "directory" : info.isFile() ? "file" : info.isSymbolicLink() ? "symlink" : "other"; }
+function statKind(info) {
+  if (info.isDirectory()) return "directory";
+  if (info.isFile()) return "file";
+  return info.isSymbolicLink() ? "symlink" : "other";
+}
 
 async function readBytes(handle, length) {
   const buffer = Buffer.alloc(length);

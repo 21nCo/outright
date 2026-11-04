@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { access, readdir, readFile, realpath } from "node:fs/promises";
+import { access, lstat, readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { utilityBudgetUnavailable, utilityProcesses } from "./subprocess-budget.mjs";
 
@@ -298,24 +298,32 @@ async function validateFiles(cwd, files) { if (!Array.isArray(files) || !files.l
 async function requireChildPath(root, child) { const resolved = path.resolve(root, child); if (!isWithin(root, resolved)) throw httpError(403, "File path escapes the worktree"); return resolved; }
 // The editor opens what a path leads to, so a link inside the worktree (the
 // file or any folder above it) that leads out is refused like a path that
-// does. A name that does not exist yet is checked through its nearest
-// existing folder. The canonical path is what the editor is given.
+// does. The path is walked one name at a time from the canonical root: a
+// link must lead to an existing place inside, so a dangling link (whose
+// target a save would create, wherever it points) is refused too. Only a
+// name that is genuinely absent ends the walk, and the rest is appended to
+// the canonical folder reached so far. The canonical path is what the
+// editor is given.
 async function requireCanonicalChild(root, child) {
-  let existing = await requireChildPath(root, child);
-  const rest = [];
-  for (;;) {
-    let real;
-    try { real = await realpath(existing); }
+  const names = path.relative(root, await requireChildPath(root, child)).split(path.sep).filter(Boolean);
+  let current;
+  try { current = await realpath(root); } catch { throw httpError(403, "File path cannot be checked inside the worktree"); }
+  const base = current;
+  for (const [index, name] of names.entries()) {
+    const next = path.join(current, name);
+    let info;
+    try { info = await lstat(next); }
     catch (error) {
-      if (!["ENOENT", "ENOTDIR"].includes(error?.code) || existing === root) throw httpError(403, "File path cannot be checked inside the worktree");
-      rest.unshift(path.basename(existing));
-      existing = path.dirname(existing);
-      continue;
+      // Absent here (or under a file, which has no children): nothing to follow.
+      if (["ENOENT", "ENOTDIR"].includes(error?.code)) return path.join(next, ...names.slice(index + 1));
+      throw httpError(403, "File path cannot be checked inside the worktree");
     }
-    const target = path.join(real, ...rest);
-    if (!isWithin(root, target)) throw httpError(403, "File path leads outside the worktree");
-    return target;
+    if (!info.isSymbolicLink()) { current = next; continue; }
+    try { current = await realpath(next); }
+    catch { throw httpError(403, "File path is a link whose target cannot be checked inside the worktree"); }
+    if (!isWithin(base, current)) throw httpError(403, "File path leads outside the worktree");
   }
+  return current;
 }
 // Containment by path segment: "..large.log" or "..cache/x" is a child, while
 // ".." and "../x" (or another drive on Windows) are not.

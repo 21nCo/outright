@@ -332,7 +332,7 @@ test("a pdf.js worker that fails before it is ready fails its document and is st
     constructor(url) { super(); this.url = url; this.terminated = false; created.push(this); }
     terminate() { this.terminated = true; }
   }
-  const start = pdfWorkerStarter({ createWorker: (url) => new FakeWorker(url), base: () => "http://app.test/files" });
+  const start = pdfWorkerStarter({ createWorker: (url) => new FakeWorker(url), base: () => "http://app.test/files", startupMs: 1000 });
   const message = (data) => Object.assign(new Event("message"), { data });
   const first = start("/assets/pdf.worker.mjs");
   first.worker.dispatchEvent(new Event("error"));
@@ -357,7 +357,28 @@ test("a pdf.js worker that fails before it is ready fails its document and is st
   third.worker.dispatchEvent(new Event("error"));
   assert.equal(third.worker.terminated, false);
   // A worker that started clears the failure: the next start uses the plain address.
-  assert.equal(start("/assets/pdf.worker.mjs").worker.url, "http://app.test/assets/pdf.worker.mjs");
+  const last = start("/assets/pdf.worker.mjs");
+  last.ready.catch(() => {});
+  assert.equal(last.worker.url, "http://app.test/assets/pdf.worker.mjs");
+});
+
+test("a pdf.js worker that stays silent past its startup deadline is ended and fails its document", async () => {
+  const created = [];
+  class SilentWorker extends EventTarget {
+    constructor(url) { super(); this.url = url; this.terminated = false; created.push(this); }
+    terminate() { this.terminated = true; }
+  }
+  const start = pdfWorkerStarter({ createWorker: (url) => new SilentWorker(url), base: () => "http://app.test/files", startupMs: 30 });
+  const silent = start("/assets/pdf.worker.mjs");
+  await assert.rejects(silent.ready, /The PDF reader did not start in time/);
+  assert.equal(silent.worker.terminated, true);
+  // The next start asks for the script afresh and, once ready, is not ended later.
+  const next = start("/assets/pdf.worker.mjs");
+  assert.equal(next.worker.url, "http://app.test/assets/pdf.worker.mjs?retry=1");
+  next.worker.dispatchEvent(Object.assign(new Event("message"), { data: { sourceName: "worker", action: "ready" } }));
+  await next.ready;
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(next.worker.terminated, false);
 });
 
 test("the hidden-files choice is saved when storage allows it, and storage that refuses never throws", () => {

@@ -29,7 +29,8 @@ export function pdfjsAssetsPlugin() {
     name: "outright-pdfjs-assets",
     configureServer(server) {
       server.middlewares.use("/pdfjs", (request, response, next) => {
-        const pathname = `/pdfjs${new URL(request.url, "http://local").pathname}`;
+        // The mount strips "/pdfjs"; the query is not part of an asset's name.
+        const pathname = `/pdfjs${request.url.split(/[?#]/)[0]}`;
         const headers = pdfjsAssetHeaders(pathname);
         if (!headers) { next(); return; }
         let body;

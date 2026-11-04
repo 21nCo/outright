@@ -672,12 +672,12 @@ test("nested runner deadline exceeds its child's full browser budget", () => {
 
 test("the per-file deadline outlives the browser fixture and the file's earlier tests", () => {
   // macOS CI spent 17 seconds on this file's earlier tests and needs about
-  // 232 seconds for the 156-step interaction phase.
+  // 280 seconds for the 167-step interaction phase.
   for (const budget of [ordinaryBudget, wheelBudget]) {
     assert(budget.fixtureMs >= budget.phaseMs + 25_000);
     assert(budget.fileMs >= budget.fixtureMs + 30_000);
   }
-  assert(ordinaryBudget.phaseMs >= 232_000 + 30_000);
+  assert(ordinaryBudget.phaseMs >= 280_000 + 45_000);
   assert(wheelBudget.phaseMs > ordinaryBudget.phaseMs);
   for (const cap of [Number.NaN, -1, 0, 1001, 5000]) assert.deepEqual(uiFixtureBudget(cap), ordinaryBudget, `cap=${cap}`);
   for (const cap of [1, 120, 1000]) assert.deepEqual(uiFixtureBudget(cap), wheelBudget, `cap=${cap}`);

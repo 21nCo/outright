@@ -7,19 +7,33 @@ import test from "node:test";
 import { pdfjsAssetHeaders } from "./pdfjs-assets-plugin.mjs";
 import { clientFiles } from "./standalone-host.mjs";
 
-test("the built client serves pdf.js assets with the development server's headers, and a missing one is a 404", async (t) => {
+test("the built client serves pdf.js assets with the development server's headers, and a missing one is a 404", { timeout: 30_000 }, async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-client-"));
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  let server;
+  // One ordered teardown: drop the client's keep-alive sockets, wait for the
+  // server (and the files it streamed) to close, then remove the folder,
+  // which Windows refuses while a file in it is still open.
+  t.after(async () => {
+    if (server?.listening) {
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+    }
+    rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
   mkdirSync(path.join(directory, "pdfjs", "cmaps"), { recursive: true });
   mkdirSync(path.join(directory, "pdfjs", "standard_fonts"), { recursive: true });
   writeFileSync(path.join(directory, "index.html"), "<!doctype html><title>Outright</title>");
   writeFileSync(path.join(directory, "pdfjs", "cmaps", "Adobe-Japan1-UCS2.bcmap"), Buffer.from([0xe0, 1, 2]));
   writeFileSync(path.join(directory, "pdfjs", "standard_fonts", "FoxitSans.pfb"), "<html><script>alert(1)</script>");
   const files = clientFiles(directory);
-  const server = createServer((request, response) => files(request, response, () => { response.statusCode = 404; response.end(); }));
+  server = createServer((request, response) => files(request, response, () => { response.statusCode = 404; response.end(); }));
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  t.after(() => server.close());
-  const get = (pathname) => fetch(`http://127.0.0.1:${server.address().port}${pathname}`);
+  // Each body is read to its end, so no response holds its file open.
+  const get = async (pathname) => {
+    const response = await fetch(new URL(pathname, `http://127.0.0.1:${server.address().port}`));
+    await response.arrayBuffer();
+    return response;
+  };
   for (const pathname of ["/pdfjs/cmaps/Adobe-Japan1-UCS2.bcmap", "/pdfjs/standard_fonts/FoxitSans.pfb"]) {
     const response = await get(pathname);
     assert.equal(response.status, 200, pathname);
