@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { pdfjsAssetHeaders } from "./pdfjs-assets-plugin.mjs";
+import { pdfjsAssetHeaders, pdfjsAssetsPlugin } from "./pdfjs-assets-plugin.mjs";
 import { clientFiles } from "./standalone-host.mjs";
 
 test("the built client serves pdf.js assets with the development server's headers, and a missing one is a 404", { timeout: 30_000 }, async (t) => {
@@ -52,4 +52,19 @@ test("the built client serves pdf.js assets with the development server's header
 test("only a /pdfjs/<folder>/<name> address gets pdf.js asset headers", () => {
   assert.deepEqual(pdfjsAssetHeaders("/pdfjs/wasm/openjpeg.wasm"), { "Content-Type": "application/wasm", "X-Content-Type-Options": "nosniff" });
   for (const pathname of ["/index.html", "/pdfjs/other/x.bcmap", "/pdfjs/cmaps/../x", "/pdfjs/cmaps/a/b", "/assets/pdfjs/cmaps/x.bcmap"]) assert.equal(pdfjsAssetHeaders(pathname), null, pathname);
+});
+
+test("the development server serves a pdf.js asset whether its request target is a path or an absolute URL", () => {
+  let middleware;
+  pdfjsAssetsPlugin().configureServer({ middlewares: { use: (mount, handler) => { assert.equal(mount, "/pdfjs"); middleware = handler; } } });
+  // Connect strips the mount from the path but keeps an absolute-form request's scheme and host.
+  for (const url of ["/cmaps/78-EUC-H.bcmap?v=1", "http://localhost:5173/cmaps/78-EUC-H.bcmap?v=1", "/cmaps/../package.json"]) {
+    const headers = {};
+    let body = null;
+    let passed = false;
+    middleware({ url }, { setHeader: (name, value) => { headers[name] = value; }, end: (data) => { body = data; } }, () => { passed = true; });
+    if (url.includes("..")) { assert.ok(passed && body === null, url); continue; }
+    assert.ok(!passed && body?.length > 0, url);
+    assert.deepEqual(headers, pdfjsAssetHeaders("/pdfjs/cmaps/78-EUC-H.bcmap"), url);
+  }
 });

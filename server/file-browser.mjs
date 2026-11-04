@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { lstat, open, opendir, readlink, stat } from "node:fs/promises";
+import { lstat, open, opendir, readlink, stat, statfs } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -75,6 +75,9 @@ const ANCHORABLE = process.platform === "linux" || Boolean(NOFOLLOW_ANY);
 const SEARCH_ONLY = { linux: 0o10000000, darwin: 0x40000000 }[process.platform] ?? constants.O_RDONLY;
 // A path that needs more links than this is treated as a loop, as the kernel does.
 const MAX_LINKS = 40;
+// How many times a proof is made again when a folder on its chain was
+// written to while it was made (proveHeld), before PATH_CHANGED.
+const PROOF_ATTEMPTS = 3;
 function openFlags(directory, search = false) {
   const nofollow = NOFOLLOW_ANY || (constants.O_NOFOLLOW ?? 0);
   const access = search ? SEARCH_ONLY : constants.O_RDONLY;
@@ -86,9 +89,12 @@ function openFlags(directory, search = false) {
 // folder or file below it (each folder a path passes through is opened),
 // `hooks.beforeInspect(real)` after a file is resolved and before it is opened,
 // and `hooks.beforeRead` and `hooks.afterRead` around reading a folder's
-// entries; they exist so tests can replace a path component at exactly those
-// moments. `handlePaths: false` simulates a system where an opened
-// descriptor's location cannot be proven (no /proc/self/fd, /.vol or O_NOFOLLOW_ANY).
+// entries, and `hooks.duringProof(step)` between the checks of a proof (after
+// each walked name on macOS, between the two readlinks on Linux); they exist
+// so tests can replace a path component at exactly those moments.
+// `hooks.statfs(path)` stands in for the volume probe (provableVolume).
+// `handlePaths: false` simulates a system where an opened descriptor's
+// location cannot be proven (no /proc/self/fd, /.vol or O_NOFOLLOW_ANY).
 export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, handlePaths = true } = {}) {
   let rawStreams = 0;
   const waiting = [];
@@ -103,7 +109,7 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
     const binding = await bindRoot(root, hooks, handlePaths);
     try {
       // Without a root anchor nothing below the root is looked at (OUT-144).
-      if (!binding.anchor) throw fileError(501, "Folder listing is unavailable on this file system, because a folder cannot be read through the handle Outright checked", "LISTING_UNAVAILABLE");
+      if (!binding.anchor) throw listingUnavailable();
       const target = relative ? await resolveContained(binding, relative, hooks, "Folder") : null;
       let folder = rootFolder(binding);
       try {
@@ -176,11 +182,15 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
   async function preview(root, file) {
     const relative = relativePath(file, limits, false);
     const binding = await bindRoot(root, hooks, handlePaths);
-    let opened;
-    try { opened = await openFile(binding, relative, hooks); }
-    finally { await binding.close(); }
-    try { return describe(relative, opened, await classify(relative, opened, limits, true)); }
-    finally { await opened.handle?.close(); }
+    try {
+      const opened = await openFile(binding, relative, hooks);
+      try {
+        const kind = await classify(relative, opened, limits, true);
+        // The bytes were read through a folder that may have moved since the open.
+        await opened.prove();
+        return describe(relative, opened, kind);
+      } finally { await opened.close(); }
+    } finally { await binding.close(); }
   }
 
   async function raw(root, file, version, request, response) {
@@ -195,9 +205,17 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
     streaming.set(response, new Promise((resolve) => { finished = resolve; }));
     try {
       const binding = await bindRoot(root, hooks, handlePaths);
-      try { opened = await openFile(binding, relative, hooks); }
-      finally { await binding.close(); }
-      const kind = await classify(relative, opened, limits, false);
+      let kind;
+      try {
+        opened = await openFile(binding, relative, hooks);
+        kind = await classify(relative, opened, limits, false);
+        // Proved once more before the headers. The stream that follows reads
+        // the same opened file, which a writer outside could still change.
+        await opened.prove();
+      } finally {
+        try { await opened?.release(); }
+        finally { await binding.close(); }
+      }
       if (kind.previewType !== "image" && kind.previewType !== "pdf") {
         throw fileError(415, "Only verified image and PDF previews are served as files", "NOT_RAW_PREVIEW");
       }
@@ -305,20 +323,33 @@ async function classify(relative, { handle, info }, limits, withText) {
 // read. The file is opened by its last name inside the folder handle the
 // resolver holds, must be the object it looked up, and is kept only if that
 // folder is still at its walked place afterwards. Its bytes are then its own.
+// The folder stays held, so the caller proves it again after reading
+// (prove), then releases it (release) or it and the file (close).
 // Without a root anchor nothing below the root is looked at, so every name
 // gives the same answer.
 async function openFile(binding, relative, hooks) {
   if (!binding.anchor) throw previewUnavailable();
   const target = await resolveContained(binding, relative, hooks, "File");
+  let handle = null;
   try {
     const { info } = target;
     const link = target.requestedLink ? { target: toPosix(path.relative(binding.root, target.real)) } : null;
     if (info.isDirectory()) throw fileError(409, `${relative} is a folder`, "IS_DIRECTORY");
-    if (!info.isFile()) return { handle: null, info: fileFacts(info), link };
-    await hooks.beforeInspect?.(target.real);
-    const { handle, info: opened } = await openUnder(binding, target.parent, target.name, info, relative, { directory: false }, hooks);
-    return { handle, info: fileFacts(opened), link };
-  } finally { await target.close(); }
+    let facts = info;
+    if (info.isFile()) {
+      await hooks.beforeInspect?.(target.real);
+      ({ handle, info: facts } = await openUnder(binding, target.parent, target.name, info, relative, { directory: false }, hooks));
+    }
+    const release = () => target.close();
+    return {
+      handle, info: fileFacts(facts), link, release,
+      prove: () => proveHeld(binding, target.parent),
+      close: async () => { try { await handle?.close(); } finally { await release(); } },
+    };
+  } catch (error) {
+    await target.close();
+    throw error;
+  }
 }
 
 // Resolves `relative` one name at a time from a folder proved inside the
@@ -391,6 +422,10 @@ async function resolveContained(binding, relative, hooks, noun, from = rootFolde
       }
       if (failure) throw failure;
       if (step.expect && !sameObject(info, step.expect)) throw pathChanged();
+      // A folder on another volume (one mounted inside the worktree) must be provable too.
+      if (info.isDirectory() && info.dev !== binding.identity.dev && !(await provableVolume(binding, info))) {
+        throw noun === "Folder" ? listingUnavailable() : previewUnavailable();
+      }
       if (destination !== undefined) {
         if (step.last) requestedLink = true;
         if (++links > MAX_LINKS) throw fileError(409, `${relative} is a link that loops`, "LINK_LOOP");
@@ -412,8 +447,9 @@ async function resolveContained(binding, relative, hooks, noun, from = rootFolde
       await release(await openUnder(binding, parent, name, info, relative, { directory: true, search: true }, hooks));
     }
   } catch (error) {
-    // A refusal is reported only once the folder its lookup was made in is proved in place.
-    await proveHeld(binding, parent);
+    // A refusal is reported only once the folder its lookup was made in is
+    // proved in place; PATH_CHANGED (a failed proof included) is the answer either way.
+    if (error?.details?.code !== "PATH_CHANGED") await proveHeld(binding, parent);
     throw error;
   } finally { if (!kept) await release(null); }
 }
@@ -460,8 +496,8 @@ function fileFacts(info) {
 // lead a read into another directory; the root's path is checked again after
 // each open, so such a change is reported as PATH_CHANGED. Where no handle
 // path exists (Windows, macOS 10.15, Linux without /proc, a macOS volume
-// without /.vol) there is no anchor and nothing is read (owner decision:
-// deferred to OUT-144, failing closed). A hard link to a file is the same
+// without /.vol or not APFS) there is no anchor and nothing is read (owner
+// decision: deferred to OUT-144, failing closed). A hard link to a file is the same
 // file wherever it is named, so no path check can tell one apart.
 async function bindRoot(root, hooks, handlePaths) {
   const unbound = { root, anchor: null, close: async () => {} };
@@ -491,11 +527,9 @@ async function bindRoot(root, hooks, handlePaths) {
       const volumePath = `/.vol/${info.dev}/${info.ino}`;
       if (await stat(volumePath, { bigint: true }).then((found) => sameObject(found, info), () => false)) anchor = volumePath;
     }
-    if (!anchor) { await handle.close(); return unbound; }
-    return {
-      root, anchor, handle, identity: info,
-      close: () => handle.close(),
-    };
+    const binding = { root, anchor, handle, identity: info, hooks, volumes: new Map(), close: () => handle.close() };
+    if (!anchor || !(await provableVolume(binding, info))) { await handle.close(); return unbound; }
+    return binding;
   } catch (error) {
     await handle.close();
     throw error;
@@ -552,20 +586,72 @@ function rootFolder(binding) { return { readPath: binding.anchor, handle: null, 
 // Linux: the kernel's path of its descriptor equals the root's plus its
 // walked names. macOS: from the root's identity down, each walked name looked
 // up in the folder above (by /.vol identity) is the folder walked through.
-// Either is PATH_CHANGED otherwise. A folder moved out and back before this
-// call is inside again, and is not told apart.
+// Those checks are made one after another, so they are bracketed: the ctime
+// of the root and of every folder walked to the held one is read before and
+// after them, and must not change. Renaming a folder changes its ctime and
+// that of the folders it leaves and enters, and so does adding or removing a
+// name in a folder (utimes cannot set a ctime back), so equal brackets mean
+// the checks saw one unchanging chain, not pieces of different ones. A folder
+// written to during the proof is proved again, at most PROOF_ATTEMPTS times
+// in all. Anything else is PATH_CHANGED at once. A folder moved out and back
+// before this call is inside again, and is not told apart.
 async function proveHeld(binding, held) {
-  if (process.platform === "linux") {
-    const [location, rootNow] = await Promise.all([held.readPath, binding.anchor].map((link) => readlink(link).catch(() => null)));
-    if (rootNow !== binding.root || location !== path.join(binding.root, ...held.canonical)) throw pathChanged();
-  } else {
-    for (let depth = 1; depth < held.chain.length; depth += 1) {
-      const above = held.chain[depth - 1];
-      const found = await lstat(`/.vol/${above.dev}/${above.ino}/${held.canonical[depth - 1]}`, { bigint: true }).catch(() => null);
-      if (!found?.isDirectory() || !sameObject(found, held.chain[depth])) throw pathChanged();
+  const { hooks } = binding;
+  for (let attempt = 1; ; attempt += 1) {
+    const before = await chainTimes(binding, held);
+    if (process.platform === "linux") {
+      const location = await readlink(held.readPath).catch(() => null);
+      await hooks.duringProof?.("readlink");
+      const rootNow = await readlink(binding.anchor).catch(() => null);
+      if (rootNow !== binding.root || location !== path.join(binding.root, ...held.canonical)) throw pathChanged();
+    } else {
+      for (let depth = 1; depth < held.chain.length; depth += 1) {
+        const above = held.chain[depth - 1];
+        const found = await lstat(`/.vol/${above.dev}/${above.ino}/${held.canonical[depth - 1]}`, { bigint: true }).catch(() => null);
+        if (!found?.isDirectory() || !sameObject(found, held.chain[depth])) throw pathChanged();
+        await hooks.duringProof?.(depth);
+      }
     }
+    await requireRoot(binding);
+    const after = await chainTimes(binding, held);
+    if (after.every((time, index) => time === before[index])) return;
+    if (attempt >= PROOF_ATTEMPTS) throw pathChanged();
   }
-  await requireRoot(binding);
+}
+
+// The ctime of the root and of each folder walked to the held one, each
+// required to be the one walked: by identity on macOS (/.vol); on Linux the
+// root's descriptor, and each folder looked up by its walked names from it
+// (without following a last link), so a folder no longer at its walked place
+// under the root is PATH_CHANGED here too. Only folders the walk passed
+// through are searched. They are read together; the bracket only needs all
+// of them read before the checks begin, and again after.
+async function chainTimes(binding, held) {
+  const infos = await Promise.all(held.chain.map((walked, depth) => {
+    if (process.platform !== "linux") return stat(`/.vol/${walked.dev}/${walked.ino}`, { bigint: true }).catch(() => null);
+    if (!depth) return stat(binding.anchor, { bigint: true }).catch(() => null);
+    return lstat(path.join(binding.anchor, ...held.canonical.slice(0, depth)), { bigint: true }).catch(() => null);
+  }));
+  if (infos.some((info, depth) => !info || !sameObject(info, held.chain[depth]))) throw pathChanged();
+  return infos.map((info) => info.ctimeNs);
+}
+
+// A proof compares nanosecond ctimes. On macOS only APFS keeps them, and
+// macOS 11 and later (the only ones with an anchor) start from an APFS
+// volume, so a folder is provable when its volume is of the same type as
+// "/". Elsewhere (HFS+, FAT, exFAT, SMB) it is not, and nothing is read
+// through it, as on a host without a root handle (OUT-144). Checked once per
+// volume and request.
+let apfsType;
+async function provableVolume(binding, info) {
+  if (process.platform !== "darwin") return true;
+  if (!binding.volumes.has(info.dev)) {
+    apfsType ??= statfs("/").then((found) => found.type, () => null);
+    const found = await (binding.hooks.statfs ?? statfs)(`/.vol/${info.dev}/${info.ino}`).catch(() => null);
+    const apfs = await apfsType;
+    binding.volumes.set(info.dev, apfs !== null && found !== null && found.type === apfs);
+  }
+  return binding.volumes.get(info.dev);
 }
 
 // The root's path must still name the root handle's directory.
@@ -576,6 +662,7 @@ async function requireRoot(binding) {
 
 function sameObject(left, right) { return left.ino === right.ino && left.dev === right.dev; }
 
+function listingUnavailable() { return fileError(501, "Folder listing is unavailable on this file system, because a folder cannot be read through the handle Outright checked", "LISTING_UNAVAILABLE"); }
 function previewUnavailable() { return fileError(501, "Previews are unavailable on this file system, because Outright cannot prove where an opened file is", "PREVIEW_UNAVAILABLE"); }
 function pathChanged() { return fileError(409, "The path changed while it was being opened; retry", "PATH_CHANGED"); }
 

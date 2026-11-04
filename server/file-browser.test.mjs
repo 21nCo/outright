@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
-import { open } from "node:fs/promises";
+import { open, statfs } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
@@ -663,6 +663,151 @@ test("a worktree root that can be entered but not listed still previews and stre
     chmodSync(root, 0o755);
     chmodSync(path.join(root, "d"), 0o755);
   }
+});
+
+test("a proof is one observation: a chain put back together outside while it is checked is PATH_CHANGED", linkable, async (t) => {
+  const { base, root, write } = fixture(t);
+  write("a/b/inside.md", "inside\n");
+  const outside = path.join(base, "outside");
+  mkdirSync(outside);
+  let armed = false;
+  let fired = false;
+  // After b is opened it moves outside and gains a private file. Then, in
+  // the middle of the last proof (after the walked name "a" was checked), a
+  // moves outside too and b goes under it, so each name checked later still
+  // matches what was walked although b never came back (pullfrog's schedule).
+  const files = createFileBrowser({ hooks: {
+    afterOpen: (real) => {
+      if (real !== path.join(root, "a", "b")) return;
+      renameSync(real, path.join(outside, "b"));
+      writeFileSync(path.join(outside, "b", "PRIVATE.md"), "secret\n");
+    },
+    afterRead: () => { armed = true; },
+    duringProof: () => {
+      if (!armed || fired) return;
+      fired = true;
+      renameSync(path.join(root, "a"), path.join(outside, "a"));
+      renameSync(path.join(outside, "b"), path.join(outside, "a", "b"));
+    },
+  } });
+  const outcome = await files.list(root, { directory: "a/b" }).then((value) => value.entries.map((entry) => entry.name), (error) => [error.statusCode, error.details?.code]);
+  // On Linux the bracket's reading of b's ancestors already finds b outside.
+  if (process.platform === "darwin") assert.ok(fired, "the proof ran its checks");
+  assert.deepEqual(outcome, [409, "PATH_CHANGED"]);
+});
+
+test("on Linux, an impostor at the root's path, taken away between the proof's two readlinks, is PATH_CHANGED", { skip: (process.platform !== "linux" && "the readlinks are Linux's proof") || linkable.skip }, async (t) => {
+  const { base, root, write } = fixture(t);
+  write("d/x.md", "inside\n");
+  const outside = path.join(base, "outside");
+  mkdirSync(outside);
+  const real = path.join(base, "real");
+  let stage = 0;
+  const files = createFileBrowser({ hooks: {
+    // d leaves before it is read, so what is read is outside.
+    beforeRead: () => {
+      renameSync(path.join(root, "d"), path.join(outside, "d"));
+      writeFileSync(path.join(outside, "d", "PRIVATE.md"), "secret\n");
+    },
+    // Then an impostor takes the root's path and d goes in it...
+    afterRead: () => {
+      stage = 1;
+      renameSync(root, real);
+      mkdirSync(root);
+      renameSync(path.join(outside, "d"), path.join(root, "d"));
+    },
+    // ...until d's location was read; then the real root comes back.
+    duringProof: (step) => {
+      if (stage !== 1 || step !== "readlink") return;
+      stage = 2;
+      renameSync(root, path.join(base, "impostor"));
+      renameSync(real, root);
+    },
+  } });
+  const outcome = await files.list(root, { directory: "d" }).then((value) => value.entries.map((entry) => entry.name), (error) => [error.statusCode, error.details?.code]);
+  // The bracket, reading d by name from the real root, may refuse before the readlinks.
+  assert.ok(stage >= 1, "the impostor was put in place");
+  assert.deepEqual(outcome, [409, "PATH_CHANGED"]);
+});
+
+test("a proof is made again when a folder on its chain is written to during it, and churn ends in PATH_CHANGED", linkable, async (t) => {
+  const { root, write } = fixture(t);
+  write("a/x.md", "x");
+  let created = 0;
+  let names = 0;
+  // Each write adds a new name to the root, a folder on every proof's chain.
+  const writer = (always) => () => { if (always || !created) { created += 1; writeFileSync(path.join(root, `new-${names++}.md`), ""); } };
+  const once = await createFileBrowser({ hooks: { duringProof: writer(false) } }).list(root, { directory: "a" });
+  assert.equal(created, 1);
+  assert.deepEqual(once.entries.map((entry) => entry.name), ["x.md"]);
+  created = 0;
+  const started = Date.now();
+  assert.deepEqual(await refusal(createFileBrowser({ hooks: { duringProof: writer(true) } }).list(root, { directory: "a" })).then((error) => [error.status, error.code]), [409, "PATH_CHANGED"]);
+  // One proof, three attempts, each changing the root once.
+  assert.equal(created, 3);
+  assert.ok(Date.now() - started < 5000, "churn is given up on promptly");
+});
+
+test("on macOS a worktree or a folder on a volume without nanosecond ctimes is never read", { skip: (process.platform !== "darwin" && "only macOS volumes are told apart") || linkable.skip }, async (t) => {
+  const { root, write } = fixture(t);
+  write("a.md", "# A\n");
+  write("d/logo.png", PNG);
+  const opened = [];
+  // The volume probe answers as for HFS+, FAT or SMB.
+  const files = createFileBrowser({ hooks: { statfs: async () => ({ type: -1 }), beforeOpen: (real) => { opened.push(real); } } });
+  assert.equal((await refusal(files.list(root))).code, "LISTING_UNAVAILABLE");
+  assert.equal((await refusal(files.list(root, { directory: "d" }))).code, "LISTING_UNAVAILABLE");
+  assert.equal((await refusal(files.preview(root, "a.md"))).code, "PREVIEW_UNAVAILABLE");
+  const { request, response } = capture();
+  assert.equal((await refusal(files.raw(root, "d/logo.png", null, request, response))).code, "PREVIEW_UNAVAILABLE");
+  assert.deepEqual(opened, [], "something below the root was opened");
+  // A volume of the same type as "/" (APFS) is read.
+  const apfs = createFileBrowser({ hooks: { statfs: () => statfs("/") } });
+  assert.equal((await apfs.preview(root, "a.md")).text, "# A\n");
+});
+
+test("a file whose folder moves outside while its bytes are read is PATH_CHANGED, for preview and raw", linkable, async (t) => {
+  const { base, root, write } = fixture(t);
+  write("d/y.md", "# inside y\n");
+  write("d/logo.png", PNG);
+  mkdirSync(path.join(base, "outside"));
+  const d = path.join(root, "d");
+  const away = path.join(base, "outside", "d");
+  const probe = await open(path.join(root, "d", "y.md"), "r");
+  const FileHandle = probe.constructor;
+  await probe.close();
+  const { read: original } = FileHandle.prototype;
+  t.after(() => { FileHandle.prototype.read = original; });
+  let armed = false;
+  let moves = 0;
+  // The file's first read, after it was opened and its folder proved: d
+  // moves outside and the opened file is rewritten there, in place.
+  FileHandle.prototype.read = function read(...args) {
+    if (armed) {
+      armed = false;
+      moves += 1;
+      renameSync(d, away);
+      for (const name of ["y.md", "logo.png"]) writeFileSync(path.join(away, name), name === "y.md" ? "# PRIVATE\n" : Buffer.concat([PNG, Buffer.from("PRIVATE")]));
+    }
+    return original.apply(this, args);
+  };
+  const arm = { hooks: { afterOpen: (real) => { armed = real.startsWith(`${d}${path.sep}`); } } };
+  const preview = await refusal(createFileBrowser(arm).preview(root, "d/y.md"));
+  renameSync(away, d);
+  const { request, response, body } = capture();
+  const raw = await refusal(createFileBrowser(arm).raw(root, "d/logo.png", null, request, response));
+  assert.equal(moves, 2);
+  assert.deepEqual([preview.status, preview.code, raw.status, raw.code], [409, "PATH_CHANGED", 409, "PATH_CHANGED"]);
+  assert.equal(body().length, 0, "raw sent bytes");
+});
+
+test("a folder that can be read but not entered, below another folder, still lists its names", { skip: linkable.skip || (process.getuid?.() === 0 && "root ignores folder permissions") }, async (t) => {
+  const { root, write } = fixture(t);
+  write("a/d/x.md", "x");
+  chmodSync(path.join(root, "a", "d"), 0o444);
+  // A proof searches only the folders the walk passed through, not this one.
+  try { assert.deepEqual((await createFileBrowser().list(root, { directory: "a/d" })).entries.map((entry) => entry.name), ["x.md"]); }
+  finally { chmodSync(path.join(root, "a", "d"), 0o755); }
 });
 
 test("a folder of 500 links lists every target with a bounded number of descriptors, also twice at once", linkable, async (t) => {
