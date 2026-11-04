@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { lstat, open, opendir, readlink, realpath, stat } from "node:fs/promises";
+import { lstat, open, opendir, readlink, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -25,6 +25,9 @@ export const FILE_BROWSER_LIMITS = Object.freeze({
   // load; further requests wait their turn, and only a full queue is refused.
   maxRawStreams: 8,
   maxRawQueue: 64,
+  // Listed links whose targets are resolved at once; each holds at most two
+  // folder descriptors, so a listing's descriptor use stays bounded.
+  linkLookups: 8,
 });
 
 const MARKDOWN = new Set([".md", ".markdown", ".mdown", ".mkd"]);
@@ -66,19 +69,26 @@ const NOFOLLOW_ANY = noFollowAnyFlag();
 // Platforms where a request can descend from one handle on the worktree
 // root: Linux through /proc/self/fd/N, macOS 11+ through /.vol/dev/ino.
 const ANCHORABLE = process.platform === "linux" || Boolean(NOFOLLOW_ANY);
-function openFlags(directory, anyComponent) {
-  const nofollow = (anyComponent && NOFOLLOW_ANY) || (constants.O_NOFOLLOW ?? 0);
-  return constants.O_RDONLY | nofollow | (directory ? constants.O_DIRECTORY ?? 0 : constants.O_NONBLOCK ?? 0);
+// A folder that is only passed through is opened for search alone (Linux
+// O_PATH, macOS O_EXEC, which with O_DIRECTORY is O_SEARCH), so a folder the
+// user may enter but not list still leads to its readable files.
+const SEARCH_ONLY = { linux: 0o10000000, darwin: 0x40000000 }[process.platform] ?? constants.O_RDONLY;
+// A path that needs more links than this is treated as a loop, as the kernel does.
+const MAX_LINKS = 40;
+function openFlags(directory, search = false) {
+  const nofollow = NOFOLLOW_ANY || (constants.O_NOFOLLOW ?? 0);
+  const access = search ? SEARCH_ONLY : constants.O_RDONLY;
+  return access | nofollow | (directory ? constants.O_DIRECTORY ?? 0 : constants.O_NONBLOCK ?? 0);
 }
 
 // `hooks.beforeRoot(root)` runs before the root handle is opened,
-// `hooks.beforeInspect(real)` after a file or a listed link's target is
-// resolved and before it is inspected,
-// `hooks.beforeOpen(real)` and `hooks.afterOpen(real)` around opening it, and
-// `hooks.beforeRead` and `hooks.afterRead` around reading a folder's entries;
-// they exist so tests can replace a path component at exactly those moments.
-// `handlePaths: false` simulates a system where an opened descriptor's
-// location cannot be proven (no /proc/self/fd, /.vol or O_NOFOLLOW_ANY).
+// `hooks.beforeOpen(real)` and `hooks.afterOpen(real)` around opening any
+// folder or file below it (each folder a path passes through is opened),
+// `hooks.beforeInspect(real)` after a file is resolved and before it is opened,
+// and `hooks.beforeRead` and `hooks.afterRead` around reading a folder's
+// entries; they exist so tests can replace a path component at exactly those
+// moments. `handlePaths: false` simulates a system where an opened
+// descriptor's location cannot be proven (no /proc/self/fd, /.vol or O_NOFOLLOW_ANY).
 export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, handlePaths = true } = {}) {
   let rawStreams = 0;
   const waiting = [];
@@ -92,10 +102,16 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
     const after = parseCursor(cursor);
     const binding = await bindRoot(root, hooks, handlePaths);
     try {
-      const real = relative ? (await resolveInside(root, relative)).real : root;
-      const folder = await openVerified(binding, real, relative, true, hooks);
+      // Without a root anchor nothing below the root is looked at (OUT-144).
+      if (!binding.anchor) throw fileError(501, "Folder listing is unavailable on this file system, because a folder cannot be read through the handle Outright checked", "LISTING_UNAVAILABLE");
+      const target = relative ? await resolveContained(binding, relative, hooks, "Folder") : null;
+      let folder = { readPath: binding.anchor, handle: null, canonical: [] };
+      try {
+        if (target && !target.info.isDirectory()) throw fileSystemError({ code: "ENOTDIR" }, relative, "Folder");
+        if (target?.name) folder = { ...await openUnder(binding, target, relative, { directory: true }, hooks), canonical: [...target.folder, target.name] };
+      } finally { await target?.close(); }
       try { return await listOpened(binding, relative, folder, { pageSize, after, showHidden }); }
-      finally { await folder.handle.close(); }
+      finally { await folder.handle?.close(); }
     } finally { await binding.close(); }
   }
 
@@ -126,7 +142,7 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
     visible.sort(compareEntries);
     const remaining = after ? visible.filter((item) => compareEntries(item, after) > 0) : visible;
     const page = remaining.slice(0, pageSize);
-    const listed = await Promise.all(page.map(async (item) => {
+    const listed = await mapLimited(page, limits.linkLookups, async (item) => {
       const entryPath = relative ? `${relative}/${item.name}` : item.name;
       let { kind } = item;
       // Some file systems report no type with the name.
@@ -134,9 +150,9 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
       const result = { name: item.name, path: item.readable ? entryPath : null, kind, hidden: item.hidden };
       // An entry without a path is told apart by its raw name instead.
       if (!item.readable) result.nameKey = item.key;
-      if (kind === "symlink" && item.readable) result.target = await linkTarget(binding, entryPath, hooks);
+      if (kind === "symlink" && item.readable) result.target = await linkTarget(binding, folder, item.name, hooks);
       return result;
-    }));
+    });
     const last = page.at(-1);
     return {
       directory: relative,
@@ -280,64 +296,122 @@ async function classify(relative, { handle, info }, limits, withText) {
   return { previewType, text };
 }
 
-// Opens the canonical target, never a link. A target that is not a regular
-// file is described without being opened, so a FIFO cannot block a read.
-// Every look at the file goes through the request's root handle, and names
-// only its last component inside a folder opened and proved inside the root.
-// Without a root anchor nothing past the name's existence is looked at.
+// Opens what the path leads to, never a link. A target that is not a
+// regular file is described without being opened, so a FIFO cannot block a
+// read. The file is opened by its last name inside the folder handle the
+// resolver holds, and must be the object it looked up. Without a root anchor
+// nothing below the root is looked at, so every name gives the same answer.
 async function openFile(binding, relative, hooks) {
-  const name = relative.split("/").at(-1);
-  const parent = relative.slice(0, -name.length - 1);
-  let linkInfo;
-  try {
-    if (!binding.anchor) await lstat(binding.at(relative));
-    else linkInfo = await lookupName(binding, parent ? (await resolveInside(binding.root, parent)).real : binding.root, name, hooks);
-  } catch (error) { throw fileSystemError(parentGone(error) ? { code: "ENOENT" } : error, relative, "File"); }
   if (!binding.anchor) throw previewUnavailable();
-  let real;
-  try { ({ real } = await resolveInside(binding.root, relative)); }
-  catch (error) {
-    // The name exists, so a missing target means the link itself is broken.
-    if (error.details?.code === "MISSING" && linkInfo.isSymbolicLink()) throw fileError(404, `${relative} is a link to a file that does not exist`, "BROKEN_LINK");
-    throw error;
-  }
-  const target = toPosix(path.relative(binding.root, real));
-  let info;
-  await hooks.beforeInspect?.(real);
-  try { info = await inspectResolved(binding, real, hooks); } catch (error) { throw fileSystemError(error, relative, "File"); }
-  const link = linkInfo.isSymbolicLink() ? { target } : null;
-  if (info.isSymbolicLink()) throw pathChanged();
-  if (info.isDirectory()) throw fileError(409, `${relative} is a folder`, "IS_DIRECTORY");
-  if (!info.isFile()) return { handle: null, info: fileFacts(info), link };
-  const { handle } = await openVerified(binding, real, relative, false, hooks);
-  let opened;
-  try { opened = await handle.stat({ bigint: true }); }
-  catch (error) { await handle.close(); throw fileSystemError(error, relative, "File"); }
-  // The file at the canonical path must be the one that was checked.
-  if (!opened.isFile() || !sameObject(opened, info)) {
-    await handle.close();
-    throw fileError(409, "The file changed while it was being opened; retry", "FILE_CHANGED");
-  }
-  return { handle, info: fileFacts(opened), link };
+  const target = await resolveContained(binding, relative, hooks, "File");
+  try {
+    const { info } = target;
+    const link = target.requestedLink ? { target: toPosix(path.relative(binding.root, target.real)) } : null;
+    if (info.isDirectory()) throw fileError(409, `${relative} is a folder`, "IS_DIRECTORY");
+    if (!info.isFile()) return { handle: null, info: fileFacts(info), link };
+    await hooks.beforeInspect?.(target.real);
+    const { handle, info: opened } = await openUnder(binding, target, relative, { directory: false }, hooks);
+    return { handle, info: fileFacts(opened), link };
+  } finally { await target.close(); }
 }
 
-// Looks up one name in a canonical folder inside the root. The folder is
-// opened through the root handle and proved inside it (openVerified), and
-// only the last name is looked up under that folder's handle path, so a link
-// swapped into any earlier component is never followed: such a swap is
-// PATH_CHANGED, never the other object's kind, size or existence.
-async function lookupName(binding, folder, name, hooks) {
-  const opened = await openVerified(binding, folder, toPosix(path.relative(binding.root, folder)), true, hooks);
-  try { return await lstat(`${opened.readPath}/${name}`, { bigint: true }); }
-  finally { await opened.handle.close(); }
+// Resolves `relative` one name at a time from a folder proved inside the
+// root (the root handle, or a listed folder's handle): each name is looked up
+// only inside the handle of the folder before it, never through a path of
+// several names, and each folder passed through is opened from its parent's
+// handle without following a link. A link's destination is read there and
+// resolved lexically against that canonical folder; when it leaves the root
+// (an absolute path not under the root, or ".." above it), or names Git's
+// metadata, the answer is OUTSIDE_WORKTREE or EXCLUDED with nothing looked
+// up, so an outside name that exists and one that does not answer alike.
+// An absent name is MISSING (BROKEN_LINK when a link named it) only inside a
+// folder already proved inside. A folder that changes kind between its
+// lookup and its open is PATH_CHANGED. At most two folder descriptors are
+// held at once. The result keeps the last folder open for the caller, who
+// must call close().
+async function resolveContained(binding, relative, hooks, noun, from = { canonical: [], readPath: binding.anchor }) {
+  const rootParent = { readPath: binding.anchor, handle: null };
+  let folder = [...from.canonical];
+  let parent = { readPath: from.readPath, handle: null };
+  const names = relative.split("/");
+  const queue = names.map((name, index) => ({ name, link: false, last: index === names.length - 1 }));
+  let links = 0;
+  let requestedLink = false;
+  let kept = false;
+  const release = async (next) => { const held = parent.handle; parent = next; await held?.close(); };
+  const outside = () => fileError(403, `${relative} links outside this worktree`, "OUTSIDE_WORKTREE");
+  try {
+    for (;;) {
+      const step = queue.shift();
+      if (!step) {
+        // A link to "." or ".." ends on a folder without looking it up: its
+        // canonical names are looked up again from the root, down to it.
+        if (folder.length) {
+          queue.push(...folder.map((part) => ({ name: part, link: true, last: false })));
+          folder = [];
+          await release(rootParent);
+          continue;
+        }
+        kept = true;
+        return { real: binding.root, folder: [], name: null, info: await binding.handle.stat({ bigint: true }), readPath: binding.anchor, requestedLink, close: () => release(null) };
+      }
+      const { name } = step;
+      if (name === "..") {
+        if (!folder.length) throw outside();
+        // The folder is canonical, so its parent is the one above it, reached again from the root.
+        const above = folder.slice(0, -1);
+        folder = [];
+        await release(rootParent);
+        queue.unshift(...above.map((part) => ({ name: part, link: true, last: false })));
+        continue;
+      }
+      if (name.toLowerCase() === ".git") throw fileError(403, "Git metadata is not browsable", "EXCLUDED");
+      const real = path.join(binding.root, ...folder, name);
+      const at = `${parent.readPath}/${name}`;
+      let info;
+      try { info = await lstat(at, { bigint: true }); }
+      catch (error) {
+        if (error?.code === "ENOENT" && step.link) throw fileError(404, `${relative} is a link to a file that does not exist`, "BROKEN_LINK");
+        // The folder handle is a folder, so ENOTDIR means the lookup went elsewhere.
+        throw error?.code === "ENOTDIR" ? pathChanged() : fileSystemError(error, relative, noun);
+      }
+      if (info.isSymbolicLink()) {
+        if (step.last) requestedLink = true;
+        if (++links > MAX_LINKS) throw fileError(409, `${relative} is a link that loops`, "LINK_LOOP");
+        let destination;
+        try { destination = await readlink(at); }
+        catch (error) { throw ["ENOENT", "EINVAL"].includes(error?.code) ? pathChanged() : fileSystemError(error, relative, noun); }
+        let parts = destination.split("/");
+        if (destination.startsWith("/")) {
+          parts = underRoot(binding.root, parts);
+          if (!parts) throw outside();
+          folder = [];
+          await release(rootParent);
+        }
+        queue.unshift(...parts.filter((part) => part && part !== ".").map((part) => ({ name: part, link: true, last: false })));
+        continue;
+      }
+      if (!queue.length) {
+        kept = true;
+        return { real, folder, name, info, readPath: parent.readPath, requestedLink, close: () => release(null) };
+      }
+      if (!info.isDirectory()) throw fileSystemError({ code: "ENOTDIR" }, relative, noun);
+      const child = await openUnder(binding, { readPath: parent.readPath, name, real, info }, relative, { directory: true, search: true }, hooks);
+      await release({ readPath: child.readPath, handle: child.handle });
+      folder.push(name);
+    }
+  } finally { if (!kept) await release(null); }
 }
-// The same for a canonical path; the root itself is the root handle. Its
-// folder was resolved as a folder, so one that no longer is (Linux reports a
-// link opened with O_DIRECTORY | O_NOFOLLOW so) was replaced.
-async function inspectResolved(binding, real, hooks) {
-  if (real === binding.root) return binding.handle.stat({ bigint: true });
-  try { return await lookupName(binding, path.dirname(real), path.basename(real), hooks); }
-  catch (error) { throw error?.details?.code === "NOT_DIRECTORY" ? pathChanged() : error; }
+
+// The names of an absolute link destination below the canonical root, or
+// null when it does not name the root or a place under it by that spelling.
+// Its names after the root are resolved by the walk like any other, so a
+// ".." in them is applied to canonical folders.
+function underRoot(root, parts) {
+  const named = parts.filter((part) => part && part !== ".");
+  const prefix = root.split("/").filter(Boolean);
+  if (named.length < prefix.length || prefix.some((part, index) => named[index] !== part)) return null;
+  return named.slice(prefix.length);
 }
 
 // What a preview needs from a bigint stat: plain numbers, and a version that
@@ -350,9 +424,9 @@ function fileFacts(info) {
 
 // One handle on the worktree root per request. Its identity must be the
 // one the root's path named when the request began, and every later open
-// descends from it: /.vol/<dev>/<ino>/<relative> on macOS 11+ (with
-// O_NOFOLLOW_ANY, so no link anywhere is followed), /proc/self/fd/<fd>/<relative>
-// on Linux. Renaming or replacing the root or any ancestor therefore cannot
+// descends from it one name at a time (resolveContained): /.vol/<dev>/<ino>
+// on macOS 11+ (opens with O_NOFOLLOW_ANY), /proc/self/fd/<fd> on Linux
+// (opens with O_NOFOLLOW). Renaming or replacing the root or any ancestor therefore cannot
 // lead a read into another directory; the root's path is checked again after
 // each open, so such a change is reported as PATH_CHANGED. Where no handle
 // path exists (Windows, macOS 10.15, Linux without /proc, a macOS volume
@@ -360,14 +434,14 @@ function fileFacts(info) {
 // deferred to OUT-144, failing closed). A hard link to a file is the same
 // file wherever it is named, so no path check can tell one apart.
 async function bindRoot(root, hooks, handlePaths) {
-  const unbound = { root, anchor: null, at: (relative) => path.join(root, ...relative.split("/")), close: async () => {} };
+  const unbound = { root, anchor: null, close: async () => {} };
   if (!handlePaths || !ANCHORABLE) return unbound;
   let expected;
   try { expected = await lstat(root, { bigint: true }); } catch (error) { throw fileSystemError(error, "", "Folder"); }
   if (!expected.isDirectory()) throw pathChanged();
   await hooks.beforeRoot?.(root);
   let handle;
-  try { handle = await open(root, openFlags(true, true)); }
+  try { handle = await open(root, openFlags(true)); }
   catch (error) {
     if (error?.code === "ELOOP") throw pathChanged();
     throw fileSystemError(error, "", "Folder");
@@ -388,7 +462,6 @@ async function bindRoot(root, hooks, handlePaths) {
     if (!anchor) { await handle.close(); return unbound; }
     return {
       root, anchor, handle, identity: info,
-      at: (relative) => `${anchor}/${relative || "."}`,
       close: () => handle.close(),
     };
   } catch (error) {
@@ -397,44 +470,38 @@ async function bindRoot(root, hooks, handlePaths) {
   }
 }
 
-// Opens `real`, a canonical path inside the root, through the request's
-// root handle, and proves that what was opened is inside the root even if a
-// component was replaced by a link after it was resolved. macOS 11+ refuses
-// a link anywhere in the path; Linux reads the descriptor's own location
-// from /proc and compares it with the root handle's current location. A
-// folder is then read through that descriptor (/proc/self/fd/N, or the
-// volume's file-ID path /.vol/dev/ino on macOS), never by name again. Without
-// a root anchor nothing is read: a name checked before and after opening or
-// reading could still point elsewhere in between, so folders are not listed
-// and files are not previewed.
-async function openVerified(binding, real, relative, directory, hooks) {
+// Opens `name` inside the folder handle `readPath` that the resolver holds,
+// never following a link, and proves it is the object looked up there as
+// `info`. A link or another kind of object put there instead is PATH_CHANGED
+// (FILE_CHANGED for a file). A folder is then read through its own
+// descriptor (/proc/self/fd/N on Linux, where the descriptor's location must
+// still be inside the root, or /.vol/dev/ino on macOS), never by name again.
+async function openUnder(binding, { readPath: parentPath, name, real, info: expected }, relative, { directory, search = false }, hooks) {
   const noun = directory ? "Folder" : "File";
-  const target = toPosix(path.relative(binding.root, real));
   await hooks.beforeOpen?.(real);
   let handle;
-  try { handle = await open(binding.at(target), openFlags(directory, Boolean(binding.anchor))); }
+  try { handle = await open(`${parentPath}/${name}`, openFlags(directory, search)); }
   catch (error) {
-    // The path was resolved without links, so a link here is a replacement.
-    if (error?.code === "ELOOP") throw pathChanged();
+    // It was looked up as this kind without following a link, so a link here is a replacement.
+    if (error?.code === "ELOOP" || error?.code === "ENOTDIR") throw pathChanged();
     throw fileSystemError(error, relative, noun);
   }
   try {
     await hooks.afterOpen?.(real);
-    if (!binding.anchor) {
-      if (directory) throw fileError(501, "Folder listing is unavailable on this file system, because a folder cannot be read through the handle Outright checked", "LISTING_UNAVAILABLE");
-      throw previewUnavailable();
+    let info;
+    try { info = await handle.stat({ bigint: true }); }
+    catch (error) { throw fileSystemError(error, relative, noun); }
+    if (!sameObject(info, expected) || (directory ? !info.isDirectory() : !info.isFile())) {
+      throw directory ? pathChanged() : fileError(409, "The file changed while it was being opened; retry", "FILE_CHANGED");
     }
-    let readPath;
+    let readPath = `/.vol/${info.dev}/${info.ino}`;
     if (process.platform === "linux") {
       readPath = `/proc/self/fd/${handle.fd}`;
       const [location, rootNow] = await Promise.all([readlink(readPath), readlink(binding.anchor)].map((read) => read.catch(() => null)));
       if (location === null || rootNow === null || !isWithin(rootNow, location) || excludedSegments(path.relative(rootNow, location).split(path.sep))) throw pathChanged();
-    } else if (directory) {
-      const info = await handle.stat({ bigint: true });
-      readPath = `/.vol/${info.dev}/${info.ino}`;
     }
     await requireRoot(binding);
-    return { handle, readPath };
+    return { handle, readPath, info };
   } catch (error) {
     await handle.close();
     throw error;
@@ -452,38 +519,29 @@ function sameObject(left, right) { return left.ino === right.ino && left.dev ===
 function previewUnavailable() { return fileError(501, "Previews are unavailable on this file system, because Outright cannot prove where an opened file is", "PREVIEW_UNAVAILABLE"); }
 function pathChanged() { return fileError(409, "The path changed while it was being opened; retry", "PATH_CHANGED"); }
 
-async function resolveInside(root, relative) {
-  let real;
-  try { real = await realpath(path.join(root, ...relative.split("/"))); }
-  catch (error) { throw fileSystemError(error, relative, "Path"); }
-  if (!isWithin(root, real)) throw fileError(403, `${relative} links outside this worktree`, "OUTSIDE_WORKTREE");
-  if (excludedSegments(path.relative(root, real).split(path.sep))) throw fileError(403, "Git metadata is not browsable", "EXCLUDED");
-  return { real };
+// Where a listed link leads, resolved from the listed folder's handle by the
+// same walk as a request, so an outside target is "outside" whether or not it
+// exists, and a target replaced while it was looked up is "unreadable".
+async function linkTarget(binding, folder, name, hooks) {
+  let target;
+  try { target = await resolveContained(binding, name, hooks, "Path", folder); }
+  catch (error) {
+    const code = error?.details?.code;
+    if (code === "OUTSIDE_WORKTREE" || code === "EXCLUDED") return { state: "outside" };
+    return { state: ["MISSING", "BROKEN_LINK", "LINK_LOOP"].includes(code) ? "missing" : "unreadable" };
+  }
+  await target.close();
+  return { state: statKind(target.info), path: toPosix(path.relative(binding.root, target.real)) };
 }
 
-// Where a listed link leads. The link is resolved by name, but what is
-// reported comes from looking up its canonical target's last name inside its
-// folder, opened through the root handle, so a swapped ancestor or
-// intermediate folder cannot reveal another directory's state: the target is
-// then unreadable.
-async function linkTarget(binding, entryPath, hooks) {
-  const { root } = binding;
-  let real;
-  try { real = await realpath(path.join(root, ...entryPath.split("/"))); }
-  catch (error) { return { state: missingCode(error) ? "missing" : "unreadable" }; }
-  if (!isWithin(root, real) || excludedSegments(path.relative(root, real).split(path.sep))) return { state: "outside" };
-  const target = toPosix(path.relative(root, real));
-  await hooks.beforeInspect?.(real);
-  let info;
-  try { info = await inspectResolved(binding, real, hooks); }
-  catch (error) { return { state: missingCode(error) ? "missing" : "unreadable" }; }
-  const state = statKind(info);
-  if (state === "symlink") return { state: "unreadable" };
-  return { state, path: target };
+// Runs `work` over `items` with at most `limit` running at once, in order.
+async function mapLimited(items, limit, work) {
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => { while (next < items.length) { const index = next++; results[index] = await work(items[index]); } };
+  await Promise.all(Array.from({ length: Math.min(Math.max(1, limit), items.length) }, worker));
+  return results;
 }
-// A folder on the way to a file that is gone, or is a file, means the file is missing.
-function parentGone(error) { return ["MISSING", "NOT_DIRECTORY"].includes(error?.details?.code); }
-function missingCode(error) { return ["ENOENT", "ENOTDIR", "ELOOP"].includes(error?.code); }
 
 // Accepts a relative path with "/" separators ("\\" too on Windows). An
 // absolute path, a parent segment, or Git's own metadata is refused before

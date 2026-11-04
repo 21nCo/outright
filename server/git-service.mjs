@@ -8,7 +8,9 @@ import { utilityBudgetUnavailable, utilityProcesses } from "./subprocess-budget.
 // ends the admission, given the failure if there was one (a Git process
 // whose ownership was lost keeps the worktree held). Check and admission
 // are synchronous.
-export function createGitService({ database, getProjects, getConfig, subprocesses = utilityProcesses, admitWriter = () => () => {} }) {
+// `hooks.beforeEditorLookup(path)` runs before each name of a path for the
+// editor is looked at, so tests can replace a folder at exactly that moment.
+export function createGitService({ database, getProjects, getConfig, subprocesses = utilityProcesses, admitWriter = () => () => {}, hooks = {} }) {
   const git = (cwd, args, overrides = {}) => runGit(subprocesses, cwd, args, overrides);
   const safeGit = async (cwd, args, overrides = {}) => {
     try { return await git(cwd, args, overrides); }
@@ -186,7 +188,7 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
 
   async function openInEditor(worktreePath, filePath, editor) {
     const cwd = await requireWorktree(worktreePath);
-    const target = filePath ? await requireCanonicalChild(cwd, filePath) : cwd;
+    const target = filePath ? await requireCanonicalChild(cwd, filePath, hooks) : cwd;
     const configured = editor || database.getSettings().editor;
     const commands = {
       zed: ["zed", [target]],
@@ -302,20 +304,28 @@ async function requireChildPath(root, child) { const resolved = path.resolve(roo
 // link must lead to an existing place inside, so a dangling link (whose
 // target a save would create, wherever it points) is refused too. Only a
 // name that is genuinely absent ends the walk, and the rest is appended to
-// the canonical folder reached so far. The canonical path is what the
-// editor is given.
-async function requireCanonicalChild(root, child) {
+// the canonical folder reached so far.
+// The walk's answer is then checked as a whole, because a folder it passed
+// may have been replaced since: the deepest existing place must still
+// resolve (realpath, every link followed now) to a place inside the root,
+// and an absent name must still be absent there; otherwise nothing is
+// launched (409, retry). That canonical path is what the editor is given.
+// Once the editor has the path, a later replacement of a folder on it is
+// outside what a path can guard; only the moment of the decision is checked.
+async function requireCanonicalChild(root, child, hooks = {}) {
   const names = path.relative(root, await requireChildPath(root, child)).split(path.sep).filter(Boolean);
   let current;
   try { current = await realpath(root); } catch { throw httpError(403, "File path cannot be checked inside the worktree"); }
   const base = current;
+  let absent = names.length;
   for (const [index, name] of names.entries()) {
     const next = path.join(current, name);
+    await hooks.beforeEditorLookup?.(next);
     let info;
     try { info = await lstat(next); }
     catch (error) {
       // Absent here (or under a file, which has no children): nothing to follow.
-      if (["ENOENT", "ENOTDIR"].includes(error?.code)) return path.join(next, ...names.slice(index + 1));
+      if (["ENOENT", "ENOTDIR"].includes(error?.code)) { absent = index; break; }
       throw httpError(403, "File path cannot be checked inside the worktree");
     }
     if (!info.isSymbolicLink()) { current = next; continue; }
@@ -323,7 +333,19 @@ async function requireCanonicalChild(root, child) {
     catch { throw httpError(403, "File path is a link whose target cannot be checked inside the worktree"); }
     if (!isWithin(base, current)) throw httpError(403, "File path leads outside the worktree");
   }
-  return current;
+  const changed = () => httpError(409, "The path changed while it was checked; retry");
+  let found;
+  try { found = await realpath(current); } catch { throw changed(); }
+  if (!isWithin(base, found)) throw changed();
+  if (absent === names.length) return found;
+  // The name is absent there, and the folder it is absent from is still the
+  // canonical one (`found` came from realpath, so it is its own realpath).
+  const missing = path.join(found, names[absent]);
+  let gone = false;
+  try { await lstat(missing); }
+  catch (error) { gone = ["ENOENT", "ENOTDIR"].includes(error?.code); }
+  if (!gone || await realpath(found).catch(() => null) !== found) throw changed();
+  return path.join(missing, ...names.slice(absent + 1));
 }
 // Containment by path segment: "..large.log" or "..cache/x" is a child, while
 // ".." and "../x" (or another drive on Windows) are not.

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -223,6 +223,43 @@ test("open in editor refuses a link inside the worktree that leads out, through 
     assert.equal((await service.openInEditor(cwd, "docs/new.md")).target, path.join(cwd, "docs", "new.md"));
     assert.equal((await service.openInEditor(cwd, "docs-link/new/deeper.md")).target, path.join(cwd, "docs", "new", "deeper.md"));
     assert.deepEqual(launched, [path.join(cwd, "docs", "guide.md"), path.join(cwd, "docs", "new.md"), path.join(cwd, "docs", "new", "deeper.md")]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("open in editor refuses a path whose folder is swapped for an outside link while it is checked, and launches nothing", { skip: process.platform === "win32" && "symlinks need POSIX semantics" }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-editor-swap-"));
+  try {
+    const base = await realpath(root);
+    const cwd = path.join(base, "worktree");
+    await mkdir(path.join(cwd, "d"), { recursive: true });
+    await mkdir(path.join(base, "outside"));
+    await writeFile(path.join(cwd, "d", "x.md"), "inside\n");
+    await writeFile(path.join(base, "outside", "x.md"), "private\n");
+    const launched = [];
+    const subprocesses = { launchDetached: async (file, args) => { launched.push(args.at(-1)); }, run: async () => { throw new Error("unused"); } };
+    const d = path.join(cwd, "d");
+    let swapAt = null;
+    // d was looked at as a folder; it becomes a link out just before the name inside it is.
+    const beforeEditorLookup = async (next) => {
+      if (next !== swapAt) return;
+      swapAt = null;
+      await rename(d, `${d}-old`);
+      await symlink(path.join(base, "outside"), d);
+    };
+    const restore = async () => { if (existsSync(`${d}-old`)) { await rm(d); await rename(`${d}-old`, d); } };
+    const service = createGitService({ database: { getSettings: () => ({ editor: "code" }), auditAdmission() {}, auditCritical() {} },
+      getProjects: () => [{ worktrees: [{ path: cwd }] }], getConfig: async () => ({ scanRoots: [cwd] }), subprocesses, hooks: { beforeEditorLookup } });
+    for (const name of ["d/x.md", "d/new.md", "d/new/deeper.md"]) {
+      swapAt = path.join(cwd, ...name.split("/").slice(0, 2));
+      await assert.rejects(service.openInEditor(cwd, name), (error) => error.statusCode === 409, `${name} was opened`);
+      assert.equal(swapAt, null, `${name}: the swap did not run`);
+      await restore();
+    }
+    assert.deepEqual(launched, []);
+    assert.equal(existsSync(path.join(base, "outside", "new.md")), false);
+    // Unswapped, the same paths open inside.
+    assert.equal((await service.openInEditor(cwd, "d/x.md")).target, path.join(cwd, "d", "x.md"));
+    assert.equal((await service.openInEditor(cwd, "d/new.md")).target, path.join(cwd, "d", "new.md"));
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

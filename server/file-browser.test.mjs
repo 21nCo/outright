@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { closeSync, constants, existsSync, mkdirSync, openSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { open } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -116,6 +116,9 @@ test("paths that leave the worktree are refused, and links are listed with where
   mkdirSync(path.join(base, "outside-dir"));
   symlinkSync("docs/guide.md", path.join(root, "guide-link.md"));
   symlinkSync("docs", path.join(root, "docs-link"));
+  // Links to "." and ".." lead to the folder they are in and the one above it.
+  symlinkSync(".", path.join(root, "docs", "here"));
+  symlinkSync("..", path.join(root, "docs", "up"));
   symlinkSync(path.join(base, "outside.txt"), path.join(root, "escape.txt"));
   symlinkSync(path.join(base, "outside-dir"), path.join(root, "escape-dir"));
   symlinkSync("gone.txt", path.join(root, "broken.txt"));
@@ -129,7 +132,11 @@ test("paths that leave the worktree are refused, and links are listed with where
     [{ state: "outside" }, { state: "outside" }, { state: "missing" }, { state: "missing" }]);
   const followed = await files.preview(root, "guide-link.md");
   assert.deepEqual([followed.previewType, followed.text, followed.link], ["markdown", "# Guide\n", { target: "docs/guide.md" }]);
-  assert.deepEqual((await files.list(root, { directory: "docs-link" })).entries.map((entry) => entry.path), ["docs-link/guide.md"]);
+  assert.deepEqual((await files.list(root, { directory: "docs-link" })).entries.map((entry) => entry.path), ["docs-link/guide.md", "docs-link/here", "docs-link/up"]);
+  const inDocs = Object.fromEntries((await files.list(root, { directory: "docs" })).entries.map((entry) => [entry.name, entry.target]));
+  assert.deepEqual([inDocs.here, inDocs.up], [{ state: "directory", path: "docs" }, { state: "directory", path: "" }]);
+  assert.equal((await files.preview(root, "docs/here/guide.md")).text, "# Guide\n");
+  assert.equal((await files.preview(root, "docs/up/docs/guide.md")).text, "# Guide\n");
   for (const [request, code] of [[() => files.preview(root, "escape.txt"), "OUTSIDE_WORKTREE"], [() => files.list(root, { directory: "escape-dir" }), "OUTSIDE_WORKTREE"],
     // A typed path that leaves the root is not a link that leads out, and a
     // broken link is not a file that was deleted.
@@ -328,7 +335,7 @@ test("a folder swapped for a link after it was checked is read through its handl
   assert.equal((await refusal(byName.list(root))).code, "LISTING_UNAVAILABLE");
 });
 
-test("a file whose ancestor is swapped around each check by name is refused, and without a descriptor-bound location is never read", linkable, async (t) => {
+test("a file whose ancestor is swapped for a link after it was resolved is read through the held folder, and without a descriptor-bound location is never read", linkable, async (t) => {
   const { base, root, write } = fixture(t);
   write("docs/inner/guide.md", "# Inside\n");
   write("docs/inner/logo.png", PNG);
@@ -352,9 +359,11 @@ test("a file whose ancestor is swapped around each check by name is refused, and
     }
     return outcomes;
   };
-  // Where the opened descriptor's location is proven, the outside file is refused.
+  // The file is opened by its last name inside the folder handle the walk
+  // holds, so the swapped ancestor's name is never used again: the inside
+  // file is served, never the outside one.
   const bound = await run(createFileBrowser({ hooks }));
-  for (const name of ["preview", "raw"]) assert.deepEqual(bound[name], { status: 409, code: "PATH_CHANGED" }, `${name}: ${JSON.stringify(bound[name])}`);
+  assert.deepEqual(bound, { preview: { served: "# Inside\n" }, raw: { served: PNG.toString("latin1") } });
   // Where it cannot be proven, nothing is read at all.
   const unbound = await run(createFileBrowser({ handlePaths: false, hooks }));
   for (const name of ["preview", "raw"]) assert.deepEqual(unbound[name], { status: 501, code: "PREVIEW_UNAVAILABLE" }, `${name}: ${JSON.stringify(unbound[name])}`);
@@ -372,7 +381,8 @@ test("a host that cannot read through a root handle lists no folder and previews
   write("a.md", "# A\n");
   assert.equal((await refusal(createFileBrowser().list(root))).code, "LISTING_UNAVAILABLE");
   assert.equal((await refusal(createFileBrowser().preview(root, "a.md"))).code, "PREVIEW_UNAVAILABLE");
-  assert.equal((await refusal(createFileBrowser().preview(root, "gone.md"))).code, "MISSING");
+  // Nothing below the root is looked at, so a missing name answers alike.
+  assert.equal((await refusal(createFileBrowser().preview(root, "gone.md"))).code, "PREVIEW_UNAVAILABLE");
 });
 
 test("a root whose parent is renamed and replaced, without links, never serves another directory's names or bytes", linkable, async (t) => {
@@ -411,8 +421,9 @@ test("a root whose parent is renamed and replaced, without links, never serves a
       assert.doesNotMatch(JSON.stringify(outcome), /PRIVATE|secret/, `${hook} ${name}`);
     }
   }
-  // beforeInspect runs only for files: preview and raw swapped there.
-  assert.equal(swaps, 4 + 4 + 2);
+  // The root itself is listed through the root handle, so beforeOpen runs
+  // for the other three; beforeInspect runs only for files (preview, raw).
+  assert.equal(swaps, 4 + 3 + 2);
   assert.equal(openDescriptors(), before, "a refused request left a descriptor open");
   // A folder inside the root renamed away and replaced by another folder is
   // either refused or read from the root as it now is, never from elsewhere.
@@ -429,36 +440,127 @@ test("a root whose parent is renamed and replaced, without links, never serves a
   assert.equal(openDescriptors(), before);
 });
 
-test("an intermediate folder swapped for an outside link after resolution never reveals the outside object's kind", linkable, async (t) => {
+test("an intermediate folder swapped for an outside link after it was looked up never reveals the outside object's kind", linkable, async (t) => {
   const { base, root, write } = fixture(t);
   write("d/x", "inside file\n");
   write("d/x.png", PNG);
   symlinkSync("d/x", path.join(root, "l"));
   symlinkSync("d/x.png", path.join(root, "image.png"));
+  // One link per listed folder, so each listing's lookup is the swapped one.
+  mkdirSync(path.join(root, "one"));
+  mkdirSync(path.join(root, "two"));
+  symlinkSync("../d/x", path.join(root, "one", "l"));
+  symlinkSync("../d/x.png", path.join(root, "two", "image.png"));
   // Outside, the same names are folders: following the swap would report one.
   mkdirSync(path.join(base, "outside", "x"), { recursive: true });
   mkdirSync(path.join(base, "outside", "x.png"));
   const d = path.join(root, "d");
-  let inspected = 0;
-  const swap = () => { inspected += 1; if (existsSync(`${d}-old`)) return; renameSync(d, `${d}-old`); symlinkSync(path.join(base, "outside"), d); };
+  let swaps = 0;
+  // d was looked up as a folder; it is swapped just before it is opened.
+  const swap = (real) => { if (real !== d || existsSync(`${d}-old`)) return; swaps += 1; renameSync(d, `${d}-old`); symlinkSync(path.join(base, "outside"), d); };
   const restore = () => { if (!existsSync(`${d}-old`)) return; unlinkSync(d); renameSync(`${d}-old`, d); };
   const before = openDescriptors();
-  // The swap runs after a target was resolved and before it is inspected.
-  const files = createFileBrowser({ hooks: { beforeInspect: swap } });
+  const files = createFileBrowser({ hooks: { beforeOpen: swap } });
   for (const [name, operation] of [["preview", () => files.preview(root, "l")], ["raw", () => { const { request, response } = capture(); return files.raw(root, "image.png", null, request, response); }]]) {
     const outcome = await refusal(operation());
     restore();
     assert.deepEqual([outcome.status, outcome.code], [409, "PATH_CHANGED"], `${name}: ${JSON.stringify(outcome)}`);
   }
-  const listed = (await files.list(root)).entries.filter((entry) => entry.kind === "symlink");
-  restore();
-  assert.equal(inspected, 4, "each listed link's target was inspected after the swap");
-  for (const entry of listed) assert.equal(entry.target.state, "unreadable", JSON.stringify(entry));
+  for (const folder of ["one", "two"]) {
+    const { entries } = await files.list(root, { directory: folder });
+    restore();
+    assert.deepEqual(entries.map((entry) => entry.target), [{ state: "unreadable" }], folder);
+  }
+  assert.equal(swaps, 4, "each request swapped d once");
   assert.equal(openDescriptors(), before, "a refused lookup left a descriptor open");
   // Unswapped, the links lead to the inside files.
   const plain = createFileBrowser();
-  assert.deepEqual((await plain.list(root)).entries.find((entry) => entry.name === "l").target, { state: "file", path: "d/x" });
+  assert.deepEqual((await plain.list(root, { directory: "one" })).entries[0].target, { state: "file", path: "d/x" });
   assert.equal((await plain.preview(root, "l")).text, "inside file\n");
+});
+
+test("an outside name answers the same whether or not it exists, with or without a root handle", linkable, async (t) => {
+  const { base, root } = fixture(t);
+  mkdirSync(path.join(base, "outside", "sub"), { recursive: true });
+  writeFileSync(path.join(base, "outside", "secret.txt"), "private");
+  writeFileSync(path.join(base, "outside", "logo.png"), PNG);
+  writeFileSync(path.join(base, "outside", "sub", "x"), "private");
+  // An absolute and a relative link to the same outside folder, and links
+  // straight to an outside file that exists and to one that does not.
+  symlinkSync(path.join(base, "outside"), path.join(root, "out"));
+  symlinkSync("../outside", path.join(root, "rel-out"));
+  for (const [name, target] of [["to-present", "secret.txt"], ["to-absent", "nope.txt"]]) {
+    symlinkSync(path.join(base, "outside", target), path.join(root, name));
+    symlinkSync(`../outside/${target}`, path.join(root, `rel-${name}`));
+  }
+  const outcome = (promise) => promise.then((value) => (value?.entries ? "listed" : value?.previewType ?? "served"), (error) => `${error.statusCode} ${error.details?.code}`);
+  for (const handlePaths of [true, false]) {
+    const files = createFileBrowser({ handlePaths });
+    const raw = (file) => { const { request, response } = capture(); return files.raw(root, file, null, request, response); };
+    for (const out of ["out", "rel-out"]) {
+      for (const [label, present, absent] of [
+        ["preview", () => files.preview(root, `${out}/secret.txt`), () => files.preview(root, `${out}/nope.txt`)],
+        ["list", () => files.list(root, { directory: `${out}/sub` }), () => files.list(root, { directory: `${out}/nosub` })],
+        ["preview under a folder", () => files.preview(root, `${out}/sub/x`), () => files.preview(root, `${out}/nosub/x`)],
+        ["raw", () => raw(`${out}/logo.png`), () => raw(`${out}/nologo.png`)],
+      ]) {
+        const answers = [await outcome(present()), await outcome(absent())];
+        const expected = handlePaths ? "403 OUTSIDE_WORKTREE" : label === "list" ? "501 LISTING_UNAVAILABLE" : "501 PREVIEW_UNAVAILABLE";
+        assert.deepEqual(answers, [expected, expected], `handlePaths ${handlePaths}, ${out}, ${label}`);
+      }
+    }
+    if (!handlePaths) continue;
+    const targets = Object.fromEntries((await files.list(root)).entries.map((entry) => [entry.name, entry.target]));
+    for (const name of ["out", "rel-out", "to-present", "to-absent", "rel-to-present", "rel-to-absent"]) assert.deepEqual(targets[name], { state: "outside" }, name);
+  }
+});
+
+test("a link whose target's folder disappears while it is resolved is missing, not unreadable", linkable, async (t) => {
+  const { base, root, write } = fixture(t);
+  write("d/x", "inside\n");
+  symlinkSync("d/x", path.join(root, "l"));
+  const d = path.join(root, "d");
+  const remove = (real) => { if (real === d && existsSync(d)) renameSync(d, path.join(base, "away")); };
+  const listed = (await createFileBrowser({ hooks: { beforeOpen: remove } }).list(root)).entries.find((entry) => entry.name === "l");
+  assert.deepEqual(listed.target, { state: "missing" });
+});
+
+test("a readable file in a folder that can be entered but not listed previews and streams", { skip: linkable.skip || (process.getuid?.() === 0 && "root ignores folder permissions") }, async (t) => {
+  const { root, write } = fixture(t);
+  write("private/guide.md", "# Guide\n");
+  write("private/logo.png", PNG);
+  const folder = path.join(root, "private");
+  chmodSync(folder, 0o111);
+  try {
+    const files = createFileBrowser();
+    assert.equal((await files.preview(root, "private/guide.md")).text, "# Guide\n");
+    const { request, response, body } = capture();
+    await files.raw(root, "private/logo.png", null, request, response);
+    assert.deepEqual(body(), PNG);
+    // Its own entries stay unlisted.
+    assert.equal((await refusal(files.list(root, { directory: "private" }))).code, "UNREADABLE");
+  } finally { chmodSync(folder, 0o755); }
+});
+
+test("a folder of 500 links lists every target with a bounded number of descriptors, also twice at once", linkable, async (t) => {
+  const { root, write } = fixture(t);
+  mkdirSync(path.join(root, "links"));
+  for (let index = 0; index < 500; index += 1) {
+    write(`targets/t${index}/f.md`, "x");
+    symlinkSync(`../targets/t${index}/f.md`, path.join(root, "links", `l${String(index).padStart(3, "0")}`));
+  }
+  const before = openDescriptors();
+  let most = 0;
+  const files = createFileBrowser({ hooks: { afterOpen: () => { most = Math.max(most, openDescriptors()); } } });
+  const listings = await Promise.all([1, 2].map(() => files.list(root, { directory: "links", limit: 500 })));
+  for (const { entries } of listings) {
+    assert.equal(entries.length, 500);
+    for (const entry of entries) assert.deepEqual(entry.target, { state: "file", path: `targets/t${Number(entry.name.slice(1))}/f.md` }, entry.name);
+  }
+  // Per listing: the root and listed folder, and two folders per lookup in flight.
+  const bound = 2 * (2 + 2 * FILE_BROWSER_LIMITS.linkLookups) + 2;
+  assert.ok(most - before <= bound, `${most - before} descriptors were open at once (bound ${bound})`);
+  assert.equal(openDescriptors(), before);
 });
 
 test("an opened file whose status cannot be read is closed before the error is reported", previewable, async (t) => {

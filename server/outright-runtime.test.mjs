@@ -3823,7 +3823,8 @@ test("file routes browse only a discovered project worktree and serve previews f
   if (!anchored) assert.deepEqual([preview.statusCode, preview.body.code], [501, "PREVIEW_UNAVAILABLE"], preview.raw);
   else assert.deepEqual([preview.statusCode, preview.body.previewType, preview.body.text], [200, "markdown", "# Fixture\n"]);
   const missing = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "gone.md" }));
-  assert.deepEqual([missing.statusCode, missing.body.code], [404, "MISSING"]);
+  // Without a root handle nothing below the root is looked at, so a missing name answers alike.
+  assert.deepEqual([missing.statusCode, missing.body.code], anchored ? [404, "MISSING"] : [501, "PREVIEW_UNAVAILABLE"], missing.raw);
   const outsider = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-undiscovered-")));
   try {
     const undiscovered = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: outsider }));
