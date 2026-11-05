@@ -3864,6 +3864,13 @@ test("file routes browse only a discovered project worktree and serve previews f
   }
   const escaping = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: worktree.path, dir: ".." }));
   assert.deepEqual([escaping.statusCode, escaping.body.code], [403, "PATH_OUTSIDE"]);
+  // The server's own checks (here the Host gate) answer before the Files routes, so that refusal names no record.
+  const recorded = runtime.files.operations().length;
+  const foreign = requestStream("GET", at("/api/files", { projectId: project.id, path: worktree.path }));
+  foreign.headers.host = "attacker.example";
+  const rejected = responseCapture();
+  await runtime.handleRequest(foreign, rejected);
+  assert.deepEqual([rejected.statusCode, rejected.headers?.["X-Outright-Operation"], runtime.files.operations().length], [403, undefined, recorded], rejected.raw);
 }));
 
 let checkpointAgentOptions;

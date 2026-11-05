@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { open, statfs } from "node:fs/promises";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
@@ -463,6 +464,76 @@ test("a raw body whose file fails to read mid-stream is recorded as a failed str
   assert.equal(response.writableFinished, false, "a body cut short completed");
   const record = files.operations().at(-1);
   assert.deepEqual([record.operationId, record.outcome, record.code], ["op-eio", "failed", "STREAM_FAILED"]);
+});
+
+test("a raw stream's record names who ended it: a write error is a failed stream, a peer that hung up is a cancellation", previewable, async (t) => {
+  const { root, write } = fixture(t);
+  write("logo.png", png(64, 64, Buffer.alloc(300 * 1024)));
+  const files = createFileBrowser();
+  // The response fails to write its second chunk.
+  let writes = 0;
+  const failing = new Writable({ write(_chunk, _encoding, done) { done(++writes > 1 ? Object.assign(new Error("injected"), { code: "EIO" }) : null); } });
+  failing.setHeader = () => {};
+  await files.raw(root, "logo.png", null, { headers: {} }, failing, { operationId: "op-write-eio" });
+  // A real HTTP client that reads the first bytes, then closes its socket.
+  const server = http.createServer((request, response) => { void files.raw(root, "logo.png", null, request, response, { operationId: "op-peer" }); });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const client = http.get({ host: "127.0.0.1", port: server.address().port, agent: false }, (response) => response.once("data", () => client.destroy()));
+  client.on("error", () => {});
+  while (!files.operations().some((record) => record.operationId === "op-peer")) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(files.operations().map((record) => [record.operationId, record.outcome, record.code]), [["op-write-eio", "failed", "STREAM_FAILED"], ["op-peer", "cancelled", "CLIENT_CLOSED"]]);
+});
+
+test("a root whose ancestor is moved and replaced by a link to its new place is PATH_CHANGED, for listing, preview and raw", linkable, async (t) => {
+  const { base, root, write } = fixture(t);
+  write("a.md", "# A\n");
+  write("logo.png", PNG);
+  // The fixture's root is base/worktree; its ancestor here is base itself, moved under a sibling.
+  const top = path.join(path.dirname(base), `${path.basename(base)}-top`);
+  mkdirSync(top);
+  t.after(() => rmSync(top, { recursive: true, force: true }));
+  const away = path.join(top, "moved");
+  let moves = 0;
+  const relocate = () => { if (existsSync(away)) return; renameSync(base, away); symlinkSync(away, base); moves += 1; };
+  const restore = () => { if (!existsSync(away)) return; unlinkSync(base); renameSync(away, base); };
+  const operations = {
+    "list": () => createFileBrowser({ hooks: { beforeRead: relocate } }).list(root),
+    preview: () => createFileBrowser({ hooks: { beforeInspect: relocate } }).preview(root, "a.md"),
+    raw: async () => { const { request, response, body } = capture(); await createFileBrowser({ hooks: { beforeInspect: relocate } }).raw(root, "logo.png", null, request, response); return body().length; },
+  };
+  for (const [name, operation] of Object.entries(operations)) {
+    const outcome = await operation().then((value) => ({ served: value }), (error) => error.details?.code);
+    restore();
+    assert.equal(outcome, "PATH_CHANGED", `${name}: ${JSON.stringify(outcome)}`);
+  }
+  assert.equal(moves, 3);
+  assert.equal((await createFileBrowser().preview(root, "a.md")).text, "# A\n");
+});
+
+test("a file bind-mounted into the worktree from a volume without nanosecond ctimes is never previewed or served", { skip: ((process.platform !== "linux" || process.getuid?.() !== 0) && "a file bind mount needs Linux and root") || linkable.skip }, async (t) => {
+  const { base, root, write } = fixture(t);
+  write("a.md", "# A\n");
+  write("logo.png", PNG);
+  const other = path.join(base, "other");
+  mkdirSync(other);
+  try { execFileSync("mount", ["-t", "tmpfs", "tmpfs", other], { stdio: "ignore" }); } catch { t.skip("mounting is not permitted"); return; }
+  try {
+    writeFileSync(path.join(other, "a.md"), "# Mounted\n");
+    writeFileSync(path.join(other, "logo.png"), PNG);
+    for (const name of ["a.md", "logo.png"]) execFileSync("mount", ["--bind", path.join(other, name), path.join(root, name)]);
+    // The mounted files' volume answers as for ext3, FAT or NFS; the worktree's does not.
+    const coarse = createFileBrowser({ hooks: { statfs: async (at) => (at.endsWith(".md") || at.endsWith(".png") ? { type: 0x6969 } : statfs(at)) } });
+    assert.equal((await refusal(coarse.preview(root, "a.md"))).code, "PREVIEW_UNAVAILABLE");
+    const { request, response, body } = capture();
+    assert.equal((await refusal(coarse.raw(root, "logo.png", null, request, response))).code, "PREVIEW_UNAVAILABLE");
+    assert.equal(body().length, 0);
+    // A mounted file on a volume with nanosecond ctimes (tmpfs) is previewed.
+    assert.equal((await createFileBrowser().preview(root, "a.md")).text, "# Mounted\n");
+  } finally {
+    for (const name of ["a.md", "logo.png"]) try { execFileSync("umount", [path.join(root, name)], { stdio: "ignore" }); } catch {}
+    execFileSync("umount", [other]);
+  }
 });
 
 test("an AVIF is sized only from metadata it read whole, and never when a decoder would show a track instead", previewable, async (t) => {
@@ -1284,6 +1355,8 @@ test("shutdown ends a stalled raw stream and a queued request, closes the handle
   await active;
   assert.equal(openDescriptors(), before, "the stalled stream's file handle stayed open");
   assert.equal(stalled.response.destroyed && queued.response.destroyed, true);
+  // Ending it was shutdown's doing, not the client's.
+  assert.deepEqual(files.operations().map((record) => [record.outcome, record.code]), [["failed", "SHUTTING_DOWN"], ["failed", "SHUTTING_DOWN"]]);
   assert.deepEqual(files.rawStats(), { active: 0, waiting: 0 });
   const late = capture();
   assert.equal((await refusal(files.raw(root, "report.pdf", null, late.request, late.response))).code, "SHUTTING_DOWN");

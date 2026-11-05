@@ -274,13 +274,11 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
       response.setHeader("Content-Type", kind.mimeType);
       response.setHeader("Content-Length", String(opened.info.size));
       // Headers are sent; a failure now can only end the response, short.
-      // pipeline ends the response when the file fails to read, so only a
-      // response that closed while the file still read was the client's.
-      let readFailed = false;
-      const body = rawBody(opened, hooks);
-      try { await pipeline(async function* () { try { yield* body; } catch (error) { readFailed = true; throw error; } }, response); record.bytes = opened.info.size; }
+      // A read or write error is the stream's, an end by shutdown is shutdown's;
+      // only a response that closed without either was the client's.
+      try { await pipeline(rawBody(opened, hooks), response); record.bytes = opened.info.size; }
       catch (error) {
-        record.code = error?.details?.code ?? (response.destroyed && !readFailed ? "CLIENT_CLOSED" : "STREAM_FAILED");
+        record.code = error?.details?.code ?? (closed ? "SHUTTING_DOWN" : error?.code === "ERR_STREAM_PREMATURE_CLOSE" ? "CLIENT_CLOSED" : "STREAM_FAILED");
         if (!response.destroyed) response.destroy(error);
       }
     } finally {
@@ -492,7 +490,8 @@ async function resolveContained(binding, relative, hooks, noun, from = rootFolde
       if (failure) throw failure;
       if (step.expect && !sameObject(info, step.expect)) throw pathChanged();
       // A folder on another volume (one mounted inside the worktree) must be provable too.
-      if (info.isDirectory() && info.dev !== binding.identity.dev && !(await provableVolume(binding, info, at))) {
+      // So must a file (a file bind mount), whose version is its ctime.
+      if (info.dev !== binding.identity.dev && !(await provableVolume(binding, info, at))) {
         throw noun === "Folder" ? listingUnavailable() : previewUnavailable();
       }
       if (destination !== undefined) {
@@ -779,9 +778,11 @@ async function provableVolume(binding, info, at) {
   return binding.volumes.get(info.dev);
 }
 
-// The root's path must still name the root handle's directory.
+// The root's path must still name the root handle's directory. On macOS it is
+// opened with O_NOFOLLOW_ANY, so an ancestor moved and replaced by a link fails.
 async function requireRoot(binding) {
-  const named = await lstat(binding.root, { bigint: true }).catch(() => null);
+  const handle = await open(binding.root, openFlags(true, true)).catch(() => null);
+  const named = await handle?.stat({ bigint: true }).finally(() => handle.close()).catch(() => null);
   if (!named || !sameObject(named, binding.identity)) throw pathChanged();
 }
 
