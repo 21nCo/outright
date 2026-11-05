@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
-import { open, statfs } from "node:fs/promises";
+import promises, { open, statfs } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -937,6 +938,35 @@ test("a folder moved away after it was opened serves nothing read through it, fo
   assert.deepEqual((await plain.list(root, { directory: "d" })).entries.map((entry) => entry.name), ["logo.png", "y.md"]);
   assert.equal((await plain.preview(root, "d/y.md")).text, "# inside y\n");
   assert.equal(await raw(plain, "d/logo.png"), PNG.toString("latin1"));
+});
+
+test("a subfolder listing closes the subfolder's descriptor even when releasing its parent folder fails", listable, async (t) => {
+  const { root, write } = fixture(t);
+  write("a/b/c.md", "# c\n");
+  const original = promises.open;
+  let opened = false;
+  let failed = 0;
+  // Once "b" is open, releasing a handle on "a" really closes it, then reports
+  // a failure once, so only a handle the browser never closes stays open.
+  promises.open = async (...args) => {
+    const handle = await original(...args);
+    opened ||= String(args[0]).endsWith("/b");
+    if (String(args[0]).endsWith("/a")) {
+      const close = handle.close.bind(handle);
+      handle.close = async () => { await close(); if (!opened || failed) return; failed += 1; throw Object.assign(new Error("injected close failure"), { code: "EIO" }); };
+    }
+    return handle;
+  };
+  syncBuiltinESMExports();
+  const restore = () => { promises.open = original; syncBuiltinESMExports(); };
+  t.after(restore);
+  const files = createFileBrowser();
+  const before = openDescriptors();
+  await assert.rejects(files.list(root, { directory: "a/b" }), /injected close failure/);
+  assert.equal(failed, 1, "releasing the parent folder failed once");
+  assert.equal(openDescriptors(), before, "the subfolder descriptor was left open");
+  restore();
+  assert.deepEqual((await files.list(root, { directory: "a/b" })).entries.map((entry) => entry.name), ["c.md"]);
 });
 
 test("a \"..\" link whose folder moved within the worktree is PATH_CHANGED, never resolved by the stale names", linkable, async (t) => {

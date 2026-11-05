@@ -156,11 +156,12 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
       const target = relative ? await resolveContained(binding, relative, hooks, "Folder") : null;
       let folder = rootFolder(binding);
       try {
-        if (target && !target.info.isDirectory()) throw fileSystemError({ code: "ENOTDIR" }, relative, "Folder");
-        if (target?.name) folder = await openUnder(binding, target.parent, target.name, target.info, relative, { directory: true }, hooks);
-      } finally { await target?.close(); }
-      try { return await listOpened(binding, relative, folder, { pageSize, after, showHidden }); }
-      finally { await folder.handle?.close(); }
+        try {
+          if (target && !target.info.isDirectory()) throw fileSystemError({ code: "ENOTDIR" }, relative, "Folder");
+          if (target?.name) folder = await openUnder(binding, target.parent, target.name, target.info, relative, { directory: true }, hooks);
+        } finally { await target?.close(); }
+        return await listOpened(binding, relative, folder, { pageSize, after, showHidden });
+      } finally { await folder.handle?.close(); }
     } finally { await binding.close(); }
   }
 
