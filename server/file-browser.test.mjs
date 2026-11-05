@@ -37,6 +37,12 @@ const listable = { skip: !anchored && unanchored };
 const previewable = listable;
 const linkable = { skip: (process.platform === "win32" && "symlinks and FIFOs need POSIX semantics") || (!anchored && unanchored) };
 
+// CI's Linux and macOS runners read through a root handle, so there a
+// regression that refuses every folder cannot pass by skipping the tests above.
+test("CI's Linux and macOS hosts read through a root handle, so no success test skips there", { skip: !(process.env.CI && ["linux", "darwin"].includes(process.platform)) && "not a CI Linux or macOS host" }, () => {
+  assert.equal(anchored, true);
+});
+
 function fixture(t) {
   const base = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-files-")));
   const root = path.join(base, "worktree");
@@ -183,17 +189,14 @@ test("previews return text only for UTF-8 text, verify image and PDF contents, a
   assert.deepEqual([(await preview("logo.png")).previewType, (await preview("logo.png")).mimeType, (await preview("logo.png")).text], ["image", "image/png", undefined]);
   assert.deepEqual([(await preview("fake.png")).previewType, (await preview("fake.png")).reason], ["unsupported", "The contents are not a PNG image"]);
   assert.equal((await preview("icon.svg")).previewType, "image");
-  // An SVG's first element may follow a prolog longer than the usual sample,
-  // and an AVIF may name avif only among its compatible brands.
+  // An SVG's first element may follow a prolog longer than the usual sample.
   for (const [name, content, type] of [
     ["long-prolog.svg", `<?xml version="1.0"?>\n<!-- ${"x".repeat(20_000)} -->\n<!DOCTYPE svg [ <!-- it's > here --> <!ENTITY a "]>"> ]>\n<svg:svg xmlns:svg="http://www.w3.org/2000/svg"/>`, "image"],
     ["bom.svg", "\uFEFF<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>", "image"],
     ["page.svg", "<!DOCTYPE html><html><body><svg></svg></body></html>", "unsupported"],
     ["unclosed.svg", `<!-- ${"x".repeat(20_000)}`, "unsupported"],
-    ["mif1.avif", avif(Buffer.concat([Buffer.from([0, 0, 0, 28]), Buffer.from("ftypmif1\0\0\0\0mif1miafavif")]), [64, 48]), "image"],
-    ["heic.avif", Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from("ftypheic\0\0\0\0mif1heic"), Buffer.alloc(16)]), "unsupported"],
-    // A brand past the end of the ftyp box is not one of its brands.
-    ["short-box.avif", Buffer.concat([Buffer.from([0, 0, 0, 20]), Buffer.from("ftypmif1\0\0\0\0mif1avif"), Buffer.alloc(16)]), "unsupported"],
+    // AVIF is not previewed (see the AVIF test below).
+    ["mif1.avif", avif(Buffer.concat([Buffer.from([0, 0, 0, 28]), Buffer.from("ftypmif1\0\0\0\0mif1miafavif")]), [64, 48]), "unsupported"],
   ]) {
     write(name, content);
     assert.equal((await preview(name)).previewType, type, name);
@@ -258,6 +261,12 @@ test("an image's decoded size is read from its header and bounded in every raste
     // A comment extension comes before the first frame.
     return Buffer.concat([head, Buffer.from([0x21, 0xfe, 3, 0x61, 0x62, 0x63, 0]), frame, Buffer.from([2, 0, 0x3b])]);
   };
+  // A small first frame, a long comment, then a later frame of `[width, height]` (the trailer stripped first).
+  const later = (frame, tail = Buffer.from([0x3b])) => {
+    const comment = Buffer.concat([Buffer.from([0x21, 0xfe]), ...Array.from({ length: 4600 }, () => Buffer.concat([Buffer.from([255]), Buffer.alloc(255, 0x61)])), Buffer.from([0])]);
+    const second = gif([1, 1], frame).subarray(20);
+    return Buffer.concat([gif([10, 10], [10, 10]).subarray(0, -1), comment, second.subarray(0, -1), tail]);
+  };
   const bmp = (width, height) => { const bytes = Buffer.alloc(54); bytes.write("BM", 0, "latin1"); bytes.writeUInt32LE(40, 14); bytes.writeInt32LE(width, 18); bytes.writeInt32LE(height, 22); return bytes; };
   const webp = (width, height) => {
     const bytes = Buffer.alloc(30);
@@ -273,18 +282,19 @@ test("an image's decoded size is read from its header and bounded in every raste
     return Buffer.concat([Buffer.from([0xff, 0xd8]), app, app, frame, Buffer.from([0xff, 0xd9])]);
   };
   const ico = (image) => { const head = Buffer.alloc(22); head.writeUInt16LE(1, 2); head.writeUInt16LE(1, 4); head.writeUInt32LE(image.length, 14); head.writeUInt32LE(22, 18); return Buffer.concat([head, image]); };
-  const ftyp = Buffer.concat([Buffer.from([0, 0, 0, 20]), Buffer.from("ftypavif\0\0\0\0avif")]);
   const cases = [
     ["big.png", png(10_000, 10_000), [10_000, 10_000]],
     ["ok.png", png(4000, 3000), null],
     ["wide-frame.gif", gif([1, 1], [60_000, 60_000]), [60_000, 60_000]],
     ["ok.gif", gif([100, 80], [10, 10]), null],
+    // Every frame of a GIF is sized, also one past the first megabyte.
+    ["late-frame.gif", later([60_000, 60_000]), [60_000, 60_000]],
+    ["late-ok.gif", later([20, 30]), null],
     ["big.bmp", bmp(10_000, -10_000), [10_000, 10_000]],
     ["big.webp", webp(16_384, 16_384), [16_384, 16_384]],
     ["big.jpg", jpeg(20_000, 20_000), [20_000, 20_000]],
     ["ok.jpeg", jpeg(640, 480), null],
     ["big.ico", ico(png(9000, 9000)), [9000, 9000]],
-    ["grid.avif", avif(ftyp, [512, 512], [8000, 8000]), [8000, 8000]],
   ];
   for (const [name, bytes] of cases) write(name, bytes);
   write("no-size.png", PNG.subarray(0, 20));
@@ -307,6 +317,9 @@ test("an image's decoded size is read from its header and bounded in every raste
   assert.deepEqual([(await files.preview(root, "ok.png")).width, (await files.preview(root, "ok.gif")).height], [4000, 80]);
   const unsized = await files.preview(root, "no-size.png");
   assert.deepEqual([unsized.previewType, unsized.reason], ["unsupported", "This PNG image's size cannot be read"]);
+  // A block a decoder cannot read ends the walk, so what follows it is never sized.
+  write("unknown-block.gif", later([20, 30], Buffer.from([0x99, 0x3b])));
+  assert.deepEqual(await files.preview(root, "unknown-block.gif").then((preview) => [preview.previewType, preview.reason]), ["unsupported", "This GIF image's size cannot be read"]);
 });
 
 test("a raw body is the version that was checked: a write or a truncation while it streams never completes the response", previewable, async (t) => {
@@ -331,6 +344,18 @@ test("a raw body is the version that was checked: a write or a truncation while 
   const truncated = await stream(() => truncateSync(target, 100 * 1024));
   assert.deepEqual([truncated.changed, truncated.complete, truncated.destroyed, truncated.code], [true, false, true, "FILE_CHANGED"]);
   assert.ok(truncated.body.length <= 100 * 1024);
+  // No byte of the rewritten version is ever sent: a write while a chunk is
+  // read keeps that chunk back, and one after it was sent ends the body there.
+  const patch = (at) => () => { const descriptor = openSync(target, "r+"); try { writeSync(descriptor, Buffer.alloc(1024, 2), 0, 1024, at); } finally { closeSync(descriptor); } };
+  for (const [after, at, sent] of [[64 * 1024, 70 * 1024, 0], [128 * 1024, 200 * 1024, 64 * 1024]]) {
+    write("big.png", original);
+    let changed = false;
+    const files = createFileBrowser({ hooks: { duringRaw: (offset) => { if (offset === after) { changed = true; patch(at)(); } } } });
+    const { request, response, body } = capture();
+    await files.raw(root, "big.png", null, request, response);
+    assert.deepEqual([changed, response.writableFinished, files.operations()[0].code, body().length], [true, false, "FILE_CHANGED", sent], `a rewrite after ${after} bytes`);
+    assert.ok(body().equals(original.subarray(0, sent)), `a rewrite after ${after} bytes sent bytes of the new version`);
+  }
 });
 
 test("a failed volume probe fails only the requests that waited for it, and later requests probe again", listable, async (t) => {
@@ -429,7 +454,9 @@ test("each request leaves one bounded operation record, named by its id, without
   // A client that stops reading, then goes away, mid-stream.
   const { request, response } = capture(undefined, new Promise(() => {}));
   const streaming = files.raw(root, "logo.png", null, request, response, { operationId: "op-raw" });
-  while (!response.headers["content-type"]) await new Promise((resolve) => setTimeout(resolve, 5));
+  for (const deadline = Date.now() + 10_000; !response.headers["content-type"]; await new Promise((resolve) => setTimeout(resolve, 5))) {
+    if (Date.now() > deadline) assert.fail(`the raw response never began: ${JSON.stringify(files.operations())}`);
+  }
   response.destroy();
   await streaming;
   assert.deepEqual(seen.map((record) => [record.operationId, record.operation, record.path, record.outcome, record.status ?? null, record.code ?? null]), [
@@ -540,40 +567,32 @@ test("a file bind-mounted into the worktree from a volume without nanosecond cti
   }
 });
 
-test("an AVIF is sized only from metadata it read whole, and never when a decoder would show a track instead", previewable, async (t) => {
+test("an AVIF is never previewed or served, even one whose metadata understates its size", previewable, async (t) => {
   const { root, write } = fixture(t);
-  const ftyp = (major, ...compatible) => box("ftyp", Buffer.from(major), u32(0), ...compatible.map((brand) => Buffer.from(brand)));
-  const ispe = (width, height) => box("ispe", u32(0, width, height));
-  // pitm names the primary item, which a decoder shows for an avif major brand.
-  const meta = (...properties) => box("meta", u32(0), box("pitm", u32(0), Buffer.from([0, 1])), box("iprp", box("ipco", ...properties)));
-  // Its frame size is not read: a decoder showing it could draw any size.
-  const moov = box("moov", box("trak", box("tkhd", Buffer.alloc(84))));
-  const mdat = box("mdat", Buffer.alloc(1100 * 1024));
-  const cases = [
-    // Its image data runs past the sample; its metadata does not.
-    ["large.avif", Buffer.concat([ftyp("avif", "mif1", "avif"), meta(ispe(64, 48)), mdat]), "image"],
-    // A later item past the sample may be larger than the ones read.
-    ["late-item.avif", Buffer.concat([ftyp("avif", "mif1", "avif"), meta(ispe(64, 64), box("free", Buffer.alloc(1100 * 1024)), ispe(10_000, 10_000))]), "unsupported"],
-    ["sequence.avif", Buffer.concat([ftyp("avis", "avif", "msf1"), meta(ispe(64, 48)), moov]), "unsupported"],
-    ["track.avif", Buffer.concat([ftyp("mif1", "avif"), meta(ispe(64, 48)), moov]), "unsupported"],
-    // Past the sample there may be a track.
-    ["late-track.avif", Buffer.concat([ftyp("mif1", "avif"), meta(ispe(64, 48)), mdat, moov]), "unsupported"],
-  ];
+  const ftyp = box("ftyp", Buffer.from("avif"), u32(0), Buffer.from("mif1avif"));
+  // Its ispe says 1 × 1; a decoder allocates by the AV1 frame size its payload codes.
+  write("understated.avif", Buffer.concat([avif(ftyp, [1, 1]), box("mdat", Buffer.alloc(4096, 0xaa))]));
   const files = createFileBrowser();
-  for (const [name, bytes, type] of cases) {
-    write(name, bytes);
-    const preview = await files.preview(root, name);
-    assert.equal(preview.previewType, type, name);
-    const { request, response, body } = capture();
-    if (type === "image") {
-      await files.raw(root, name, preview.version, request, response);
-      assert.equal(body().length, bytes.length, name);
-      continue;
-    }
-    assert.equal(preview.reason, "This AVIF image's size cannot be read", name);
-    assert.deepEqual(await refusal(files.raw(root, name, null, request, response)).then((error) => [error.status, error.code]), [415, "NOT_RAW_PREVIEW"], name);
-    assert.equal(body().length, 0, name);
-  }
+  const preview = await files.preview(root, "understated.avif");
+  assert.deepEqual([preview.previewType, preview.width], ["unsupported", undefined]);
+  const { request, response, body } = capture();
+  assert.deepEqual(await refusal(files.raw(root, "understated.avif", null, request, response)).then((error) => [error.status, error.code]), [415, "NOT_RAW_PREVIEW"]);
+  assert.equal(body().length, 0);
+});
+
+test("a link whose destination is not UTF-8 is unreadable, never the file its decoded name would name", linkable, async (t) => {
+  const { root, write } = fixture(t);
+  // "a\uFFFD" is what the destination's invalid byte decodes to.
+  write("a\uFFFD.png", PNG);
+  symlinkSync(Buffer.from([0x61, 0xff, 0x2e, 0x70, 0x6e, 0x67]), path.join(root, "lossy.png"));
+  const files = createFileBrowser();
+  assert.deepEqual(await refusal(files.preview(root, "lossy.png")).then((error) => [error.status, error.code]), [403, "UNREADABLE"]);
+  const { request, response, body } = capture();
+  assert.deepEqual(await refusal(files.raw(root, "lossy.png", null, request, response)).then((error) => [error.status, error.code]), [403, "UNREADABLE"]);
+  assert.equal(body().length, 0);
+  const listed = (await files.list(root)).entries.find((entry) => entry.name === "lossy.png");
+  assert.deepEqual(listed.target, { state: "unreadable" });
+  assert.equal((await files.preview(root, "a\uFFFD.png")).previewType, "image");
 });
 
 test("an SVG that could embed a raster is neither previewed nor served, however the data: URL is spelled, and a plain SVG still is", previewable, async (t) => {

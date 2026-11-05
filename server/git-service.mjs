@@ -312,11 +312,18 @@ async function requireChildPath(root, child) { const resolved = path.resolve(roo
 // launched (409, retry). That canonical path is what the editor is given.
 // Once the editor has the path, a later replacement of a folder on it is
 // outside what a path can guard; only the moment of the decision is checked.
+// The base is the canonical root requireWorktree admitted, so a root that no
+// longer resolves to itself was replaced, and nothing is launched (409).
+// An editor opens an existing path as it is, but reads an absent one ending
+// in ":12" or holding "(12)" as a place in another file (Zed), so such a new
+// path is refused.
 async function requireCanonicalChild(root, child, hooks = {}) {
   const names = path.relative(root, await requireChildPath(root, child)).split(path.sep).filter(Boolean);
+  const changed = () => httpError(409, "The path changed while it was checked; retry");
   let current;
   try { current = await realpath(root); } catch { throw httpError(403, "File path cannot be checked inside the worktree"); }
-  const base = current;
+  if (current !== root) throw changed();
+  const base = root;
   let absent = names.length;
   for (const [index, name] of names.entries()) {
     const next = path.join(current, name);
@@ -333,7 +340,6 @@ async function requireCanonicalChild(root, child, hooks = {}) {
     catch { throw httpError(403, "File path is a link whose target cannot be checked inside the worktree"); }
     if (!isWithin(base, current)) throw httpError(403, "File path leads outside the worktree");
   }
-  const changed = () => httpError(409, "The path changed while it was checked; retry");
   let found;
   try { found = await realpath(current); } catch { throw changed(); }
   if (!isWithin(base, found)) throw changed();
@@ -345,7 +351,9 @@ async function requireCanonicalChild(root, child, hooks = {}) {
   try { await lstat(missing); }
   catch (error) { gone = ["ENOENT", "ENOTDIR"].includes(error?.code); }
   if (!gone || await realpath(found).catch(() => null) !== found) throw changed();
-  return path.join(missing, ...names.slice(absent + 1));
+  const created = path.join(missing, ...names.slice(absent + 1));
+  if (/:[\d:]*$|\(\d+(?:[,:]\d+)?\)/.test(created)) throw httpError(403, "A new file's path cannot hold a line locator such as :12 or (12), which an editor reads as a place in another file");
+  return created;
 }
 // Containment by path segment: "..large.log" or "..cache/x" is a child, while
 // ".." and "../x" (or another drive on Windows) are not.

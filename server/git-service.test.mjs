@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, renameSync, symlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -182,6 +182,43 @@ test("open in editor accepts dot-prefixed names inside the worktree and refuses 
       await assert.rejects(service.openInEditor(cwd, name), (error) => error.statusCode === 403, `${name} was opened`);
     }
     assert.deepEqual(launched, ["..large.log", path.join("..cache", "x"), "...", "a/../b.txt"].map((name) => path.resolve(cwd, name)));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("open in editor refuses a root replaced after it was admitted, and a new path an editor would read as a place in another file", { skip: process.platform === "win32" && "symlinks need POSIX semantics" }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "outright-editor-root-"));
+  try {
+    const base = await realpath(root);
+    const cwd = path.join(base, "worktree");
+    await mkdir(cwd);
+    await mkdir(path.join(base, "outside"));
+    await writeFile(path.join(base, "outside", "secret.txt"), "private");
+    await writeFile(path.join(cwd, "notes.md"), "inside");
+    await writeFile(path.join(cwd, "todo.md:2"), "an existing name is opened as it is");
+    await symlink(path.join(base, "outside", "secret.txt"), path.join(cwd, "escape.txt"));
+    const launched = [];
+    const subprocesses = { launchDetached: async (file, args) => { launched.push(args.at(-1)); }, run: async () => { throw new Error("unused"); } };
+    let swap = false;
+    // Admission looks the worktree up once it has its canonical path; the root becomes a link out right then.
+    const getProjects = () => {
+      if (swap) { swap = false; renameSync(cwd, `${cwd}-old`); symlinkSync(path.join(base, "outside"), cwd); }
+      return [{ worktrees: [{ path: cwd }] }];
+    };
+    const service = createGitService({ database: { getSettings: () => ({ editor: "zed" }), auditAdmission() {}, auditCritical() {} },
+      getProjects, getConfig: async () => ({ scanRoots: [cwd] }), subprocesses });
+    swap = true;
+    await assert.rejects(service.openInEditor(cwd, "secret.txt"), (error) => error.statusCode === 409, "a file of the replacing folder was opened");
+    assert.equal(swap, false, "the swap did not run");
+    await rm(cwd);
+    await rename(`${cwd}-old`, cwd);
+    // Zed opens escape.txt (a link out) at line 12 for an absent "escape.txt:12".
+    for (const name of ["escape.txt:12", "escape.txt:12:3", "escape.txt::4:", "escape.txt:", "escape.txt(12)", "escape.txt(12,3)", "escape.txt:(2:1)", "new(2)/x.md"]) {
+      await assert.rejects(service.openInEditor(cwd, name), (error) => error.statusCode === 403, `${name} was opened`);
+    }
+    assert.deepEqual(launched, []);
+    assert.equal((await service.openInEditor(cwd, "todo.md:2")).target, path.join(cwd, "todo.md:2"));
+    assert.equal((await service.openInEditor(cwd, "new.md")).target, path.join(cwd, "new.md"));
+    assert.deepEqual(launched, [path.join(cwd, "todo.md:2"), path.join(cwd, "new.md")]);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

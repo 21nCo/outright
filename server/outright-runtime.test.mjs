@@ -3813,6 +3813,8 @@ test("file routes browse only a discovered project worktree and serve previews f
   // its folders and files (OUT-144); probed, not inferred from the platform.
   const anchored = await createFileBrowser().list(worktree.path).then(() => true, (error) => error.details?.code !== "LISTING_UNAVAILABLE");
   if (process.platform === "win32") assert.equal(anchored, false, "Windows cannot read through a root handle");
+  // CI's Linux and macOS runners can, so a regression there cannot pass on the 501 branch.
+  if (process.env.CI && ["linux", "darwin"].includes(process.platform)) assert.equal(anchored, true, "a CI Linux or macOS host refused its root handle");
   if (!anchored) assert.deepEqual([listed.statusCode, listed.body.code], [501, "LISTING_UNAVAILABLE"], listed.raw);
   else {
     assert.equal(listed.statusCode, 200, listed.raw);
@@ -3843,6 +3845,20 @@ test("file routes browse only a discovered project worktree and serve previews f
     const stale = await callRuntime(runtime, "GET", at("/api/files/raw", { projectId: project.id, path: worktree.path, file: "logo.png", version: `${image.body.version}-old` }));
     assert.deepEqual([stale.statusCode, stale.body.code], [409, "FILE_CHANGED"], stale.raw);
     assert.match(stale.headers["X-Outright-Operation"], operationId);
+    // As the README says: after a rewrite the previewed version is refused, and
+    // a request without a version, or with an empty one, gets the version it verifies.
+    const rewritten = Buffer.concat([png, Buffer.from("tail")]);
+    writeFileSync(path.join(worktree.path, "logo.png"), rewritten);
+    const previewed = await callRuntime(runtime, "GET", at("/api/files/raw", { projectId: project.id, path: worktree.path, file: "logo.png", version: image.body.version }));
+    assert.deepEqual([previewed.statusCode, previewed.body.code], [409, "FILE_CHANGED"], previewed.raw);
+    for (const version of [undefined, ""]) {
+      const parts = [];
+      const current = new Writable({ write(chunk, _encoding, done) { parts.push(chunk); done(); } });
+      current.headers = {};
+      current.setHeader = (name, value) => { current.headers[name.toLowerCase()] = value; };
+      await runtime.handleRequest(requestStream("GET", at("/api/files/raw", { projectId: project.id, path: worktree.path, file: "logo.png", ...(version === undefined ? {} : { version }) })), current);
+      assert.deepEqual([current.statusCode, current.headers["content-type"], Buffer.concat(parts).equals(rewritten)], [200, "image/png", true], `version ${JSON.stringify(version)}`);
+    }
   }
   const missing = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "gone.md" }));
   // Without a root handle nothing below the root is looked at, so a missing name answers alike.
@@ -3864,6 +3880,20 @@ test("file routes browse only a discovered project worktree and serve previews f
   }
   const escaping = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: worktree.path, dir: ".." }));
   assert.deepEqual([escaping.statusCode, escaping.body.code], [403, "PATH_OUTSIDE"]);
+  // OUTRIGHT_FILES=off turns every Files route off, recorded like any refusal, until it is unset.
+  const setting = process.env.OUTRIGHT_FILES;
+  process.env.OUTRIGHT_FILES = "off";
+  try {
+    for (const [route, operation, parameters] of [["/api/files", "list", {}], ["/api/files/preview", "preview", { file: "README.md" }], ["/api/files/raw", "raw", { file: "logo.png" }]]) {
+      const off = await callRuntime(runtime, "GET", at(route, { projectId: project.id, path: worktree.path, ...parameters }));
+      const record = runtime.files.operations().find((item) => item.operationId === off.headers["X-Outright-Operation"]);
+      assert.deepEqual([off.statusCode, off.body.code, record?.operation, record?.code], [503, "FILES_DISABLED", operation, "FILES_DISABLED"], off.raw);
+    }
+  } finally {
+    if (setting === undefined) delete process.env.OUTRIGHT_FILES; else process.env.OUTRIGHT_FILES = setting;
+  }
+  const on = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "README.md" }));
+  assert.equal(on.statusCode, anchored ? 200 : 501, on.raw);
   // The server's own checks (here the Host gate) answer before the Files routes, so that refusal names no record.
   const recorded = runtime.files.operations().length;
   const foreign = requestStream("GET", at("/api/files", { projectId: project.id, path: worktree.path }));

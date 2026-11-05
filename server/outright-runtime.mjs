@@ -389,8 +389,9 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
 
   // File browsing reads one worktree of the latest scan. Expanding a folder
   // must not start a project rescan, so only a runtime with no scan yet waits
-  // for one.
+  // for one. OUTRIGHT_FILES=off turns Files off (see README).
   async function resolveBrowseTarget(projectId, worktreePath) {
+    if (process.env.OUTRIGHT_FILES === "off") throw apiError(503, "Files is turned off on this Outright (OUTRIGHT_FILES=off)", { code: "FILES_DISABLED" });
     if (!worktreePath) throw apiError(400, "Missing path", { code: "PATH_REQUIRED" });
     if (!latestScan) await projects();
     const canonical = await git.requireWorktree(worktreePath).catch((error) => { throw error.statusCode === 403 ? apiError(403, error.message, { code: "WORKTREE_UNKNOWN" }) : error; });

@@ -43,7 +43,6 @@ const IMAGES = Object.freeze({
   ".jpeg": ["image/jpeg", (bytes) => startsWith(bytes, [0xff, 0xd8, 0xff])],
   ".gif": ["image/gif", (bytes) => ascii(bytes, 0, 6) === "GIF87a" || ascii(bytes, 0, 6) === "GIF89a"],
   ".webp": ["image/webp", (bytes) => ascii(bytes, 0, 4) === "RIFF" && ascii(bytes, 8, 12) === "WEBP"],
-  ".avif": ["image/avif", isAvif],
   ".bmp": ["image/bmp", (bytes) => ascii(bytes, 0, 2) === "BM"],
   ".ico": ["image/x-icon", (bytes) => startsWith(bytes, [0x00, 0x00, 0x01, 0x00])],
   // SVG can carry script. It is only ever shown through <img>, which runs
@@ -52,7 +51,8 @@ const IMAGES = Object.freeze({
 });
 // The first element of an SVG may follow a long prolog (comments, a DOCTYPE
 // with its own declarations), and an image's size may follow long metadata
-// (EXIF, ICC profiles), so more of an image is read to find them.
+// (EXIF, ICC profiles), so more of an image is read to find them. Every frame
+// of a GIF can widen what it decodes to, so a GIF is read whole.
 const SVG_SAMPLE_BYTES = 1024 * 1024;
 // A raw response cannot run script, load anything, or be embedded by
 // another site, even if it is opened as a top-level page.
@@ -351,7 +351,8 @@ async function classify(relative, { handle, info }, limits, withText) {
   if (!handle) return { previewType: "unsupported", reason: "This is not a regular file" };
   const extension = path.extname(relative).toLowerCase();
   const image = IMAGES[extension];
-  const sample = await readBytes(handle, Math.min(info.size, image ? Math.max(limits.sampleBytes, SVG_SAMPLE_BYTES) : limits.sampleBytes));
+  const imageSample = extension === ".gif" ? limits.imageBytes : Math.max(limits.sampleBytes, SVG_SAMPLE_BYTES);
+  const sample = await readBytes(handle, Math.min(info.size, image ? imageSample : limits.sampleBytes));
   if (image) {
     const format = extension.slice(1).toUpperCase();
     if (!image[1](sample)) return { previewType: "unsupported", reason: `The contents are not a ${format} image` };
@@ -491,8 +492,9 @@ async function resolveContained(binding, relative, hooks, noun, from = rootFolde
         else failure = error?.code === "ENOENT" && step.link ? fileError(404, `${relative} is a link to a file that does not exist`, "BROKEN_LINK") : fileSystemError(error, relative, noun);
       }
       if (info?.isSymbolicLink()) {
-        try { destination = await readlink(at); }
+        try { destination = utf8(await readlink(at, { encoding: "buffer" })); }
         catch (error) { failure = ["ENOENT", "EINVAL"].includes(error?.code) ? pathChanged() : fileSystemError(error, relative, noun); }
+        if (destination === null) failure = fileError(403, `${relative} is a link whose destination is not UTF-8`, "UNREADABLE");
       }
       if (failure) throw failure;
       if (step.expect && !sameObject(info, step.expect)) throw pathChanged();
@@ -567,9 +569,10 @@ async function settledStat(handle) {
   }
 }
 
-// A raw body is the version that was checked: it is read in chunks, and its
-// last chunk is sent only if the file still has that version after every
-// byte was read, so a body a write changed or cut short never completes.
+// A raw body is the version that was checked: it is read in chunks, and each
+// chunk is sent only if the file still has that version after it was read,
+// so no byte of another version is sent, and a body a write changed or cut
+// short ends before the change instead of completing.
 async function* rawBody({ handle, info, unchanged }, hooks) {
   for (let offset = 0; offset < info.size;) {
     const length = Math.min(RAW_CHUNK_BYTES, info.size - offset);
@@ -577,7 +580,7 @@ async function* rawBody({ handle, info, unchanged }, hooks) {
     if (!bytesRead) throw fileChanged();
     offset += bytesRead;
     await hooks.duringRaw?.(offset);
-    if (offset === info.size) await unchanged();
+    await unchanged();
     yield buffer.subarray(0, bytesRead);
   }
 }
@@ -622,8 +625,8 @@ async function bindRoot(root, hooks, handlePaths, probes) {
     let anchor = null;
     if (process.platform === "linux") {
       const procPath = `/proc/self/fd/${handle.fd}`;
-      const location = await readlink(procPath).catch(() => null);
-      if (location !== null && location !== root) throw pathChanged();
+      const location = await readlink(procPath, { encoding: "buffer" }).catch(() => null);
+      if (location !== null && !location.equals(Buffer.from(root))) throw pathChanged();
       if (location !== null) anchor = procPath;
     } else {
       const volumePath = `/.vol/${info.dev}/${info.ino}`;
@@ -715,9 +718,9 @@ async function proveHeld(binding, held) {
     if (process.platform === "linux") {
       // One kernel snapshot of where the held folder is; inside the bracket,
       // its chain is the root's, so this also names where the root was.
-      const location = await readlink(held.readPath).catch(() => null);
+      const location = await readlink(held.readPath, { encoding: "buffer" }).catch(() => null);
       await hooks.duringProof?.("readlink");
-      if (location !== path.join(binding.root, ...held.canonical)) throw pathChanged();
+      if (!location?.equals(Buffer.from(path.join(binding.root, ...held.canonical)))) throw pathChanged();
     } else {
       for (let depth = 1; depth < held.chain.length; depth += 1) {
         const above = held.chain[depth - 1];
@@ -908,27 +911,22 @@ async function readBytes(handle, length) {
 }
 
 function fileVersion(info) { return [info.size, info.mtimeNs, info.ctimeNs, info.ino, info.dev].map((value) => value.toString(36)).join("-"); }
-// An AVIF file starts with an ftyp box naming avif or avis as its major
-// brand or as one of its compatible brands (a major brand may be mif1).
-function avifBrands(bytes) {
-  if (ascii(bytes, 4, 8) !== "ftyp") return [];
-  const size = Math.min(bytes.readUInt32BE(0), bytes.length);
-  const brands = [ascii(bytes, 8, 12)];
-  for (let offset = 16; offset + 4 <= size; offset += 4) brands.push(ascii(bytes, offset, offset + 4));
-  return brands;
-}
-function isAvif(bytes) { return avifBrands(bytes).some((brand) => brand === "avif" || brand === "avis"); }
-// The pixel size an image declares ahead of its image data, read from its
-// first bytes; null when it is not there. The decoder's canvas counts: a
-// GIF's first frame widens it, an ICO entry or an AVIF item (a grid or a
-// tile) may be the largest, and a BMP inside an ICO counts at full height.
+// Link bytes as text, or null when they are not UTF-8: decoding them would
+// name another file (each invalid byte becomes U+FFFD).
+function utf8(bytes) { const text = bytes.toString("utf8"); return Buffer.from(text, "utf8").equals(bytes) ? text : null; }
+// The pixel size an image decodes to, read from the headers a decoder sizes
+// its buffers by; null when they are not there. The decoder's canvas counts:
+// any GIF frame widens it, an ICO entry may be the largest, and a BMP inside
+// an ICO counts at full height. A decoder refuses a WebP or APNG frame outside
+// the canvas its header declares, and a second JPEG frame header, before
+// decoding them. AVIF is not served: its decoder allocates by the AV1 frame
+// size, which only its coded payload states.
 function imageSize(extension, b, whole) {
   if (extension === ".png") return b.length >= 24 && ascii(b, 12, 16) === "IHDR" ? [b.readUInt32BE(16), b.readUInt32BE(20)] : null;
-  if (extension === ".gif") return gifSize(b);
+  if (extension === ".gif") return whole ? gifSize(b) : null;
   if (extension === ".bmp") return bmpSize(b, 14);
   if (extension === ".webp") return webpSize(b);
   if (extension === ".ico") return icoSize(b);
-  if (extension === ".avif") return avifSize(b, whole);
   return jpegSize(b);
 }
 function larger(left, right) { return !left || (right && right[0] * right[1] > left[0] * left[1]) ? right : left; }
@@ -936,13 +934,22 @@ function bmpSize(b, at) {
   if (b.length < at + 12) return null;
   return b.readUInt32LE(at) === 12 ? [b.readUInt16LE(at + 4), b.readUInt16LE(at + 6)] : [Math.abs(b.readInt32LE(at + 4)), Math.abs(b.readInt32LE(at + 8))];
 }
+// Every block up to the trailer: an extension (two bytes) or a frame (its
+// descriptor, color table and code size), each followed by its sub-blocks.
+// Anything else ends a decoder's reading in error, so it is unsupported.
 function gifSize(b) {
   if (b.length < 13) return null;
-  let at = 13 + (b[10] & 0x80 ? 3 * 2 ** ((b[10] & 7) + 1) : 0);
-  // Extensions, each a run of sub-blocks, come before the first frame.
-  while (b[at] === 0x21) { at += 2; while (at < b.length && b[at]) at += b[at] + 1; at += 1; }
-  if (b[at] !== 0x2c || b.length < at + 9) return null;
-  return [Math.max(b.readUInt16LE(6), b.readUInt16LE(at + 1) + b.readUInt16LE(at + 5)), Math.max(b.readUInt16LE(8), b.readUInt16LE(at + 3) + b.readUInt16LE(at + 7))];
+  const table = (flags) => (flags & 0x80 ? 3 * 2 ** ((flags & 7) + 1) : 0);
+  let size = [b.readUInt16LE(6), b.readUInt16LE(8)];
+  for (let at = 13 + table(b[10]); at < b.length && b[at] !== 0x3b; at += 1) {
+    if (b[at] === 0x2c && at + 10 <= b.length) {
+      size = [Math.max(size[0], b.readUInt16LE(at + 1) + b.readUInt16LE(at + 5)), Math.max(size[1], b.readUInt16LE(at + 3) + b.readUInt16LE(at + 7))];
+      at += 11 + table(b[at + 9]);
+    } else if (b[at] === 0x21) at += 2;
+    else return null;
+    while (at < b.length && b[at]) at += b[at] + 1;
+  }
+  return size;
 }
 function webpSize(b) {
   if (b.length < 30) return null;
@@ -971,37 +978,6 @@ function icoSize(b) {
     largest = larger(largest, size);
   }
   return largest;
-}
-// A decoder (libavif in Chromium and WebKit, and Firefox) shows the primary
-// item, sized by the items' ispe properties (meta > iprp > ipco), when the
-// major brand is avif and meta names one (pitm); otherwise it shows a moov
-// track, if there is one. A track's frame size is not read here, so a
-// sequence (avis), or a file whose moov could lie past the sample, is
-// unsupported, as is one whose meta box is cut short by the sample.
-function avifSize(b, whole) {
-  const brands = avifBrands(b);
-  if (brands.includes("avis")) return null;
-  const inside = ["meta", "iprp", "ipco"];
-  let largest = null;
-  let primary = false;
-  let mayHaveTrack = !whole;
-  // False when a box holding item properties runs past its container.
-  const visit = (start, end, depth) => {
-    for (let at = start; at + 8 <= end;) {
-      let size = b.readUInt32BE(at);
-      let header = 8;
-      if (size === 1 && at + 16 <= end) { size = Number(b.readBigUInt64BE(at + 8)); header = 16; } else if (size === 0) size = whole || depth ? end - at : Infinity;
-      const type = ascii(b, at + 4, at + 8);
-      if (size < header || at + size > end) { mayHaveTrack = true; return depth === 0 && type !== "meta"; }
-      if (depth === 0 && type === "moov") mayHaveTrack = true;
-      primary ||= depth === 1 && type === "pitm";
-      if (type === inside[depth] && !visit(at + header + (depth ? 0 : 4), at + size, depth + 1)) return false;
-      if (type === "ispe" && depth === 3) { if (size < header + 12) return false; largest = larger(largest, [b.readUInt32BE(at + header + 4), b.readUInt32BE(at + header + 8)]); }
-      at += size;
-    }
-    return true;
-  };
-  return visit(0, b.length, 0) && ((brands[0] === "avif" && primary) || !mayHaveTrack) ? largest : null;
 }
 // An SVG's first element is <svg> (or a prefixed svg element), after only
 // a byte order mark, an XML declaration, processing instructions, comments,
