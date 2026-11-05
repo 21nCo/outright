@@ -189,7 +189,8 @@ test("open in editor refuses a root replaced after it was admitted, and a new pa
   const root = await mkdtemp(path.join(os.tmpdir(), "outright-editor-root-"));
   try {
     const base = await realpath(root);
-    const cwd = path.join(base, "worktree");
+    // A locator spelling in the root's own path is not the new file's name.
+    const cwd = path.join(base, "work (2)");
     await mkdir(cwd);
     await mkdir(path.join(base, "outside"));
     await writeFile(path.join(base, "outside", "secret.txt"), "private");
@@ -206,19 +207,26 @@ test("open in editor refuses a root replaced after it was admitted, and a new pa
     };
     const service = createGitService({ database: { getSettings: () => ({ editor: "zed" }), auditAdmission() {}, auditCritical() {} },
       getProjects, getConfig: async () => ({ scanRoots: [cwd] }), subprocesses });
-    swap = true;
-    await assert.rejects(service.openInEditor(cwd, "secret.txt"), (error) => error.statusCode === 409, "a file of the replacing folder was opened");
-    assert.equal(swap, false, "the swap did not run");
-    await rm(cwd);
-    await rename(`${cwd}-old`, cwd);
-    // Zed opens escape.txt (a link out) at line 12 for an absent "escape.txt:12".
-    for (const name of ["escape.txt:12", "escape.txt:12:3", "escape.txt::4:", "escape.txt:", "escape.txt(12)", "escape.txt(12,3)", "escape.txt:(2:1)", "new(2)/x.md"]) {
+    // A file in it, or the worktree itself (no file, or an empty one).
+    for (const file of ["secret.txt", undefined, ""]) {
+      swap = true;
+      await assert.rejects(service.openInEditor(cwd, file), (error) => error.statusCode === 409, `${JSON.stringify(file)}: the replacing folder was opened`);
+      assert.equal(swap, false, "the swap did not run");
+      await rm(cwd);
+      await rename(`${cwd}-old`, cwd);
+    }
+    // Zed opens escape.txt (a link out) at line 12 for an absent "escape.txt:12",
+    // and trims an absent name first, so white space around one leads there too.
+    for (const name of ["escape.txt:12", "escape.txt:12:3", "escape.txt::4:", "escape.txt:", "escape.txt(12)", "escape.txt(12,3)", "escape.txt:(2:1)",
+      "escape.txt:12 ", "escape.txt:12\t", "escape.txt:12\n", "escape.txt ", "escape.txt\u00a0", "docs/notes(3).md"]) {
       await assert.rejects(service.openInEditor(cwd, name), (error) => error.statusCode === 403, `${name} was opened`);
     }
     assert.deepEqual(launched, []);
     assert.equal((await service.openInEditor(cwd, "todo.md:2")).target, path.join(cwd, "todo.md:2"));
     assert.equal((await service.openInEditor(cwd, "new.md")).target, path.join(cwd, "new.md"));
-    assert.deepEqual(launched, [path.join(cwd, "todo.md:2"), path.join(cwd, "new.md")]);
+    assert.equal((await service.openInEditor(cwd, "new(2)/x.md")).target, path.join(cwd, "new(2)", "x.md"));
+    assert.equal((await service.openInEditor(cwd)).target, cwd);
+    assert.deepEqual(launched, [path.join(cwd, "todo.md:2"), path.join(cwd, "new.md"), path.join(cwd, "new(2)", "x.md"), cwd]);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

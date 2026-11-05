@@ -188,7 +188,7 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
 
   async function openInEditor(worktreePath, filePath, editor) {
     const cwd = await requireWorktree(worktreePath);
-    const target = filePath ? await requireCanonicalChild(cwd, filePath, hooks) : cwd;
+    const target = filePath ? await requireCanonicalChild(cwd, filePath, hooks) : await requireAdmittedRoot(cwd);
     const configured = editor || database.getSettings().editor;
     const commands = {
       zed: ["zed", [target]],
@@ -312,18 +312,15 @@ async function requireChildPath(root, child) { const resolved = path.resolve(roo
 // launched (409, retry). That canonical path is what the editor is given.
 // Once the editor has the path, a later replacement of a folder on it is
 // outside what a path can guard; only the moment of the decision is checked.
-// The base is the canonical root requireWorktree admitted, so a root that no
-// longer resolves to itself was replaced, and nothing is launched (409).
-// An editor opens an existing path as it is, but reads an absent one ending
-// in ":12" or holding "(12)" as a place in another file (Zed), so such a new
-// path is refused.
+// The base is the canonical root requireWorktree admitted (requireAdmittedRoot).
+// An editor opens an existing path as it is, but trims an absent one and reads
+// a name ending in ":12" or holding "(12)" as a place in another file (Zed),
+// so a new file's name with either, or with white space around it, is refused.
 async function requireCanonicalChild(root, child, hooks = {}) {
   const names = path.relative(root, await requireChildPath(root, child)).split(path.sep).filter(Boolean);
   const changed = () => httpError(409, "The path changed while it was checked; retry");
-  let current;
-  try { current = await realpath(root); } catch { throw httpError(403, "File path cannot be checked inside the worktree"); }
-  if (current !== root) throw changed();
-  const base = root;
+  const base = await requireAdmittedRoot(root);
+  let current = base;
   let absent = names.length;
   for (const [index, name] of names.entries()) {
     const next = path.join(current, name);
@@ -351,9 +348,17 @@ async function requireCanonicalChild(root, child, hooks = {}) {
   try { await lstat(missing); }
   catch (error) { gone = ["ENOENT", "ENOTDIR"].includes(error?.code); }
   if (!gone || await realpath(found).catch(() => null) !== found) throw changed();
-  const created = path.join(missing, ...names.slice(absent + 1));
-  if (/:[\d:]*$|\(\d+(?:[,:]\d+)?\)/.test(created)) throw httpError(403, "A new file's path cannot hold a line locator such as :12 or (12), which an editor reads as a place in another file");
-  return created;
+  const name = names.at(-1);
+  if (name !== name.trim() || /:[\d:]*$|\(\d+(?:[,:]\d+)?\)/.test(name)) throw httpError(403, "A new file's name cannot hold a line locator such as :12 or (12), or white space around it, which an editor reads as another file");
+  return path.join(missing, ...names.slice(absent + 1));
+}
+// The canonical root requireWorktree admitted must still resolve to itself:
+// one replaced since (by a link elsewhere) is 409, and nothing is launched.
+async function requireAdmittedRoot(root) {
+  let current;
+  try { current = await realpath(root); } catch { throw httpError(403, "The worktree cannot be checked"); }
+  if (current !== root) throw httpError(409, "The path changed while it was checked; retry");
+  return root;
 }
 // Containment by path segment: "..large.log" or "..cache/x" is a child, while
 // ".." and "../x" (or another drive on Windows) are not.
