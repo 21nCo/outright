@@ -1188,10 +1188,11 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       }
       const filesMatch = /^\/api\/files(?:\/(preview|raw))?$/.exec(url.pathname);
       if (filesMatch && request.method === "GET") {
-        const root = await resolveBrowseTarget(url.searchParams.get("projectId"), requiredQuery(url, "path"));
         // The response names the file browser's record of it, also when it is refused.
         const operation = { operationId: randomUUID() };
         response.setHeader("X-Outright-Operation", operation.operationId);
+        const root = await Promise.resolve().then(() => resolveBrowseTarget(url.searchParams.get("projectId"), requiredQuery(url, "path"))).catch((error) => files.refuse(
+          filesMatch[1] ?? "list", url.searchParams.get("path"), url.searchParams.get(filesMatch[1] ? "file" : "dir"), operation.operationId, error));
         if (filesMatch[1] === "preview") return json(response, 200, await files.preview(root, url.searchParams.get("file"), operation));
         if (filesMatch[1] === "raw") { await files.raw(root, url.searchParams.get("file"), url.searchParams.get("version"), request, response, operation); return true; }
         return json(response, 200, await files.list(root, { directory: url.searchParams.get("dir") ?? "", cursor: url.searchParams.get("cursor"),
@@ -1358,7 +1359,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
     return shutdownPromise;
   }
 
-  return { attach, handleRequest, projects, publish, eventHub, database, agents, terminals, git, lifecycle, checkpoints, shutdown, withdrawReattach,
+  return { attach, handleRequest, projects, publish, eventHub, database, agents, terminals, git, lifecycle, checkpoints, files, shutdown, withdrawReattach,
     whenShutdownComplete: () => shutdownCompletion, whenRunRecoveryComplete: () => runRecovery.cycle };
   } catch (error) {
     runRecoveryController.abort();

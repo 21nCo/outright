@@ -443,6 +443,64 @@ test("each request leaves one bounded operation record, named by its id, without
   assert.match(files.operations().at(-1).operationId, /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/);
 });
 
+test("a raw body whose file fails to read mid-stream is recorded as a failed stream, not a client that left", previewable, async (t) => {
+  const { root, write } = fixture(t);
+  write("logo.png", png(64, 64, Buffer.alloc(300 * 1024)));
+  const probe = await open(path.join(root, "logo.png"), "r");
+  const FileHandle = probe.constructor;
+  await probe.close();
+  const { read: original } = FileHandle.prototype;
+  let failing = false;
+  t.after(() => { FileHandle.prototype.read = original; });
+  FileHandle.prototype.read = function read(...args) {
+    return failing ? Promise.reject(Object.assign(new Error("injected"), { code: "EIO" })) : original.apply(this, args);
+  };
+  // The read after the first chunk fails.
+  const files = createFileBrowser({ hooks: { duringRaw: () => { failing = true; } } });
+  const { request, response } = capture();
+  await files.raw(root, "logo.png", null, request, response, { operationId: "op-eio" });
+  failing = false;
+  assert.equal(response.writableFinished, false, "a body cut short completed");
+  const record = files.operations().at(-1);
+  assert.deepEqual([record.operationId, record.outcome, record.code], ["op-eio", "failed", "STREAM_FAILED"]);
+});
+
+test("an AVIF is sized only from metadata it read whole, and never when a decoder would show a track instead", previewable, async (t) => {
+  const { root, write } = fixture(t);
+  const ftyp = (major, ...compatible) => box("ftyp", Buffer.from(major), u32(0), ...compatible.map((brand) => Buffer.from(brand)));
+  const ispe = (width, height) => box("ispe", u32(0, width, height));
+  // pitm names the primary item, which a decoder shows for an avif major brand.
+  const meta = (...properties) => box("meta", u32(0), box("pitm", u32(0), Buffer.from([0, 1])), box("iprp", box("ipco", ...properties)));
+  // Its frame size is not read: a decoder showing it could draw any size.
+  const moov = box("moov", box("trak", box("tkhd", Buffer.alloc(84))));
+  const mdat = box("mdat", Buffer.alloc(1100 * 1024));
+  const cases = [
+    // Its image data runs past the sample; its metadata does not.
+    ["large.avif", Buffer.concat([ftyp("avif", "mif1", "avif"), meta(ispe(64, 48)), mdat]), "image"],
+    // A later item past the sample may be larger than the ones read.
+    ["late-item.avif", Buffer.concat([ftyp("avif", "mif1", "avif"), meta(ispe(64, 64), box("free", Buffer.alloc(1100 * 1024)), ispe(10_000, 10_000))]), "unsupported"],
+    ["sequence.avif", Buffer.concat([ftyp("avis", "avif", "msf1"), meta(ispe(64, 48)), moov]), "unsupported"],
+    ["track.avif", Buffer.concat([ftyp("mif1", "avif"), meta(ispe(64, 48)), moov]), "unsupported"],
+    // Past the sample there may be a track.
+    ["late-track.avif", Buffer.concat([ftyp("mif1", "avif"), meta(ispe(64, 48)), mdat, moov]), "unsupported"],
+  ];
+  const files = createFileBrowser();
+  for (const [name, bytes, type] of cases) {
+    write(name, bytes);
+    const preview = await files.preview(root, name);
+    assert.equal(preview.previewType, type, name);
+    const { request, response, body } = capture();
+    if (type === "image") {
+      await files.raw(root, name, preview.version, request, response);
+      assert.equal(body().length, bytes.length, name);
+      continue;
+    }
+    assert.equal(preview.reason, "This AVIF image's size cannot be read", name);
+    assert.deepEqual(await refusal(files.raw(root, name, null, request, response)).then((error) => [error.status, error.code]), [415, "NOT_RAW_PREVIEW"], name);
+    assert.equal(body().length, 0, name);
+  }
+});
+
 test("an in-place rewrite of the same size with its mtime put back is a new version, and raw refuses the old one", previewable, async (t) => {
   const { root, write } = fixture(t);
   const when = new Date("2026-01-02T03:04:05Z");
@@ -1044,25 +1102,41 @@ test("a folder of 500 links lists every target with a bounded number of descript
   assert.equal(openDescriptors(), before);
 });
 
-test("an opened file whose status cannot be read is closed before the error is reported", previewable, async (t) => {
+test("an opened file whose status cannot be read, or never settles, is closed before the error is reported, for preview and raw", previewable, async (t) => {
   const { root, write } = fixture(t);
   write("a.md", "# A\n");
+  write("a.png", PNG);
   const probe = await open(path.join(root, "a.md"), "r");
   const FileHandle = probe.constructor;
   await probe.close();
   const { stat: original } = FileHandle.prototype;
-  let failing = false;
-  // The status read right after the file is opened fails once.
+  // From the given status read of the opened file on (the first is made as
+  // it is opened, the next ones while it settles), each fails or reports a
+  // write just now.
+  let schedule = null;
+  let file = null;
+  let reads = 0;
   t.after(() => { FileHandle.prototype.stat = original; });
-  FileHandle.prototype.stat = function stat(...args) {
-    if (failing && args[0]?.bigint) { failing = false; return Promise.reject(Object.assign(new Error("injected"), { code: "EIO" })); }
-    return original.apply(this, args);
+  FileHandle.prototype.stat = async function stat(...args) {
+    if (schedule && args[0]?.bigint) file ??= this;
+    if (!schedule || this !== file || ++reads < schedule.from) return original.apply(this, args);
+    if (schedule.fail) throw Object.assign(new Error("injected"), { code: "EIO" });
+    return Object.assign(await original.apply(this, args), { ctimeNs: BigInt(Date.now()) * 1_000_000n });
   };
   const before = openDescriptors();
-  // Only the file's own open arms the failure, not its folder's.
-  const files = createFileBrowser({ hooks: { afterOpen: (real) => { failing = real.endsWith("a.md"); } } });
-  assert.deepEqual(await refusal(files.preview(root, "a.md")).then((error) => [error.status, error.code]), [500, "READ_FAILED"]);
-  assert.equal(openDescriptors(), before, "the opened file was left open");
+  for (const [from, fail, expected] of [[1, true, [500, "READ_FAILED"]], [2, true, [500, "READ_FAILED"]], [2, false, [409, "FILE_CHANGED"]]]) {
+    for (const name of ["a.md", "a.png"]) {
+      // Only the file's own open arms the schedule, not its folder's.
+      const files = createFileBrowser({ hooks: { afterOpen: (real) => { if (real.endsWith(name)) { schedule = { from, fail }; file = null; reads = 0; } } } });
+      const { request, response } = capture();
+      const request_ = name === "a.md" ? files.preview(root, name) : files.raw(root, name, null, request, response);
+      await refusal(request_);
+      const record = files.operations().at(-1);
+      assert.deepEqual([record.status, record.code], expected, `${name} from status read ${from}`);
+      schedule = null;
+      assert.equal(openDescriptors(), before, `${name} from status read ${from}: the opened file was left open`);
+    }
+  }
 });
 
 test("a name with a drive-like prefix is browsable outside Windows, where only real outside paths are refused", { skip: (process.platform === "win32" && "a drive prefix is a real location on Windows") || listable.skip }, async (t) => {

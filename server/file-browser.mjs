@@ -274,9 +274,13 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
       response.setHeader("Content-Type", kind.mimeType);
       response.setHeader("Content-Length", String(opened.info.size));
       // Headers are sent; a failure now can only end the response, short.
-      try { await pipeline(rawBody(opened, hooks), response); record.bytes = opened.info.size; }
+      // pipeline ends the response when the file fails to read, so only a
+      // response that closed while the file still read was the client's.
+      let readFailed = false;
+      const body = rawBody(opened, hooks);
+      try { await pipeline(async function* () { try { yield* body; } catch (error) { readFailed = true; throw error; } }, response); record.bytes = opened.info.size; }
       catch (error) {
-        record.code = error?.details?.code ?? (response.destroyed ? "CLIENT_CLOSED" : "STREAM_FAILED");
+        record.code = error?.details?.code ?? (response.destroyed && !readFailed ? "CLIENT_CLOSED" : "STREAM_FAILED");
         if (!response.destroyed) response.destroy(error);
       }
     } finally {
@@ -326,7 +330,9 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
     return Promise.all(streaming.values()).then(() => {});
   }
 
-  return { list, preview, raw, shutdown, operations: () => [...operations], rawStats: () => ({ active: rawStreams, waiting: waiting.length }) };
+  // Records a request refused before it reached the browser, then rethrows its error.
+  const refuse = (operation, root, file, operationId, error) => track(operation, root, file, operationId, () => { throw error; });
+  return { list, preview, raw, refuse, shutdown, operations: () => [...operations], rawStats: () => ({ active: rawStreams, waiting: waiting.length }) };
 }
 
 function describe(relative, opened, kind) {
@@ -354,7 +360,7 @@ async function classify(relative, { handle, info }, limits, withText) {
     // What decoding would allocate is bounded before a decoder sees it. An
     // SVG has no pixels of its own: it is drawn at the size it is shown.
     if (extension === ".svg") return { previewType: "image", mimeType: image[0] };
-    const [width, height] = imageSize(extension, sample) ?? [];
+    const [width, height] = imageSize(extension, sample, sample.length === info.size) ?? [];
     if (!(width > 0 && height > 0)) return { previewType: "unsupported", reason: `This ${format} image's size cannot be read` };
     if (width * height > limits.imagePixels) return { previewType: "oversized", width, height, pixelLimit: limits.imagePixels, reason: `The image is ${width} × ${height} pixels, over the preview limit of ${limits.imagePixels} pixels` };
     return { previewType: "image", mimeType: image[0], width, height };
@@ -409,7 +415,8 @@ async function openFile(binding, relative, hooks) {
       close: async () => { try { await handle?.close(); } finally { await release(); } },
     };
   } catch (error) {
-    await target.close();
+    // A file opened before a later check failed is closed with its folder.
+    try { await handle?.close(); } finally { await target.close(); }
     throw error;
   }
 }
@@ -893,24 +900,25 @@ async function readBytes(handle, length) {
 function fileVersion(info) { return [info.size, info.mtimeNs, info.ctimeNs, info.ino, info.dev].map((value) => value.toString(36)).join("-"); }
 // An AVIF file starts with an ftyp box naming avif or avis as its major
 // brand or as one of its compatible brands (a major brand may be mif1).
-function isAvif(bytes) {
-  if (ascii(bytes, 4, 8) !== "ftyp") return false;
+function avifBrands(bytes) {
+  if (ascii(bytes, 4, 8) !== "ftyp") return [];
   const size = Math.min(bytes.readUInt32BE(0), bytes.length);
   const brands = [ascii(bytes, 8, 12)];
   for (let offset = 16; offset + 4 <= size; offset += 4) brands.push(ascii(bytes, offset, offset + 4));
-  return brands.some((brand) => brand === "avif" || brand === "avis");
+  return brands;
 }
+function isAvif(bytes) { return avifBrands(bytes).some((brand) => brand === "avif" || brand === "avis"); }
 // The pixel size an image declares ahead of its image data, read from its
 // first bytes; null when it is not there. The decoder's canvas counts: a
 // GIF's first frame widens it, an ICO entry or an AVIF item (a grid or a
 // tile) may be the largest, and a BMP inside an ICO counts at full height.
-function imageSize(extension, b) {
+function imageSize(extension, b, whole) {
   if (extension === ".png") return b.length >= 24 && ascii(b, 12, 16) === "IHDR" ? [b.readUInt32BE(16), b.readUInt32BE(20)] : null;
   if (extension === ".gif") return gifSize(b);
   if (extension === ".bmp") return bmpSize(b, 14);
   if (extension === ".webp") return webpSize(b);
   if (extension === ".ico") return icoSize(b);
-  if (extension === ".avif") return avifSize(b);
+  if (extension === ".avif") return avifSize(b, whole);
   return jpegSize(b);
 }
 function larger(left, right) { return !left || (right && right[0] * right[1] > left[0] * left[1]) ? right : left; }
@@ -954,26 +962,36 @@ function icoSize(b) {
   }
   return largest;
 }
-function avifSize(b) {
+// A decoder (libavif in Chromium and WebKit, and Firefox) shows the primary
+// item, sized by the items' ispe properties (meta > iprp > ipco), when the
+// major brand is avif and meta names one (pitm); otherwise it shows a moov
+// track, if there is one. A track's frame size is not read here, so a
+// sequence (avis), or a file whose moov could lie past the sample, is
+// unsupported, as is one whose meta box is cut short by the sample.
+function avifSize(b, whole) {
+  const brands = avifBrands(b);
+  if (brands.includes("avis")) return null;
+  const inside = ["meta", "iprp", "ipco"];
   let largest = null;
-  // Items' properties are in meta > iprp > ipco; nothing deeper is read.
+  let primary = false;
+  let mayHaveTrack = !whole;
+  // False when a box holding item properties runs past its container.
   const visit = (start, end, depth) => {
-    for (let at = start; depth <= 3 && at + 8 <= end;) {
+    for (let at = start; at + 8 <= end;) {
       let size = b.readUInt32BE(at);
       let header = 8;
-      if (size === 1 && at + 16 <= end) { size = Number(b.readBigUInt64BE(at + 8)); header = 16; } else if (size === 0) size = end - at;
-      if (size < header) return;
+      if (size === 1 && at + 16 <= end) { size = Number(b.readBigUInt64BE(at + 8)); header = 16; } else if (size === 0) size = whole || depth ? end - at : Infinity;
       const type = ascii(b, at + 4, at + 8);
-      const content = at + header;
-      const boxEnd = Math.min(at + size, end);
-      if (type === "meta") visit(content + 4, boxEnd, depth + 1);
-      else if (type === "iprp" || type === "ipco") visit(content, boxEnd, depth + 1);
-      else if (type === "ispe" && content + 12 <= boxEnd) largest = larger(largest, [b.readUInt32BE(content + 4), b.readUInt32BE(content + 8)]);
+      if (size < header || at + size > end) { mayHaveTrack = true; return depth === 0 && type !== "meta"; }
+      if (depth === 0 && type === "moov") mayHaveTrack = true;
+      primary ||= depth === 1 && type === "pitm";
+      if (type === inside[depth] && !visit(at + header + (depth ? 0 : 4), at + size, depth + 1)) return false;
+      if (type === "ispe" && depth === 3) { if (size < header + 12) return false; largest = larger(largest, [b.readUInt32BE(at + header + 4), b.readUInt32BE(at + header + 8)]); }
       at += size;
     }
+    return true;
   };
-  visit(0, b.length, 0);
-  return largest;
+  return visit(0, b.length, 0) && ((brands[0] === "avif" && primary) || !mayHaveTrack) ? largest : null;
 }
 // An SVG's first element is <svg> (or a prefixed svg element), after only
 // a byte order mark, an XML declaration, processing instructions, comments,

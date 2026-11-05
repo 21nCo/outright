@@ -3848,12 +3848,20 @@ test("file routes browse only a discovered project worktree and serve previews f
   // Without a root handle nothing below the root is looked at, so a missing name answers alike.
   assert.deepEqual([missing.statusCode, missing.body.code], anchored ? [404, "MISSING"] : [501, "PREVIEW_UNAVAILABLE"], missing.raw);
   const outsider = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-undiscovered-")));
+  let undiscovered;
   try {
-    const undiscovered = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: outsider }));
+    undiscovered = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: outsider }));
     assert.equal(undiscovered.statusCode, 403, undiscovered.raw);
   } finally { rmSync(outsider, { recursive: true, force: true }); }
   const otherProject = await callRuntime(runtime, "GET", at("/api/files", { projectId: "another-project", path: worktree.path }));
   assert.equal(otherProject.statusCode, 400, otherProject.raw);
+  const noPath = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, file: "README.md" }));
+  assert.equal(noPath.statusCode, 400, noPath.raw);
+  // A request refused before the file browser looks at the worktree is recorded too.
+  for (const [refused, operation, status] of [[undiscovered, "list", 403], [otherProject, "list", 400], [noPath, "preview", 400]]) {
+    const record = runtime.files.operations().find((item) => item.operationId === refused.headers["X-Outright-Operation"]);
+    assert.deepEqual([record?.operation, record?.status, record?.outcome], [operation, status, "failed"], refused.raw);
+  }
   const escaping = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: worktree.path, dir: ".." }));
   assert.deepEqual([escaping.statusCode, escaping.body.code], [403, "PATH_OUTSIDE"]);
 }));
