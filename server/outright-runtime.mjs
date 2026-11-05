@@ -389,7 +389,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
 
   // File browsing reads one worktree of the latest scan. Expanding a folder
   // must not start a project rescan, so only a runtime with no scan yet waits
-  // for one. Each refusal has a code, which its operation record keeps.
+  // for one.
   async function resolveBrowseTarget(projectId, worktreePath) {
     if (!worktreePath) throw apiError(400, "Missing path", { code: "PATH_REQUIRED" });
     if (!latestScan) await projects();

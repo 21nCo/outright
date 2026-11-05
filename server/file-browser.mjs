@@ -122,8 +122,7 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
   } };
   const bind = (root, unavailable = previewUnavailable) => bindRoot(root, hooks, handlePaths, { ...probes, unavailable });
   // One record per request, kept for the last operationRecords requests:
-  // which worktree and path, how long, and how it ended. Never contents. An
-  // error without a code is READ_FAILED from the system, INTERNAL otherwise.
+  // which worktree and path, how long, and how it ended. Never contents.
   const operations = [];
   async function track(operation, root, file, operationId, work) {
     const record = { operationId: operationId ?? randomUUID(), operation, root, path: typeof file === "string" ? file.slice(0, 512) : "" };
@@ -357,13 +356,10 @@ async function classify(relative, { handle, info }, limits, withText) {
     const format = extension.slice(1).toUpperCase();
     if (!image[1](sample)) return { previewType: "unsupported", reason: `The contents are not a ${format} image` };
     if (info.size > limits.imageBytes) return { previewType: "oversized", limit: limits.imageBytes };
-    // What decoding would allocate is bounded before a decoder sees it. An
-    // SVG is drawn at the size it is shown, but a raster it embeds decodes at
-    // its own, and only a data: URL can bring one (an SVG image loads nothing,
-    // a raw SVG only bounded same-origin files): only an SVG read whole, with
-    // no "data:" nor what could spell it (a character or declared entity
-    // reference, a CSS escape, another encoding's control bytes; URLs drop
-    // tabs and newlines), is shown.
+    // An SVG is drawn at the size it is shown, but a raster it embeds decodes
+    // at its own. Only a data: URL can bring one (an SVG image loads nothing,
+    // a raw SVG only bounded same-origin files), so an SVG must be read whole
+    // with nothing that could spell one (URLs drop tabs and newlines).
     if (extension === ".svg") {
       if (sample.length < info.size) return { previewType: "oversized", limit: sample.length };
       if (/[Dd][Aa][Tt][Aa]:|&(?!(?:amp|lt|gt|quot|apos);)|\\|[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(sample.toString("latin1").replace(/[\t\n\r]/g, ""))) return { previewType: "unsupported", reason: "This SVG may embed an image whose size cannot be checked" };
@@ -738,12 +734,13 @@ async function proveHeld(binding, held) {
 }
 
 // The ctimes of the root and of each folder walked to the held one, each
-// required to be the folder walked, with a sub-second ctime. macOS reads each by identity (/.vol).
-// Linux goes down from the root's descriptor: each folder is opened by its
-// one walked name inside the descriptor of the one above it, never following
-// a link, so no link or name above it can redirect the lookup, and a folder
-// no longer at its walked place is PATH_CHANGED here too. Only folders the
-// walk passed through are searched, and one descriptor more is held.
+// required to be the folder walked, and to have a fraction of a second (an
+// old inode may not). macOS reads each by identity (/.vol). Linux goes down
+// from the root's descriptor: each folder is opened by its one walked name
+// inside the descriptor of the one above it, never following a link, so no
+// link or name above it can redirect the lookup, and a folder no longer at
+// its walked place is PATH_CHANGED here too. Only folders the walk passed
+// through are searched, and one descriptor more is held.
 async function chainTimes(binding, held) {
   let infos;
   if (process.platform !== "linux") {
@@ -774,8 +771,7 @@ async function chainTimes(binding, held) {
 // own ctime has a fraction of a second (ext2, ext3 and ext4 with small
 // inodes keep whole seconds). Nothing is read through a folder on any other
 // volume (HFS+, FAT, exFAT, SMB, NFS, FUSE), as on a host without a root
-// handle (OUT-144). Checked once per volume and request; an inode of an old
-// format can still keep whole seconds, so every ctime used is checked too.
+// handle (OUT-144). Checked once per volume and request.
 const LINUX_NANOSECOND_TYPES = new Set([0xef53, 0x58465342, 0x9123683e, 0x01021994, 0x794c7630, 0xf2f52010, 0x2fc12fc1, 0xca451a4e]);
 export function nanosecondVolume(type, ctimeNs, reference, platform = process.platform) {
   if (type === null || wholeSecond(ctimeNs)) return false;
