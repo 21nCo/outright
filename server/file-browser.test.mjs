@@ -443,6 +443,9 @@ test("each request leaves one bounded operation record, named by its id, without
   assert.deepEqual(files.operations().map((record) => record.operationId), ["op-preview", "op-missing", "op-raw"]);
   await files.list(root);
   assert.match(files.operations().at(-1).operationId, /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/);
+  // A failure that is not the file system's is not recorded as a read failure.
+  await refusal(files.refuse("list", root, "", "op-bug", new TypeError("a bug")));
+  assert.deepEqual([files.operations().at(-1).status, files.operations().at(-1).code], [500, "INTERNAL"]);
 });
 
 test("a raw body whose file fails to read mid-stream is recorded as a failed stream, not a client that left", previewable, async (t) => {
@@ -571,6 +574,104 @@ test("an AVIF is sized only from metadata it read whole, and never when a decode
     assert.deepEqual(await refusal(files.raw(root, name, null, request, response)).then((error) => [error.status, error.code]), [415, "NOT_RAW_PREVIEW"], name);
     assert.equal(body().length, 0, name);
   }
+});
+
+test("an SVG that could embed a raster is neither previewed nor served, however the data: URL is spelled, and a plain SVG still is", previewable, async (t) => {
+  const { root, write } = fixture(t);
+  // An 8000 × 8000 PNG header is a few bytes; a decoder would allocate its full size.
+  const big = `data:image/png;base64,${png(8000, 8000).toString("base64")}`;
+  const svg = (body, prolog = "") => `${prolog}<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">${body}</svg>`;
+  const cases = [
+    ["image.svg", svg(`<image href="${big}" width="10" height="10"/>`), "unsupported"],
+    ["upper.svg", svg(`<image xlink:href="DATA:${big.slice(5)}"/>`), "unsupported"],
+    ["reference.svg", svg(`<image href="&#100;ata:${big.slice(5)}"/>`), "unsupported"],
+    ["entity.svg", svg(`<image href="&d;&t;${big.slice(5)}"/>`, '<!DOCTYPE svg [<!ENTITY d "da"><!ENTITY t "ta:">]>'), "unsupported"],
+    ["escape.svg", svg(`<rect style="fill:url('\\64 ata:${big.slice(5)}')"/>`), "unsupported"],
+    ["tab.svg", svg(`<style>rect{fill:url("da\tta:${big.slice(5)}")}</style><rect/>`), "unsupported"],
+    ["jis.svg", svg(`<image href="d\x1b(Jata:${big.slice(5)}"/>`), "unsupported"],
+    // Read whole or not at all: what follows the scanned bytes could embed one.
+    ["long.svg", svg(`<!-- ${"x".repeat(1100 * 1024)} --><image href="${big}"/>`), "oversized"],
+    ["plain.svg", svg('<defs><linearGradient id="g"/></defs><rect fill="url(#g)"/><text>A &amp; B &lt; C</text>'), "image"],
+  ];
+  const files = createFileBrowser();
+  for (const [name, content, type] of cases) {
+    write(name, content);
+    const preview = await files.preview(root, name);
+    assert.equal(preview.previewType, type, name);
+    const { request, response, body } = capture();
+    if (type === "image") {
+      await files.raw(root, name, preview.version, request, response);
+      assert.equal(body().toString(), content, name);
+      // A raw SVG opened as a page loads no data: URL either.
+      assert.doesNotMatch(response.headers["content-security-policy"], /data:/);
+      continue;
+    }
+    const expected = type === "oversized" ? [413, "OVERSIZED"] : [415, "NOT_RAW_PREVIEW"];
+    assert.deepEqual(await refusal(files.raw(root, name, null, request, response)).then((error) => [error.status, error.code]), expected, name);
+    assert.equal(body().length, 0, name);
+  }
+});
+
+test("a file or a folder whose own ctime keeps whole seconds is never read, even on a volume that keeps nanoseconds", linkable, async (t) => {
+  const { root, write } = fixture(t);
+  write("coarse/a.md", "# A\n");
+  write("coarse.png", PNG);
+  write("fine/b.md", "# B\n");
+  // As an inode of an older format would report (ext4 converted from ext3, FUSE).
+  const coarse = new Set([path.join(root, "coarse"), path.join(root, "coarse.png")].map((target) => statSync(target, { bigint: true }).ino));
+  const floor = (info) => (info && coarse.has(info.ino) ? Object.assign(info, { ctimeNs: info.ctimeNs - (info.ctimeNs % 1_000_000_000n) }) : info);
+  const probe = await open(root, "r");
+  const FileHandle = probe.constructor;
+  await probe.close();
+  const { stat: handleStat } = FileHandle.prototype;
+  const { stat: pathStat } = promises;
+  FileHandle.prototype.stat = async function stat(...args) { return floor(await handleStat.apply(this, args)); };
+  promises.stat = async (...args) => floor(await pathStat(...args));
+  syncBuiltinESMExports();
+  t.after(() => { FileHandle.prototype.stat = handleStat; promises.stat = pathStat; syncBuiltinESMExports(); });
+  const files = createFileBrowser();
+  assert.equal((await refusal(files.list(root, { directory: "coarse" }))).code, "LISTING_UNAVAILABLE");
+  assert.equal((await refusal(files.preview(root, "coarse/a.md"))).code, "PREVIEW_UNAVAILABLE");
+  assert.equal((await refusal(files.preview(root, "coarse.png"))).code, "PREVIEW_UNAVAILABLE");
+  const { request, response, body } = capture();
+  assert.equal((await refusal(files.raw(root, "coarse.png", null, request, response))).code, "PREVIEW_UNAVAILABLE");
+  assert.equal(body().length, 0);
+  // Its neighbours, and the root that lists it, are read as before.
+  assert.equal((await files.preview(root, "fine/b.md")).text, "# B\n");
+  assert.deepEqual((await files.list(root)).entries.map((entry) => entry.name), ["coarse", "fine", "coarse.png"]);
+});
+
+test("on Linux, a proof that fails to release a folder on its chain still closes the next one", { skip: (process.platform !== "linux" && "the descriptor walk is Linux's proof") || linkable.skip }, async (t) => {
+  const { root, write } = fixture(t);
+  write("a/b/c.md", "# c\n");
+  const original = promises.open;
+  let failed = 0;
+  // The proof's walk opens "a", then "b" inside it, then releases "a": that
+  // release really closes "a", then reports a failure once. The walk's
+  // handles are kept here, so none is closed by garbage collection instead.
+  const walked = [];
+  promises.open = (...args) => {
+    const walk = new Error().stack.includes("chainTimes");
+    return original(...args).then((handle) => {
+      if (walk) walked.push(handle);
+      if (walk && String(args[0]).endsWith("/a")) {
+        const close = handle.close.bind(handle);
+        handle.close = async () => { await close(); if (failed) return; failed += 1; throw Object.assign(new Error("injected close failure"), { code: "EIO" }); };
+      }
+      return handle;
+    });
+  };
+  syncBuiltinESMExports();
+  const restore = () => { promises.open = original; syncBuiltinESMExports(); };
+  t.after(restore);
+  const files = createFileBrowser();
+  const before = openDescriptors();
+  await assert.rejects(files.preview(root, "a/b/c.md"), /injected close failure/);
+  assert.equal(failed, 1, "releasing a folder on the chain failed once");
+  assert.equal(walked.filter((handle) => handle.fd !== -1).length, 0, "the next folder on the chain was left open");
+  assert.equal(openDescriptors(), before, "a descriptor was left open");
+  restore();
+  assert.equal((await files.preview(root, "a/b/c.md")).text, "# c\n");
 });
 
 test("an in-place rewrite of the same size with its mtime put back is a new version, and raw refuses the old one", previewable, async (t) => {
@@ -1222,7 +1323,7 @@ test("an opened file whose status cannot be read, or never settles, is closed be
     if (schedule && args[0]?.bigint) file ??= this;
     if (!schedule || this !== file || ++reads < schedule.from) return original.apply(this, args);
     if (schedule.fail) throw Object.assign(new Error("injected"), { code: "EIO" });
-    return Object.assign(await original.apply(this, args), { ctimeNs: BigInt(Date.now()) * 1_000_000n });
+    return Object.assign(await original.apply(this, args), { ctimeNs: BigInt(Date.now()) * 1_000_000n + 1n });
   };
   const before = openDescriptors();
   for (const [from, fail, expected] of [[1, true, [500, "READ_FAILED"]], [2, true, [500, "READ_FAILED"]], [2, false, [409, "FILE_CHANGED"]]]) {

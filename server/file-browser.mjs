@@ -59,7 +59,7 @@ const SVG_SAMPLE_BYTES = 1024 * 1024;
 const RAW_HEADERS = Object.freeze({
   "Cache-Control": "no-store",
   "X-Content-Type-Options": "nosniff",
-  "Content-Security-Policy": "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox",
+  "Content-Security-Policy": "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox",
   "Cross-Origin-Resource-Policy": "same-origin",
   "Content-Disposition": "inline",
 });
@@ -120,15 +120,16 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
     const probe = rootType ??= volumeType("/").then((type) => { if (type === null && rootType === probe) rootType = undefined; return type; });
     return probe;
   } };
-  const bind = (root) => bindRoot(root, hooks, handlePaths, probes);
+  const bind = (root, unavailable = previewUnavailable) => bindRoot(root, hooks, handlePaths, { ...probes, unavailable });
   // One record per request, kept for the last operationRecords requests:
-  // which worktree and path, how long, and how it ended. Never contents.
+  // which worktree and path, how long, and how it ended. Never contents. An
+  // error without a code is READ_FAILED from the system, INTERNAL otherwise.
   const operations = [];
   async function track(operation, root, file, operationId, work) {
     const record = { operationId: operationId ?? randomUUID(), operation, root, path: typeof file === "string" ? file.slice(0, 512) : "" };
     const started = performance.now();
     try { return await work(record); }
-    catch (error) { record.status = error?.statusCode ?? 500; record.code ??= error?.details?.code ?? "READ_FAILED"; throw error; }
+    catch (error) { record.status = error?.statusCode ?? 500; record.code ??= error?.details?.code ?? (/^E[A-Z\d]+$/.test(error?.code) ? "READ_FAILED" : "INTERNAL"); throw error; }
     finally {
       record.outcome = record.code === "CLIENT_CLOSED" ? "cancelled" : record.code ? "failed" : "ok";
       record.elapsedMs = Math.round(performance.now() - started);
@@ -149,7 +150,7 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
     const relative = relativePath(directory, limits, true);
     const pageSize = pageLimit(limit, limits);
     const after = parseCursor(cursor);
-    const binding = await bind(root);
+    const binding = await bind(root, listingUnavailable);
     try {
       // Without a root anchor nothing below the root is looked at (OUT-144).
       if (!binding.anchor) throw listingUnavailable();
@@ -357,8 +358,17 @@ async function classify(relative, { handle, info }, limits, withText) {
     if (!image[1](sample)) return { previewType: "unsupported", reason: `The contents are not a ${format} image` };
     if (info.size > limits.imageBytes) return { previewType: "oversized", limit: limits.imageBytes };
     // What decoding would allocate is bounded before a decoder sees it. An
-    // SVG has no pixels of its own: it is drawn at the size it is shown.
-    if (extension === ".svg") return { previewType: "image", mimeType: image[0] };
+    // SVG is drawn at the size it is shown, but a raster it embeds decodes at
+    // its own, and only a data: URL can bring one (an SVG image loads nothing,
+    // a raw SVG only bounded same-origin files): only an SVG read whole, with
+    // no "data:" nor what could spell it (a character or declared entity
+    // reference, a CSS escape, another encoding's control bytes; URLs drop
+    // tabs and newlines), is shown.
+    if (extension === ".svg") {
+      if (sample.length < info.size) return { previewType: "oversized", limit: sample.length };
+      if (/[Dd][Aa][Tt][Aa]:|&(?!(?:amp|lt|gt|quot|apos);)|\\|[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(sample.toString("latin1").replace(/[\t\n\r]/g, ""))) return { previewType: "unsupported", reason: "This SVG may embed an image whose size cannot be checked" };
+      return { previewType: "image", mimeType: image[0] };
+    }
     const [width, height] = imageSize(extension, sample, sample.length === info.size) ?? [];
     if (!(width > 0 && height > 0)) return { previewType: "unsupported", reason: `This ${format} image's size cannot be read` };
     if (width * height > limits.imagePixels) return { previewType: "oversized", width, height, pixelLimit: limits.imagePixels, reason: `The image is ${width} × ${height} pixels, over the preview limit of ${limits.imagePixels} pixels` };
@@ -492,9 +502,7 @@ async function resolveContained(binding, relative, hooks, noun, from = rootFolde
       if (step.expect && !sameObject(info, step.expect)) throw pathChanged();
       // A folder on another volume (one mounted inside the worktree) must be provable too.
       // So must a file (a file bind mount), whose version is its ctime.
-      if (info.dev !== binding.identity.dev && !(await provableVolume(binding, info, at))) {
-        throw noun === "Folder" ? listingUnavailable() : previewUnavailable();
-      }
+      if (info.dev !== binding.identity.dev && !(await provableVolume(binding, info, at))) throw binding.unavailable();
       if (destination !== undefined) {
         if (step.last) requestedLink = true;
         if (++links > MAX_LINKS) throw fileError(409, `${relative} is a link that loops`, "LINK_LOOP");
@@ -551,11 +559,12 @@ function underRoot(root, parts) {
 
 // A file's status once its ctime is older than SETTLE_NS, so that any write
 // after it gives the file a new version (see proveHeld); a file written too
-// often to settle is FILE_CHANGED.
+// often to settle is FILE_CHANGED, one with a whole-second ctime unavailable.
 async function settledStat(handle) {
   for (let waits = 0; ; waits += 1) {
     const started = nowNs();
     const info = await handle.stat({ bigint: true });
+    if (wholeSecond(info.ctimeNs)) throw previewUnavailable();
     if (info.ctimeNs <= started - SETTLE_NS) return info;
     if (waits >= PROOF_ATTEMPTS) throw fileChanged();
     await sleep(Number(SETTLE_NS / 1_000_000n));
@@ -729,7 +738,7 @@ async function proveHeld(binding, held) {
 }
 
 // The ctimes of the root and of each folder walked to the held one, each
-// required to be the folder walked. macOS reads each by identity (/.vol).
+// required to be the folder walked, with a sub-second ctime. macOS reads each by identity (/.vol).
 // Linux goes down from the root's descriptor: each folder is opened by its
 // one walked name inside the descriptor of the one above it, never following
 // a link, so no link or name above it can redirect the lookup, and a folder
@@ -744,9 +753,9 @@ async function chainTimes(binding, held) {
     let above = null;
     try {
       for (let depth = 1, at = binding.anchor; depth < held.chain.length && infos[depth - 1] && sameObject(infos[depth - 1], held.chain[depth - 1]); depth += 1) {
-        const next = await open(`${at}/${held.canonical[depth - 1]}`, openFlags(true, true)).catch(() => null);
-        await above?.close();
-        above = next;
+        const previous = above;
+        above = await open(`${at}/${held.canonical[depth - 1]}`, openFlags(true, true)).catch(() => null);
+        await previous?.close();
         if (!above) break;
         at = `/proc/self/fd/${above.fd}`;
         infos[depth] = await above.stat({ bigint: true }).catch(() => null);
@@ -754,6 +763,7 @@ async function chainTimes(binding, held) {
     } finally { await above?.close(); }
   }
   if (held.chain.some((walked, depth) => !infos[depth] || !sameObject(infos[depth], walked))) throw pathChanged();
+  if (infos.some((info) => wholeSecond(info.ctimeNs))) throw binding.unavailable();
   return infos.map((info) => info.ctimeNs);
 }
 
@@ -764,13 +774,15 @@ async function chainTimes(binding, held) {
 // own ctime has a fraction of a second (ext2, ext3 and ext4 with small
 // inodes keep whole seconds). Nothing is read through a folder on any other
 // volume (HFS+, FAT, exFAT, SMB, NFS, FUSE), as on a host without a root
-// handle (OUT-144). Checked once per volume and request.
+// handle (OUT-144). Checked once per volume and request; an inode of an old
+// format can still keep whole seconds, so every ctime used is checked too.
 const LINUX_NANOSECOND_TYPES = new Set([0xef53, 0x58465342, 0x9123683e, 0x01021994, 0x794c7630, 0xf2f52010, 0x2fc12fc1, 0xca451a4e]);
 export function nanosecondVolume(type, ctimeNs, reference, platform = process.platform) {
-  if (type === null || ctimeNs % 1_000_000_000n === 0n) return false;
+  if (type === null || wholeSecond(ctimeNs)) return false;
   if (platform === "darwin") return reference !== null && type === reference;
   return platform === "linux" && LINUX_NANOSECOND_TYPES.has(Number(type) >>> 0);
 }
+function wholeSecond(ctimeNs) { return ctimeNs % 1_000_000_000n === 0n; }
 async function provableVolume(binding, info, at) {
   if (!binding.volumes.has(info.dev)) {
     const [type, reference] = await Promise.all([binding.volumeType(process.platform === "darwin" ? `/.vol/${info.dev}/${info.ino}` : at), binding.referenceType()]);

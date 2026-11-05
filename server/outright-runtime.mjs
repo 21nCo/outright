@@ -389,15 +389,16 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
 
   // File browsing reads one worktree of the latest scan. Expanding a folder
   // must not start a project rescan, so only a runtime with no scan yet waits
-  // for one.
+  // for one. Each refusal has a code, which its operation record keeps.
   async function resolveBrowseTarget(projectId, worktreePath) {
+    if (!worktreePath) throw apiError(400, "Missing path", { code: "PATH_REQUIRED" });
     if (!latestScan) await projects();
-    const canonical = await git.requireWorktree(worktreePath);
+    const canonical = await git.requireWorktree(worktreePath).catch((error) => { throw error.statusCode === 403 ? apiError(403, error.message, { code: "WORKTREE_UNKNOWN" }) : error; });
     const project = latestScan?.projects.find((item) => item.id === projectId);
     for (const worktree of project?.worktrees ?? []) {
       if (await canonicalOf(worktree.path) === canonical) return canonical;
     }
-    throw apiError(400, "Destination is not a discovered project worktree");
+    throw apiError(400, "Destination is not a discovered project worktree", { code: "PROJECT_MISMATCH" });
   }
 
   // A `fresh` scan starts after the call: one already running may have read
@@ -1191,7 +1192,7 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
         // The response names the file browser's record of it, also when it is refused.
         const operation = { operationId: randomUUID() };
         response.setHeader("X-Outright-Operation", operation.operationId);
-        const root = await Promise.resolve().then(() => resolveBrowseTarget(url.searchParams.get("projectId"), requiredQuery(url, "path"))).catch((error) => files.refuse(
+        const root = await Promise.resolve().then(() => resolveBrowseTarget(url.searchParams.get("projectId"), url.searchParams.get("path"))).catch((error) => files.refuse(
           filesMatch[1] ?? "list", url.searchParams.get("path"), url.searchParams.get(filesMatch[1] ? "file" : "dir"), operation.operationId, error));
         if (filesMatch[1] === "preview") return json(response, 200, await files.preview(root, url.searchParams.get("file"), operation));
         if (filesMatch[1] === "raw") { await files.raw(root, url.searchParams.get("file"), url.searchParams.get("version"), request, response, operation); return true; }

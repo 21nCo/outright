@@ -3858,9 +3858,9 @@ test("file routes browse only a discovered project worktree and serve previews f
   const noPath = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, file: "README.md" }));
   assert.equal(noPath.statusCode, 400, noPath.raw);
   // A request refused before the file browser looks at the worktree is recorded too.
-  for (const [refused, operation, status] of [[undiscovered, "list", 403], [otherProject, "list", 400], [noPath, "preview", 400]]) {
+  for (const [refused, operation, status, code] of [[undiscovered, "list", 403, "WORKTREE_UNKNOWN"], [otherProject, "list", 400, "PROJECT_MISMATCH"], [noPath, "preview", 400, "PATH_REQUIRED"]]) {
     const record = runtime.files.operations().find((item) => item.operationId === refused.headers["X-Outright-Operation"]);
-    assert.deepEqual([record?.operation, record?.status, record?.outcome], [operation, status, "failed"], refused.raw);
+    assert.deepEqual([record?.operation, record?.status, record?.outcome, record?.code, refused.body.code], [operation, status, "failed", code, code], refused.raw);
   }
   const escaping = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: worktree.path, dir: ".." }));
   assert.deepEqual([escaping.statusCode, escaping.body.code], [403, "PATH_OUTSIDE"]);
