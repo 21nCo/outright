@@ -17,6 +17,7 @@ import { AGENT_SUPERVISOR, createAgentManager, LAUNCH_AUTHORIZED_CONTROL } from 
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { openTerminalHistory } from "./terminal-history.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
+import { createFileBrowser } from "./file-browser.mjs";
 import { randomUUID } from "node:crypto";
 import { writeNodeCommand } from "../tests/fixtures/node-command.mjs";
 
@@ -3802,6 +3803,38 @@ async function within(promise, what, signal, ms = 15_000) {
       .then(() => assert.fail(`timed out waiting for ${what}`))]);
   } finally { settled.abort(); }
 }
+
+test("file routes browse only a discovered project worktree and serve previews from it", withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  writeFileSync(path.join(worktree.path, "README.md"), "# Fixture\n");
+  mkdirSync(path.join(worktree.path, "docs"));
+  const at = (route, parameters) => `${route}?${new URLSearchParams(parameters)}`;
+  const listed = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: worktree.path }));
+  // A host without a handle-bound folder path (Windows, among others) refuses
+  // its folders and files (OUT-144); probed, not inferred from the platform.
+  const anchored = await createFileBrowser().list(worktree.path).then(() => true, (error) => error.details?.code !== "LISTING_UNAVAILABLE");
+  if (process.platform === "win32") assert.equal(anchored, false, "Windows cannot read through a root handle");
+  if (!anchored) assert.deepEqual([listed.statusCode, listed.body.code], [501, "LISTING_UNAVAILABLE"], listed.raw);
+  else {
+    assert.equal(listed.statusCode, 200, listed.raw);
+    assert.deepEqual(listed.body.entries.map((entry) => [entry.name, entry.kind]), [["docs", "directory"], ["README.md", "file"]]);
+  }
+  const preview = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "README.md" }));
+  // Nor can it prove where an opened file is, so files are not previewed.
+  if (!anchored) assert.deepEqual([preview.statusCode, preview.body.code], [501, "PREVIEW_UNAVAILABLE"], preview.raw);
+  else assert.deepEqual([preview.statusCode, preview.body.previewType, preview.body.text], [200, "markdown", "# Fixture\n"]);
+  const missing = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "gone.md" }));
+  // Without a root handle nothing below the root is looked at, so a missing name answers alike.
+  assert.deepEqual([missing.statusCode, missing.body.code], anchored ? [404, "MISSING"] : [501, "PREVIEW_UNAVAILABLE"], missing.raw);
+  const outsider = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-undiscovered-")));
+  try {
+    const undiscovered = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: outsider }));
+    assert.equal(undiscovered.statusCode, 403, undiscovered.raw);
+  } finally { rmSync(outsider, { recursive: true, force: true }); }
+  const otherProject = await callRuntime(runtime, "GET", at("/api/files", { projectId: "another-project", path: worktree.path }));
+  assert.equal(otherProject.statusCode, 400, otherProject.raw);
+  const escaping = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: worktree.path, dir: ".." }));
+  assert.deepEqual([escaping.statusCode, escaping.body.code], [403, "PATH_OUTSIDE"]);
+}));
 
 let checkpointAgentOptions;
 let checkpointGate = null;
