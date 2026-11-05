@@ -1189,10 +1189,13 @@ export function createOutrightRuntime({ configUrl, allowedHosts = runtimeAllowed
       const filesMatch = /^\/api\/files(?:\/(preview|raw))?$/.exec(url.pathname);
       if (filesMatch && request.method === "GET") {
         const root = await resolveBrowseTarget(url.searchParams.get("projectId"), requiredQuery(url, "path"));
-        if (filesMatch[1] === "preview") return json(response, 200, await files.preview(root, url.searchParams.get("file")));
-        if (filesMatch[1] === "raw") { await files.raw(root, url.searchParams.get("file"), url.searchParams.get("version"), request, response); return true; }
+        // The response names the file browser's record of it, also when it is refused.
+        const operation = { operationId: randomUUID() };
+        response.setHeader("X-Outright-Operation", operation.operationId);
+        if (filesMatch[1] === "preview") return json(response, 200, await files.preview(root, url.searchParams.get("file"), operation));
+        if (filesMatch[1] === "raw") { await files.raw(root, url.searchParams.get("file"), url.searchParams.get("version"), request, response, operation); return true; }
         return json(response, 200, await files.list(root, { directory: url.searchParams.get("dir") ?? "", cursor: url.searchParams.get("cursor"),
-          limit: url.searchParams.get("limit"), showHidden: url.searchParams.get("hidden") === "true" }));
+          limit: url.searchParams.get("limit"), showHidden: url.searchParams.get("hidden") === "true", ...operation }));
       }
       const checkpointMatch = /^\/api\/worktrees\/checkpoints(?:\/(inspect|diff|preview|restore|recover))?$/.exec(url.pathname);
       if (checkpointMatch && request.method === "GET" && ["inspect", "diff", undefined].includes(checkpointMatch[1])) {

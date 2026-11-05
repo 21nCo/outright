@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
-import { PassThrough, Readable } from "node:stream";
+import { PassThrough, Readable, Writable } from "node:stream";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
@@ -3822,6 +3822,28 @@ test("file routes browse only a discovered project worktree and serve previews f
   // Nor can it prove where an opened file is, so files are not previewed.
   if (!anchored) assert.deepEqual([preview.statusCode, preview.body.code], [501, "PREVIEW_UNAVAILABLE"], preview.raw);
   else assert.deepEqual([preview.statusCode, preview.body.previewType, preview.body.text], [200, "markdown", "# Fixture\n"]);
+  // Every response the file browser answered names its operation record.
+  const operationId = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/;
+  for (const answered of [listed, preview]) assert.match(answered.headers["X-Outright-Operation"], operationId);
+  if (anchored) {
+    // A 1×1 PNG: its raw bytes come with their type and the sandbox headers,
+    // for the previewed version only.
+    const png = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da63f8ffff3f0005fe02fea7d6a4a70000000049454e44ae426082", "hex");
+    writeFileSync(path.join(worktree.path, "logo.png"), png);
+    const image = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "logo.png" }));
+    assert.deepEqual([image.statusCode, image.body.previewType, image.body.width, image.body.height], [200, "image", 1, 1], image.raw);
+    const chunks = [];
+    const served = new Writable({ write(chunk, _encoding, done) { chunks.push(chunk); done(); } });
+    served.headers = {};
+    served.setHeader = (name, value) => { served.headers[name.toLowerCase()] = value; };
+    await runtime.handleRequest(requestStream("GET", at("/api/files/raw", { projectId: project.id, path: worktree.path, file: "logo.png", version: image.body.version })), served);
+    assert.deepEqual([served.statusCode, served.headers["content-type"], served.headers["content-length"], served.headers["x-content-type-options"], Buffer.concat(chunks).equals(png)], [200, "image/png", String(png.length), "nosniff", true]);
+    assert.match(served.headers["content-security-policy"], /sandbox/);
+    assert.match(served.headers["x-outright-operation"], operationId);
+    const stale = await callRuntime(runtime, "GET", at("/api/files/raw", { projectId: project.id, path: worktree.path, file: "logo.png", version: `${image.body.version}-old` }));
+    assert.deepEqual([stale.statusCode, stale.body.code], [409, "FILE_CHANGED"], stale.raw);
+    assert.match(stale.headers["X-Outright-Operation"], operationId);
+  }
   const missing = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "gone.md" }));
   // Without a root handle nothing below the root is looked at, so a missing name answers alike.
   assert.deepEqual([missing.statusCode, missing.body.code], anchored ? [404, "MISSING"] : [501, "PREVIEW_UNAVAILABLE"], missing.raw);

@@ -1,14 +1,26 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { open, statfs } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
 import test from "node:test";
-import { FILE_BROWSER_LIMITS, createFileBrowser, noFollowAnyFlag, relativePath } from "./file-browser.mjs";
+import { FILE_BROWSER_LIMITS, createFileBrowser, nanosecondVolume, noFollowAnyFlag, relativePath } from "./file-browser.mjs";
 
 const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da63f8ffff3f0005fe02fea7d6a4a70000000049454e44ae426082", "hex");
+// ISO BMFF boxes, and an AVIF whose items declare these sizes (ispe).
+function box(type, ...parts) {
+  const body = Buffer.concat(parts);
+  const head = Buffer.alloc(8);
+  head.writeUInt32BE(8 + body.length);
+  head.write(type, 4, "latin1");
+  return Buffer.concat([head, body]);
+}
+function u32(...values) { const bytes = Buffer.alloc(4 * values.length); values.forEach((value, index) => bytes.writeUInt32BE(value, 4 * index)); return bytes; }
+function avif(ftyp, ...sizes) { return Buffer.concat([ftyp, box("meta", u32(0), box("iprp", box("ipco", ...sizes.map(([width, height]) => box("ispe", u32(0, width, height))))))]); }
+function png(width, height, tail = Buffer.alloc(0)) { const bytes = Buffer.from(PNG); bytes.writeUInt32BE(width, 16); bytes.writeUInt32BE(height, 20); return Buffer.concat([bytes, tail]); }
+
 // Whether this host reads through a handle on the worktree root (Linux
 // /proc, macOS 11+ /.vol): probed, not inferred from the platform name. A
 // host that cannot refuses every folder and file instead (OUT-144), which
@@ -176,7 +188,7 @@ test("previews return text only for UTF-8 text, verify image and PDF contents, a
     ["bom.svg", "\uFEFF<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>", "image"],
     ["page.svg", "<!DOCTYPE html><html><body><svg></svg></body></html>", "unsupported"],
     ["unclosed.svg", `<!-- ${"x".repeat(20_000)}`, "unsupported"],
-    ["mif1.avif", Buffer.concat([Buffer.from([0, 0, 0, 28]), Buffer.from("ftypmif1\0\0\0\0mif1miafavif"), Buffer.alloc(16)]), "image"],
+    ["mif1.avif", avif(Buffer.concat([Buffer.from([0, 0, 0, 28]), Buffer.from("ftypmif1\0\0\0\0mif1miafavif")]), [64, 48]), "image"],
     ["heic.avif", Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from("ftypheic\0\0\0\0mif1heic"), Buffer.alloc(16)]), "unsupported"],
     // A brand past the end of the ftyp box is not one of its brands.
     ["short-box.avif", Buffer.concat([Buffer.from([0, 0, 0, 20]), Buffer.from("ftypmif1\0\0\0\0mif1avif"), Buffer.alloc(16)]), "unsupported"],
@@ -228,6 +240,207 @@ test("raw bytes are served only for verified images and PDFs, sandboxed, same-si
   assert.equal(await refused("logo.png", version, { "sec-fetch-site": "cross-site" }), "CROSS_SITE");
   write("logo.png", Buffer.concat([PNG, Buffer.from([0])]));
   assert.equal(await refused("logo.png", version), "FILE_CHANGED");
+});
+
+test("an image's decoded size is read from its header and bounded in every raster format, for preview and raw", previewable, async (t) => {
+  const { root, write } = fixture(t);
+  const gif = ([screenWidth, screenHeight], [frameWidth, frameHeight]) => {
+    const head = Buffer.alloc(13);
+    head.write("GIF89a", 0, "latin1");
+    head.writeUInt16LE(screenWidth, 6);
+    head.writeUInt16LE(screenHeight, 8);
+    const frame = Buffer.alloc(10);
+    frame[0] = 0x2c;
+    frame.writeUInt16LE(frameWidth, 5);
+    frame.writeUInt16LE(frameHeight, 7);
+    // A comment extension comes before the first frame.
+    return Buffer.concat([head, Buffer.from([0x21, 0xfe, 3, 0x61, 0x62, 0x63, 0]), frame, Buffer.from([2, 0, 0x3b])]);
+  };
+  const bmp = (width, height) => { const bytes = Buffer.alloc(54); bytes.write("BM", 0, "latin1"); bytes.writeUInt32LE(40, 14); bytes.writeInt32LE(width, 18); bytes.writeInt32LE(height, 22); return bytes; };
+  const webp = (width, height) => {
+    const bytes = Buffer.alloc(30);
+    bytes.write("RIFF", 0, "latin1"); bytes.writeUInt32LE(22, 4); bytes.write("WEBPVP8X", 8, "latin1"); bytes.writeUInt32LE(10, 16);
+    bytes.writeUIntLE(width - 1, 24, 3); bytes.writeUIntLE(height - 1, 27, 3);
+    return bytes;
+  };
+  // Two 64 KB APP1 segments put the frame header past the usual sample.
+  const jpeg = (width, height) => {
+    const app = Buffer.alloc(65_537, 0); app[0] = 0xff; app[1] = 0xe1; app.writeUInt16BE(65_535, 2);
+    const frame = Buffer.from([0xff, 0xc0, 0, 17, 8, 0, 0, 0, 0, 3, 1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0]);
+    frame.writeUInt16BE(height, 5); frame.writeUInt16BE(width, 7);
+    return Buffer.concat([Buffer.from([0xff, 0xd8]), app, app, frame, Buffer.from([0xff, 0xd9])]);
+  };
+  const ico = (image) => { const head = Buffer.alloc(22); head.writeUInt16LE(1, 2); head.writeUInt16LE(1, 4); head.writeUInt32LE(image.length, 14); head.writeUInt32LE(22, 18); return Buffer.concat([head, image]); };
+  const ftyp = Buffer.concat([Buffer.from([0, 0, 0, 20]), Buffer.from("ftypavif\0\0\0\0avif")]);
+  const cases = [
+    ["big.png", png(10_000, 10_000), [10_000, 10_000]],
+    ["ok.png", png(4000, 3000), null],
+    ["wide-frame.gif", gif([1, 1], [60_000, 60_000]), [60_000, 60_000]],
+    ["ok.gif", gif([100, 80], [10, 10]), null],
+    ["big.bmp", bmp(10_000, -10_000), [10_000, 10_000]],
+    ["big.webp", webp(16_384, 16_384), [16_384, 16_384]],
+    ["big.jpg", jpeg(20_000, 20_000), [20_000, 20_000]],
+    ["ok.jpeg", jpeg(640, 480), null],
+    ["big.ico", ico(png(9000, 9000)), [9000, 9000]],
+    ["grid.avif", avif(ftyp, [512, 512], [8000, 8000]), [8000, 8000]],
+  ];
+  for (const [name, bytes] of cases) write(name, bytes);
+  write("no-size.png", PNG.subarray(0, 20));
+  const files = createFileBrowser();
+  for (const [name, bytes, oversized] of cases) {
+    const preview = await files.preview(root, name);
+    const { request, response, body } = capture();
+    if (!oversized) {
+      assert.equal(preview.previewType, "image", name);
+      await files.raw(root, name, preview.version, request, response);
+      assert.deepEqual(body(), bytes, name);
+      continue;
+    }
+    assert.deepEqual([preview.previewType, preview.width, preview.height, preview.pixelLimit], ["oversized", ...oversized, FILE_BROWSER_LIMITS.imagePixels], name);
+    assert.match(preview.reason, /pixels/, name);
+    // A Markdown image asks for raw bytes directly; none are sent.
+    assert.deepEqual(await refusal(files.raw(root, name, null, request, response)).then((error) => [error.status, error.code]), [413, "OVERSIZED"], name);
+    assert.equal(body().length, 0, name);
+  }
+  assert.deepEqual([(await files.preview(root, "ok.png")).width, (await files.preview(root, "ok.gif")).height], [4000, 80]);
+  const unsized = await files.preview(root, "no-size.png");
+  assert.deepEqual([unsized.previewType, unsized.reason], ["unsupported", "This PNG image's size cannot be read"]);
+});
+
+test("a raw body is the version that was checked: a write or a truncation while it streams never completes the response", previewable, async (t) => {
+  const { root, write } = fixture(t);
+  const original = png(64, 64, Buffer.alloc(300 * 1024, 1));
+  write("big.png", original);
+  const target = path.join(root, "big.png");
+  const stream = async (change) => {
+    let changed = false;
+    const files = createFileBrowser({ hooks: { duringRaw: (offset) => { if (change && !changed && offset < original.length) { changed = true; change(); } } } });
+    const { request, response, body } = capture();
+    await files.raw(root, "big.png", null, request, response);
+    return { changed, complete: response.writableFinished, destroyed: response.destroyed, body: body(), code: files.operations()[0].code ?? null };
+  };
+  const whole = await stream(null);
+  assert.deepEqual([whole.complete, whole.body.equals(original), whole.code], [true, true, null]);
+  // In place and the same size: the bytes still to come are the new version's.
+  const rewritten = await stream(() => { const descriptor = openSync(target, "r+"); try { writeSync(descriptor, Buffer.alloc(1024, 2), 0, 1024, original.length - 1024); } finally { closeSync(descriptor); } });
+  assert.deepEqual([rewritten.changed, rewritten.complete, rewritten.destroyed, rewritten.code], [true, false, true, "FILE_CHANGED"]);
+  assert.ok(rewritten.body.length < original.length, "the whole rewritten body was sent");
+  write("big.png", original);
+  const truncated = await stream(() => truncateSync(target, 100 * 1024));
+  assert.deepEqual([truncated.changed, truncated.complete, truncated.destroyed, truncated.code], [true, false, true, "FILE_CHANGED"]);
+  assert.ok(truncated.body.length <= 100 * 1024);
+});
+
+test("a failed volume probe fails only the requests that waited for it, and later requests probe again", listable, async (t) => {
+  const { root, write } = fixture(t);
+  write("a.md", "# A\n");
+  write("logo.png", PNG);
+  let failing = true;
+  const probed = [];
+  const files = createFileBrowser({ hooks: { statfs: async (at) => {
+    probed.push(at);
+    if (!failing) return statfs(at);
+    // Slow enough that the concurrent requests share one failing probe of "/".
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    throw Object.assign(new Error("transient"), { code: "EIO" });
+  } } });
+  const { request, response } = capture();
+  const refused = await Promise.all([refusal(files.list(root)), refusal(files.preview(root, "a.md")), refusal(files.raw(root, "logo.png", null, request, response))]);
+  assert.deepEqual(refused.map((error) => [error.status, error.code]), [[501, "LISTING_UNAVAILABLE"], [501, "PREVIEW_UNAVAILABLE"], [501, "PREVIEW_UNAVAILABLE"]]);
+  const failedProbes = probed.length;
+  failing = false;
+  assert.deepEqual((await files.list(root)).entries.map((entry) => entry.name), ["a.md", "logo.png"]);
+  assert.equal((await files.preview(root, "a.md")).text, "# A\n");
+  const served = capture();
+  await files.raw(root, "logo.png", null, served.request, served.response);
+  assert.deepEqual(served.body(), PNG);
+  // macOS compares with "/", which is probed again once its probe failed.
+  if (process.platform === "darwin") assert.ok(probed.slice(failedProbes).includes("/"), "the failed probe of / was kept");
+});
+
+test("a proof is trusted only on a volume that keeps nanosecond ctimes from this machine's clock", () => {
+  const fine = 1_793_817_092_123_456_789n;
+  const whole = 1_793_817_092_000_000_000n;
+  // ext4, XFS, Btrfs (also as a signed 32-bit type), tmpfs and overlay.
+  for (const type of [0xef53, 0x58465342, 0x9123683e, 0x9123683e | 0, 0x01021994, 0x794c7630]) assert.equal(nanosecondVolume(type, fine, null, "linux"), true, type.toString(16));
+  // ext2, ext3 and small-inode ext4 keep whole seconds; NFS, SMB and FUSE use another clock.
+  assert.equal(nanosecondVolume(0xef53, whole, null, "linux"), false);
+  for (const type of [0x6969, 0xff534d42, 0x65735546, null]) assert.equal(nanosecondVolume(type, fine, null, "linux"), false, String(type));
+  // macOS: the type of "/" (APFS), once it is known.
+  assert.deepEqual([nanosecondVolume(26, fine, 26, "darwin"), nanosecondVolume(17, fine, 26, "darwin"), nanosecondVolume(26, fine, null, "darwin"), nanosecondVolume(26, whole, 26, "darwin")], [true, false, false, false]);
+  assert.equal(nanosecondVolume(0xef53, fine, null, "win32"), false);
+});
+
+test("on macOS a worktree on an HFS+ volume, or one mounted inside a worktree, is never read", { skip: (process.platform !== "darwin" && "hdiutil is macOS's") || linkable.skip }, async (t) => {
+  const { base, root, write } = fixture(t);
+  write("a.md", "# A\n");
+  const image = path.join(base, "hfs.dmg");
+  const mounted = path.join(root, "mnt");
+  mkdirSync(mounted);
+  try {
+    execFileSync("hdiutil", ["create", "-quiet", "-size", "4m", "-fs", "HFS+", "-volname", "outright-hfs", image]);
+    execFileSync("hdiutil", ["attach", "-quiet", "-nobrowse", "-mountpoint", mounted, image]);
+  } catch (error) { t.skip(`no HFS+ image could be mounted: ${error.message}`); return; }
+  try {
+    mkdirSync(path.join(mounted, "inner"));
+    writeFileSync(path.join(mounted, "b.md"), "# B\n");
+    writeFileSync(path.join(mounted, "inner", "c.md"), "# C\n");
+    const files = createFileBrowser();
+    assert.deepEqual((await files.list(root)).entries.map((entry) => [entry.name, entry.kind]), [["mnt", "directory"], ["a.md", "file"]]);
+    assert.equal((await refusal(files.list(root, { directory: "mnt" }))).code, "LISTING_UNAVAILABLE");
+    assert.equal((await refusal(files.preview(root, "mnt/b.md"))).code, "PREVIEW_UNAVAILABLE");
+    assert.equal((await refusal(files.list(path.join(mounted, "inner")))).code, "LISTING_UNAVAILABLE");
+    assert.equal((await refusal(files.preview(path.join(mounted, "inner"), "c.md"))).code, "PREVIEW_UNAVAILABLE");
+    assert.equal((await files.preview(root, "a.md")).text, "# A\n");
+  } finally { execFileSync("hdiutil", ["detach", "-quiet", "-force", mounted]); }
+});
+
+test("a folder on a proof's chain, or a file, changed within the settle margin is waited out, so a write in the same clock tick is still seen", previewable, async (t) => {
+  const { root, write } = fixture(t);
+  write("d/logo.png", PNG);
+  const age = (target) => BigInt(Date.now()) * 1_000_000n - statSync(target, { bigint: true }).ctimeNs;
+  const ages = { chain: [], file: [] };
+  const files = createFileBrowser({ hooks: {
+    duringProof: (step) => { if (step === "chain") ages.chain.push(age(root), age(path.join(root, "d"))); },
+    duringRaw: () => { ages.file.push(age(path.join(root, "d", "logo.png"))); },
+  } });
+  // Both were written just now.
+  writeFileSync(path.join(root, "fresh.md"), "");
+  writeFileSync(path.join(root, "d", "logo.png"), PNG);
+  await files.list(root, { directory: "d" });
+  const { request, response, body } = capture();
+  await files.raw(root, "d/logo.png", null, request, response);
+  assert.deepEqual(body(), PNG);
+  assert.ok(ages.chain.length >= 2 && ages.file.length === 1, "the checks ran");
+  for (const value of [...ages.chain, ...ages.file]) assert.ok(value >= 25_000_000n, `a ctime ${value} ns old was trusted`);
+});
+
+test("each request leaves one bounded operation record, named by its id, without contents, for success, failure and cancellation", previewable, async (t) => {
+  const { root, write } = fixture(t);
+  write("secret.md", "SECRET-CONTENT\n");
+  write("logo.png", png(64, 64, Buffer.alloc(300 * 1024)));
+  const seen = [];
+  const files = createFileBrowser({ limits: { ...FILE_BROWSER_LIMITS, operationRecords: 3 }, hooks: { onOperation: (record) => seen.push(record) } });
+  await files.list(root, { operationId: "op-list" });
+  await files.preview(root, "secret.md", { operationId: "op-preview" });
+  await refusal(files.preview(root, "gone.md", { operationId: "op-missing" }));
+  // A client that stops reading, then goes away, mid-stream.
+  const { request, response } = capture(undefined, new Promise(() => {}));
+  const streaming = files.raw(root, "logo.png", null, request, response, { operationId: "op-raw" });
+  while (!response.headers["content-type"]) await new Promise((resolve) => setTimeout(resolve, 5));
+  response.destroy();
+  await streaming;
+  assert.deepEqual(seen.map((record) => [record.operationId, record.operation, record.path, record.outcome, record.status ?? null, record.code ?? null]), [
+    ["op-list", "list", "", "ok", null, null],
+    ["op-preview", "preview", "secret.md", "ok", null, null],
+    ["op-missing", "preview", "gone.md", "failed", 404, "MISSING"],
+    ["op-raw", "raw", "logo.png", "cancelled", null, "CLIENT_CLOSED"],
+  ]);
+  for (const record of seen) assert.ok(record.root === root && Number.isInteger(record.elapsedMs) && record.elapsedMs >= 0, JSON.stringify(record));
+  assert.ok(!JSON.stringify(seen).includes("SECRET"), "a record holds contents");
+  assert.deepEqual(files.operations().map((record) => record.operationId), ["op-preview", "op-missing", "op-raw"]);
+  await files.list(root);
+  assert.match(files.operations().at(-1).operationId, /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/);
 });
 
 test("an in-place rewrite of the same size with its mtime put back is a new version, and raw refuses the old one", previewable, async (t) => {
@@ -683,8 +896,8 @@ test("a proof is one observation: a chain put back together outside while it is 
       writeFileSync(path.join(outside, "b", "PRIVATE.md"), "secret\n");
     },
     afterRead: () => { armed = true; },
-    duringProof: () => {
-      if (!armed || fired) return;
+    duringProof: (step) => {
+      if (!armed || fired || step !== 1) return;
       fired = true;
       renameSync(path.join(root, "a"), path.join(outside, "a"));
       renameSync(path.join(outside, "b"), path.join(outside, "a", "b"));
@@ -696,37 +909,36 @@ test("a proof is one observation: a chain put back together outside while it is 
   assert.deepEqual(outcome, [409, "PATH_CHANGED"]);
 });
 
-test("on Linux, an impostor at the root's path, taken away between the proof's two readlinks, is PATH_CHANGED", { skip: (process.platform !== "linux" && "the readlinks are Linux's proof") || linkable.skip }, async (t) => {
+test("on Linux, a held folder moved under an impostor at the root's path while its location is read is PATH_CHANGED", { skip: (process.platform !== "linux" && "the location read is Linux's proof") || linkable.skip }, async (t) => {
   const { base, root, write } = fixture(t);
-  write("d/x.md", "inside\n");
-  const outside = path.join(base, "outside");
-  mkdirSync(outside);
+  write("a/d/x.md", "inside\n");
   const real = path.join(base, "real");
   let stage = 0;
+  let outcomeAtReadlink = null;
   const files = createFileBrowser({ hooks: {
-    // d leaves before it is read, so what is read is outside.
-    beforeRead: () => {
-      renameSync(path.join(root, "d"), path.join(outside, "d"));
-      writeFileSync(path.join(outside, "d", "PRIVATE.md"), "secret\n");
-    },
-    // Then an impostor takes the root's path and d goes in it...
-    afterRead: () => {
-      stage = 1;
-      renameSync(root, real);
-      mkdirSync(root);
-      renameSync(path.join(outside, "d"), path.join(root, "d"));
-    },
-    // ...until d's location was read; then the real root comes back.
+    // Once the chain was read in place, the real root leaves, an impostor
+    // takes its path, and d moves into the impostor under the same names,
+    // with a private file: d's location now reads as the walked one.
     duringProof: (step) => {
-      if (stage !== 1 || step !== "readlink") return;
-      stage = 2;
-      renameSync(root, path.join(base, "impostor"));
-      renameSync(real, root);
+      if (step === "chain" && stage === 0) {
+        stage = 1;
+        renameSync(root, real);
+        mkdirSync(path.join(root, "a"), { recursive: true });
+        renameSync(path.join(real, "a", "d"), path.join(root, "a", "d"));
+        writeFileSync(path.join(root, "a", "d", "PRIVATE.md"), "secret\n");
+      } else if (step === "readlink" && stage === 1) {
+        // Then the real root comes back, and d stays in the impostor.
+        stage = 2;
+        outcomeAtReadlink = readdirSync(path.join(root, "a", "d")).sort();
+        renameSync(root, path.join(base, "impostor"));
+        renameSync(real, root);
+      }
     },
   } });
-  const outcome = await files.list(root, { directory: "d" }).then((value) => value.entries.map((entry) => entry.name), (error) => [error.statusCode, error.details?.code]);
-  // The bracket, reading d by name from the real root, may refuse before the readlinks.
-  assert.ok(stage >= 1, "the impostor was put in place");
+  const outcome = await files.list(root, { directory: "a/d" }).then((value) => value.entries.map((entry) => entry.name), (error) => [error.statusCode, error.details?.code]);
+  // The schedule ran in full: d's location was read while it was in the impostor.
+  assert.equal(stage, 2);
+  assert.deepEqual(outcomeAtReadlink, ["PRIVATE.md", "x.md"]);
   assert.deepEqual(outcome, [409, "PATH_CHANGED"]);
 });
 
@@ -736,7 +948,7 @@ test("a proof is made again when a folder on its chain is written to during it, 
   let created = 0;
   let names = 0;
   // Each write adds a new name to the root, a folder on every proof's chain.
-  const writer = (always) => () => { if (always || !created) { created += 1; writeFileSync(path.join(root, `new-${names++}.md`), ""); } };
+  const writer = (always) => (step) => { if (step === "chain" && (always || !created)) { created += 1; writeFileSync(path.join(root, `new-${names++}.md`), ""); } };
   const once = await createFileBrowser({ hooks: { duringProof: writer(false) } }).list(root, { directory: "a" });
   assert.equal(created, 1);
   assert.deepEqual(once.entries.map((entry) => entry.name), ["x.md"]);
@@ -748,22 +960,22 @@ test("a proof is made again when a folder on its chain is written to during it, 
   assert.ok(Date.now() - started < 5000, "churn is given up on promptly");
 });
 
-test("on macOS a worktree or a folder on a volume without nanosecond ctimes is never read", { skip: (process.platform !== "darwin" && "only macOS volumes are told apart") || linkable.skip }, async (t) => {
+test("a worktree or a folder on a volume without nanosecond ctimes is never read", linkable, async (t) => {
   const { root, write } = fixture(t);
   write("a.md", "# A\n");
   write("d/logo.png", PNG);
   const opened = [];
-  // The volume probe answers as for HFS+, FAT or SMB.
-  const files = createFileBrowser({ hooks: { statfs: async () => ({ type: -1 }), beforeOpen: (real) => { opened.push(real); } } });
+  // The volume probe answers as for HFS+, FAT, SMB or NFS; "/" is still APFS on macOS.
+  const files = createFileBrowser({ hooks: { statfs: async (at) => (at === "/" ? statfs("/") : { type: 0x6969 }), beforeOpen: (real) => { opened.push(real); } } });
   assert.equal((await refusal(files.list(root))).code, "LISTING_UNAVAILABLE");
   assert.equal((await refusal(files.list(root, { directory: "d" }))).code, "LISTING_UNAVAILABLE");
   assert.equal((await refusal(files.preview(root, "a.md"))).code, "PREVIEW_UNAVAILABLE");
   const { request, response } = capture();
   assert.equal((await refusal(files.raw(root, "d/logo.png", null, request, response))).code, "PREVIEW_UNAVAILABLE");
   assert.deepEqual(opened, [], "something below the root was opened");
-  // A volume of the same type as "/" (APFS) is read.
-  const apfs = createFileBrowser({ hooks: { statfs: () => statfs("/") } });
-  assert.equal((await apfs.preview(root, "a.md")).text, "# A\n");
+  // A volume of the same type as "/" (APFS) is read on macOS, as is one of a Linux type with nanosecond ctimes.
+  const provable = createFileBrowser({ hooks: { statfs: async (at) => (process.platform === "darwin" ? statfs("/") : { type: 0xef53, at }) } });
+  assert.equal((await provable.preview(root, "a.md")).text, "# A\n");
 });
 
 test("a file whose folder moves outside while its bytes are read is PATH_CHANGED, for preview and raw", linkable, async (t) => {
@@ -825,8 +1037,9 @@ test("a folder of 500 links lists every target with a bounded number of descript
     assert.equal(entries.length, 500);
     for (const entry of entries) assert.deepEqual(entry.target, { state: "file", path: `targets/t${Number(entry.name.slice(1))}/f.md` }, entry.name);
   }
-  // Per listing: the root and listed folder, and two folders per lookup in flight.
-  const bound = 2 * (2 + 2 * FILE_BROWSER_LIMITS.linkLookups) + 2;
+  // Per listing: the root and listed folder, and per lookup in flight two
+  // folders plus the one a proof opens while it walks the chain.
+  const bound = 2 * (2 + 3 * FILE_BROWSER_LIMITS.linkLookups) + 2;
   assert.ok(most - before <= bound, `${most - before} descriptors were open at once (bound ${bound})`);
   assert.equal(openDescriptors(), before);
 });
@@ -852,7 +1065,7 @@ test("an opened file whose status cannot be read is closed before the error is r
   assert.equal(openDescriptors(), before, "the opened file was left open");
 });
 
-test("a name with a drive-like prefix is browsable outside Windows, where only real outside paths are refused", { skip: process.platform === "win32" && "a drive prefix is a real location on Windows" }, async (t) => {
+test("a name with a drive-like prefix is browsable outside Windows, where only real outside paths are refused", { skip: (process.platform === "win32" && "a drive prefix is a real location on Windows") || listable.skip }, async (t) => {
   const { base, root, write } = fixture(t);
   write("a:notes.md", "# Colon\n");
   write("C:docs/inner.txt", "inside");
