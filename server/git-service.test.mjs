@@ -215,18 +215,22 @@ test("open in editor refuses a root replaced after it was admitted, and a new pa
       await rm(cwd);
       await rename(`${cwd}-old`, cwd);
     }
-    // Zed opens escape.txt (a link out) at line 12 for an absent "escape.txt:12",
-    // and trims an absent name first, so white space around one leads there too.
+    // Zed opens escape.txt (a link out) at line 12 for an absent "escape.txt:12"
+    // or "escape.txt:12:in" (its fallback), and trims an absent name first, so
+    // white space around one leads there too.
     for (const name of ["escape.txt:12", "escape.txt:12:3", "escape.txt::4:", "escape.txt:", "escape.txt(12)", "escape.txt(12,3)", "escape.txt:(2:1)",
-      "escape.txt:12 ", "escape.txt:12\t", "escape.txt:12\n", "escape.txt ", "escape.txt\u00a0", "escape.txt\u0085", "escape.txt:\u0661\u0662", "escape.txt(\uff11\uff12)", "docs/notes(3).md"]) {
+      "escape.txt:12:in", "escape.txt:x", "escape.txt:12:5:", "docs/escape.txt:12:in", "escape.txt(12:3)",
+      "escape.txt:12 ", "escape.txt:12\t", "escape.txt:12\n", "escape.txt ", "escape.txt\u00a0", "escape.txt\u0085", "escape.txt:\u0661\u0662", "escape.txt(\uff11\uff12)"]) {
       await assert.rejects(service.openInEditor(cwd, name), (error) => error.statusCode === 403, `${name} was opened`);
     }
     assert.deepEqual(launched, []);
     assert.equal((await service.openInEditor(cwd, "todo.md:2")).target, path.join(cwd, "todo.md:2"));
     assert.equal((await service.openInEditor(cwd, "new.md")).target, path.join(cwd, "new.md"));
-    assert.equal((await service.openInEditor(cwd, "new(2)/x.md")).target, path.join(cwd, "new(2)", "x.md"));
+    // A parenthesized number is a place only at the end of the name.
+    const literal = ["new(2)/x.md", "report(12).md", "notes (draft).md", "docs/notes(3).md", "(12)"];
+    for (const name of literal) assert.equal((await service.openInEditor(cwd, name)).target, path.join(cwd, name));
     assert.equal((await service.openInEditor(cwd)).target, cwd);
-    assert.deepEqual(launched, [path.join(cwd, "todo.md:2"), path.join(cwd, "new.md"), path.join(cwd, "new(2)", "x.md"), cwd]);
+    assert.deepEqual(launched, [path.join(cwd, "todo.md:2"), path.join(cwd, "new.md"), ...literal.map((name) => path.join(cwd, name)), cwd]);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

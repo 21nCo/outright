@@ -580,6 +580,60 @@ test("an AVIF is never previewed or served, even one whose metadata understates 
   assert.equal(body().length, 0);
 });
 
+test("a GIF is sized by a strict walk of every block in bounded reads, so a block a decoder reads differently cannot hide a frame", previewable, async (t) => {
+  const { root, write } = fixture(t);
+  const screen = Buffer.alloc(13);
+  screen.write("GIF89a", 0, "latin1"); screen.writeUInt16LE(10, 6); screen.writeUInt16LE(10, 8);
+  const frame = (width, height, data = Buffer.from([2, 2, 0x4c, 0x01, 0])) => {
+    const descriptor = Buffer.alloc(10); descriptor[0] = 0x2c; descriptor.writeUInt16LE(width, 5); descriptor.writeUInt16LE(height, 7);
+    return Buffer.concat([descriptor, data]);
+  };
+  const netscape = (...subBlocks) => Buffer.concat([Buffer.from([0x21, 0xff, 11]), Buffer.from("NETSCAPE2.0", "latin1"), Buffer.from(subBlocks)]);
+  const control = Buffer.from([0x21, 0xf9, 4, 0, 10, 0, 0, 0]);
+  const comment = (length) => Buffer.concat([Buffer.from([0x21, 0xfe]), ...Array.from({ length: Math.ceil(length / 256) }, () => Buffer.concat([Buffer.from([255]), Buffer.alloc(255, 0x61)])), Buffer.from([0])]);
+  const gif = (...blocks) => Buffer.concat([screen, ...blocks]);
+  const end = Buffer.from([0x3b]);
+  const cases = [
+    ["animated.gif", gif(netscape(3, 1, 0, 0, 0), control, frame(10, 10), control, frame(10, 10), netscape(5, 2, 0, 0, 0, 0, 0), control, frame(4, 4), end), "image"],
+    ["plain.gif", gif(frame(10, 10), end), "image"],
+    ["long.gif", gif(frame(10, 10), comment(1200 * 1024), frame(20, 30), end), "image"],
+    // A decoder reads at least 4 bytes of a graphic control extension, and at
+    // least 3 of a NETSCAPE sub-block: past what a declared 1 says, the 0x3B
+    // below is not a trailer, and an 8000 × 8000 frame follows.
+    ["short-control.gif", gif(frame(10, 10), Buffer.from([0x21, 0xf9, 1, 0, 0, 0x3b, 0, 0]), frame(8000, 8000), end), "unsupported"],
+    ["short-loop.gif", gif(netscape(1, 1, 0, 0x3b, 0), frame(8000, 8000), end), "unsupported"],
+    ["no-trailer.gif", gif(frame(10, 10)), "unsupported"],
+    ["code-size.gif", gif(frame(10, 10, Buffer.from([12, 0])), end), "unsupported"],
+    ["over-bytes.gif", Buffer.concat([gif(frame(10, 10), end), Buffer.alloc(FILE_BROWSER_LIMITS.imageBytes)]), "oversized"],
+  ];
+  // Every read a preview makes, sized: none may hold more than the sample.
+  const opened = await open(root);
+  const prototype = Object.getPrototypeOf(opened);
+  await opened.close();
+  const read = prototype.read;
+  let largest = 0;
+  prototype.read = function (buffer, offset, length, position) { largest = Math.max(largest, length ?? 0); return read.call(this, buffer, offset, length, position); };
+  t.after(() => { prototype.read = read; });
+  const files = createFileBrowser();
+  for (const [name, bytes, type] of cases) {
+    write(name, bytes);
+    largest = 0;
+    const preview = await files.preview(root, name);
+    assert.equal(preview.previewType, type, name);
+    assert.ok(largest <= 1024 * 1024, `${name}: one read of ${largest} bytes`);
+    const { request, response, body } = capture();
+    if (type === "image") {
+      await files.raw(root, name, preview.version, request, response);
+      assert.ok(body().equals(bytes), name);
+      continue;
+    }
+    const expected = type === "oversized" ? [413, "OVERSIZED"] : [415, "NOT_RAW_PREVIEW"];
+    assert.deepEqual(await refusal(files.raw(root, name, null, request, response)).then((error) => [error.status, error.code]), expected, name);
+    assert.equal(body().length, 0, name);
+  }
+  assert.deepEqual([(await files.preview(root, "long.gif")).width, (await files.preview(root, "long.gif")).height], [20, 30]);
+});
+
 test("a link whose destination is not UTF-8 is unreadable, never the file its decoded name would name", linkable, async (t) => {
   const { root, write } = fixture(t);
   // "a\uFFFD" is what the destination's invalid byte decodes to.

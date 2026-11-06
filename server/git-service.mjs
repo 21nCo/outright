@@ -313,10 +313,9 @@ async function requireChildPath(root, child) { const resolved = path.resolve(roo
 // Once the editor has the path, a later replacement of a folder on it is
 // outside what a path can guard; only the moment of the decision is checked.
 // The base is the canonical root requireWorktree admitted (requireAdmittedRoot).
-// An editor opens an existing path as it is, but trims an absent one (Unicode
-// white space, U+0085 included) and reads a name ending in ":12" or holding
-// "(12)", in any script's digits, as a place in another file (Zed), so a new
-// file's name with either, or with white space around it, is refused.
+// An editor opens an existing path as it is, but Zed trims an absent one
+// (Unicode white space, U+0085 too) and reads any ":" in its name, or a name
+// ending in "(12)" or "(12,5)" in any digits, as a place in another file.
 async function requireCanonicalChild(root, child, hooks = {}) {
   const names = path.relative(root, await requireChildPath(root, child)).split(path.sep).filter(Boolean);
   const changed = () => httpError(409, "The path changed while it was checked; retry");
@@ -350,7 +349,9 @@ async function requireCanonicalChild(root, child, hooks = {}) {
   catch (error) { gone = ["ENOENT", "ENOTDIR"].includes(error?.code); }
   if (!gone || await realpath(found).catch(() => null) !== found) throw changed();
   const name = names.at(-1);
-  if (/^[\s\u0085]|[\s\u0085]$|:[\p{Nd}:]*$|\(\p{Nd}+(?:[,:]\p{Nd}+)?\)/u.test(name)) throw httpError(403, "A new file's name cannot hold a line locator such as :12 or (12), or white space around it, which an editor reads as another file");
+  const open = name.lastIndexOf("(");
+  const position = open > 0 && name.endsWith(")") ? name.slice(open + 1, -1) : "";
+  if (name.includes(":") || /^[\s\u0085]|[\s\u0085]$/u.test(name) || /^\p{Nd}+(?:,\p{Nd}+)?$/u.test(position)) throw httpError(403, "A new file's name cannot hold a line locator such as :12 or (12), or white space around it, which an editor reads as another file");
   return path.join(missing, ...names.slice(absent + 1));
 }
 // The canonical root requireWorktree admitted must still resolve to itself:
