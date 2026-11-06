@@ -314,7 +314,7 @@ async function requireChildPath(root, child) { const resolved = path.resolve(roo
 // outside what a path can guard; only the moment of the decision is checked.
 // The base is the canonical root requireWorktree admitted (requireAdmittedRoot).
 // An editor opens an existing path as it is, but Zed trims an absent one
-// (Unicode white space, U+0085 too) and reads any ":" in its name, or a name
+// (Unicode white space, U+0085 too) and reads a ":" anywhere in it, or a name
 // ending in "(12)" or "(12,5)" in any digits, as a place in another file.
 async function requireCanonicalChild(root, child, hooks = {}) {
   const names = path.relative(root, await requireChildPath(root, child)).split(path.sep).filter(Boolean);
@@ -348,11 +348,12 @@ async function requireCanonicalChild(root, child, hooks = {}) {
   try { await lstat(missing); }
   catch (error) { gone = ["ENOENT", "ENOTDIR"].includes(error?.code); }
   if (!gone || await realpath(found).catch(() => null) !== found) throw changed();
+  const target = path.join(missing, ...names.slice(absent + 1));
   const name = names.at(-1);
   const open = name.lastIndexOf("(");
   const position = open > 0 && name.endsWith(")") ? name.slice(open + 1, -1) : "";
-  if (name.includes(":") || /^[\s\u0085]|[\s\u0085]$/u.test(name) || /^\p{Nd}+(?:,\p{Nd}+)?$/u.test(position)) throw httpError(403, "A new file's name cannot hold a line locator such as :12 or (12), or white space around it, which an editor reads as another file");
-  return path.join(missing, ...names.slice(absent + 1));
+  if (target.slice(path.parse(target).root.length).includes(":") || /^[\s\u0085]|[\s\u0085]$/u.test(name) || /^\p{Nd}+(?:,\p{Nd}+)?$/u.test(position)) throw httpError(403, "A new file's name cannot hold a line locator such as :12 or (12), or white space around it, which an editor reads as another file");
+  return target;
 }
 // The canonical root requireWorktree admitted must still resolve to itself:
 // one replaced since (by a link elsewhere) is 409, and nothing is launched.
