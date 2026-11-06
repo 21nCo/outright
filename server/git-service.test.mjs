@@ -218,7 +218,7 @@ test("open in editor refuses a root replaced after it was admitted, and a new pa
     // Zed opens escape.txt (a link out) at line 12 for an absent "escape.txt:12",
     // and trims an absent name first, so white space around one leads there too.
     for (const name of ["escape.txt:12", "escape.txt:12:3", "escape.txt::4:", "escape.txt:", "escape.txt(12)", "escape.txt(12,3)", "escape.txt:(2:1)",
-      "escape.txt:12 ", "escape.txt:12\t", "escape.txt:12\n", "escape.txt ", "escape.txt\u00a0", "docs/notes(3).md"]) {
+      "escape.txt:12 ", "escape.txt:12\t", "escape.txt:12\n", "escape.txt ", "escape.txt\u00a0", "escape.txt\u0085", "escape.txt:\u0661\u0662", "escape.txt(\uff11\uff12)", "docs/notes(3).md"]) {
       await assert.rejects(service.openInEditor(cwd, name), (error) => error.statusCode === 403, `${name} was opened`);
     }
     assert.deepEqual(launched, []);
