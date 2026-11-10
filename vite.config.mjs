@@ -3,6 +3,8 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "node:path";
 import { outrightApiPlugin } from "./server/outright-vite-plugin.mjs";
+import { pdfjsAssetsPlugin } from "./server/pdfjs-assets-plugin.mjs";
+import { manualChunks } from "./server/vite-chunks.mjs";
 
 export default defineConfig({
   resolve: {
@@ -13,14 +15,7 @@ export default defineConfig({
   build: {
     outDir: "dist/client",
     rollupOptions: {
-      output: {
-        manualChunks(id) {
-          if (id.includes("@xterm/")) return "terminal";
-          if (id.includes("@phosphor-icons/")) return "icons";
-          if (id.includes("@base-ui/")) return "base-ui";
-          if (id.includes("node_modules")) return "vendor";
-        },
-      },
+      output: { manualChunks },
     },
   },
   optimizeDeps: {
@@ -36,6 +31,7 @@ export default defineConfig({
   plugins: [
     tailwindcss(),
     react(),
+    pdfjsAssetsPlugin(),
     outrightApiPlugin({ configUrl: new URL("./outright.config.json", import.meta.url) }),
   ],
 });
