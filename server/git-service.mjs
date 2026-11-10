@@ -352,7 +352,7 @@ async function requireCanonicalChild(root, child, hooks = {}) {
   const name = names.at(-1);
   const open = name.lastIndexOf("(");
   const position = open > 0 && name.endsWith(")") ? name.slice(open + 1, -1) : "";
-  if (target.slice(path.parse(target).root.length).includes(":") || /^[\s\u0085]|[\s\u0085]$/u.test(name) || /^\p{Nd}+(?:,\p{Nd}+)?$/u.test(position)) throw httpError(403, "A new file's name cannot hold a line locator such as :12 or (12), or white space around it, which an editor reads as another file");
+  if (target.slice(path.parse(target).root.length).includes(":") || /^[\s\u0085]|[\s\u0085]$/u.test(name) || /^\p{Nd}+(?:,\p{Nd}+)?$/u.test(position)) throw httpError(403, "A path to a new file cannot hold a \":\" anywhere (in the worktree path, a folder or the name), and its name cannot end in a line locator such as (12) or have white space around it, which an editor reads as another file");
   return target;
 }
 // The canonical root requireWorktree admitted must still resolve to itself:

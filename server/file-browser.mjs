@@ -52,8 +52,8 @@ const IMAGES = Object.freeze({
 // The first element of an SVG may follow a long prolog (comments, a DOCTYPE
 // with its own declarations), and an image's size may follow long metadata
 // (EXIF, ICC profiles), so more of an image is read to find them. Every frame
-// of a GIF can widen what it decodes to, so a GIF is read whole.
-const SVG_SAMPLE_BYTES = 1024 * 1024;
+// of a GIF can widen what it decodes to, so a GIF, like an SVG, must fit in it.
+const IMAGE_SAMPLE_BYTES = 1024 * 1024;
 // A raw response cannot run script, load anything, or be embedded by
 // another site, even if it is opened as a top-level page.
 const RAW_HEADERS = Object.freeze({
@@ -351,7 +351,7 @@ async function classify(relative, { handle, info }, limits, withText) {
   if (!handle) return { previewType: "unsupported", reason: "This is not a regular file" };
   const extension = path.extname(relative).toLowerCase();
   const image = IMAGES[extension];
-  const sample = await readBytes(handle, Math.min(info.size, image ? Math.max(limits.sampleBytes, SVG_SAMPLE_BYTES) : limits.sampleBytes));
+  const sample = await readBytes(handle, Math.min(info.size, image ? Math.max(limits.sampleBytes, IMAGE_SAMPLE_BYTES) : limits.sampleBytes));
   if (image) {
     const format = extension.slice(1).toUpperCase();
     if (!image[1](sample)) return { previewType: "unsupported", reason: `The contents are not a ${format} image` };
@@ -360,12 +360,12 @@ async function classify(relative, { handle, info }, limits, withText) {
     // at its own. Only a data: URL can bring one (an SVG image loads nothing,
     // a raw SVG only bounded same-origin files), so an SVG must be read whole
     // with nothing that could spell one (URLs drop tabs and newlines).
+    if ((extension === ".svg" || extension === ".gif") && sample.length < info.size) return { previewType: "oversized", limit: sample.length };
     if (extension === ".svg") {
-      if (sample.length < info.size) return { previewType: "oversized", limit: sample.length };
       if (/[Dd][Aa][Tt][Aa]:|&(?!(?:amp|lt|gt|quot|apos);)|\\|[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(sample.toString("latin1").replace(/[\t\n\r]/g, ""))) return { previewType: "unsupported", reason: "This SVG may embed an image whose size cannot be checked" };
       return { previewType: "image", mimeType: image[0] };
     }
-    const [width, height] = (extension === ".gif" ? await gifSize(handle, info.size, sample) : imageSize(extension, sample)) ?? [];
+    const [width, height] = (extension === ".gif" ? gifSize(sample) : imageSize(extension, sample)) ?? [];
     if (!(width > 0 && height > 0)) return { previewType: "unsupported", reason: `This ${format} image's size cannot be read` };
     if (width * height > limits.imagePixels) return { previewType: "oversized", width, height, pixelLimit: limits.imagePixels, reason: `The image is ${width} × ${height} pixels, over the preview limit of ${limits.imagePixels} pixels` };
     return { previewType: "image", mimeType: image[0], width, height };
@@ -932,41 +932,39 @@ function bmpSize(b, at) {
   if (b.length < at + 12) return null;
   return b.readUInt32LE(at) === 12 ? [b.readUInt16LE(at + 4), b.readUInt16LE(at + 6)] : [Math.abs(b.readInt32LE(at + 4)), Math.abs(b.readInt32LE(at + 8))];
 }
-// Every block to the trailer, read past the sample 64 KB at a time; each frame
-// widens the canvas. No decoder may read a block differently, so only a 4-byte
-// graphic control, 3-byte loop and 5-byte buffering NETSCAPE2.0/ANIMEXTS1.0
+// Every block of a GIF read whole, to the trailer; each frame widens the
+// canvas. No decoder may read a block differently, so only a 4-byte graphic
+// control, 3-byte loop and 5-byte buffering NETSCAPE2.0/ANIMEXTS1.0
 // sub-blocks, a 12-byte plain text header and code sizes 2 to 8 are accepted.
-async function gifSize(handle, size, sample) {
-  let [base, window] = [0, sample];
-  const bytes = async (at, length) => {
-    if (at < base || at + length > base + window.length) [base, window] = [at, await readBytes(handle, Math.max(0, Math.min(65_536, size - at)), at)];
-    return window.length >= at - base + length ? window.subarray(at - base, at - base + length) : null;
-  };
+function gifSize(b) {
+  const bytes = (at, length) => (at >= 0 && at + length <= b.length ? b.subarray(at, at + length) : null);
   // Past the sub-blocks at `at` and their terminator, or -1.
-  const subBlocks = async (at, animation) => {
-    for (let block; (block = await bytes(at, 2)); at += block[0] + 1) {
-      if (!block[0]) return at + 1;
-      if (animation && !(block[0] === 3 && block[1] === 1) && !(block[0] === 5 && block[1] === 2)) return -1;
+  const subBlocks = (at, animation) => {
+    while (at < b.length) {
+      const length = b[at];
+      if (!length) return at + 1;
+      if (animation && !(length === 3 && b[at + 1] === 1) && !(length === 5 && b[at + 1] === 2)) return -1;
+      at += length + 1;
     }
     return -1;
   };
   const table = (flags) => (flags & 0x80 ? 3 * 2 ** ((flags & 7) + 1) : 0);
-  const screen = await bytes(0, 13);
+  const screen = bytes(0, 13);
   let canvas = screen && [screen.readUInt16LE(6), screen.readUInt16LE(8)];
   for (let at = screen ? 13 + table(screen[10]) : -1; at >= 0;) {
-    const block = await bytes(at, 3) ?? await bytes(at, 1);
+    const block = bytes(at, 3) ?? bytes(at, 1);
     if (block?.[0] === 0x3b) return canvas;
-    const frame = block?.[0] === 0x2c && await bytes(at, 10);
+    const frame = block?.[0] === 0x2c && bytes(at, 10);
     if (frame) {
       canvas = [Math.max(canvas[0], frame.readUInt16LE(1) + frame.readUInt16LE(5)), Math.max(canvas[1], frame.readUInt16LE(3) + frame.readUInt16LE(7))];
       at += 10 + table(frame[9]);
-      const code = (await bytes(at, 1))?.[0];
-      at = code >= 2 && code <= 8 ? await subBlocks(at + 1) : -1;
+      const code = b[at];
+      at = code >= 2 && code <= 8 ? subBlocks(at + 1) : -1;
     } else if (block?.[0] !== 0x21 || block.length < 3) return null;
-    else if (block[1] === 0xf9) at = block[2] === 4 && (await bytes(at + 7, 1))?.[0] === 0 ? at + 8 : -1;
-    else if (block[1] === 0xff && block[2] === 11) at = await subBlocks(at + 14, ["NETSCAPE2.0", "ANIMEXTS1.0"].includes((await bytes(at + 3, 11))?.toString("latin1")));
-    else if (block[1] === 0x01 && block[2] === 12) at = await subBlocks(at + 15);
-    else at = block[1] === 0xfe ? await subBlocks(at + 2) : -1;
+    else if (block[1] === 0xf9) at = block[2] === 4 && b[at + 7] === 0 ? at + 8 : -1;
+    else if (block[1] === 0xff && block[2] === 11) at = subBlocks(at + 14, ["NETSCAPE2.0", "ANIMEXTS1.0"].includes(bytes(at + 3, 11)?.toString("latin1")));
+    else if (block[1] === 0x01 && block[2] === 12) at = subBlocks(at + 15);
+    else at = block[1] === 0xfe ? subBlocks(at + 2) : -1;
   }
   return null;
 }

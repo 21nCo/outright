@@ -263,7 +263,7 @@ test("an image's decoded size is read from its header and bounded in every raste
   };
   // A small first frame, a long comment, then a later frame of `[width, height]` (the trailer stripped first).
   const later = (frame, tail = Buffer.from([0x3b])) => {
-    const comment = Buffer.concat([Buffer.from([0x21, 0xfe]), ...Array.from({ length: 4600 }, () => Buffer.concat([Buffer.from([255]), Buffer.alloc(255, 0x61)])), Buffer.from([0])]);
+    const comment = Buffer.concat([Buffer.from([0x21, 0xfe]), ...Array.from({ length: 3000 }, () => Buffer.concat([Buffer.from([255]), Buffer.alloc(255, 0x61)])), Buffer.from([0])]);
     const second = gif([1, 1], frame).subarray(20);
     return Buffer.concat([gif([10, 10], [10, 10]).subarray(0, -1), comment, second.subarray(0, -1), tail]);
   };
@@ -287,7 +287,7 @@ test("an image's decoded size is read from its header and bounded in every raste
     ["ok.png", png(4000, 3000), null],
     ["wide-frame.gif", gif([1, 1], [60_000, 60_000]), [60_000, 60_000]],
     ["ok.gif", gif([100, 80], [10, 10]), null],
-    // Every frame of a GIF is sized, also one past the first megabyte.
+    // Every frame of a GIF is sized, also one far past the first.
     ["late-frame.gif", later([60_000, 60_000]), [60_000, 60_000]],
     ["late-ok.gif", later([20, 30]), null],
     ["big.bmp", bmp(10_000, -10_000), [10_000, 10_000]],
@@ -580,7 +580,7 @@ test("an AVIF is never previewed or served, even one whose metadata understates 
   assert.equal(body().length, 0);
 });
 
-test("a GIF is sized by a strict walk of every block in bounded reads, so a block a decoder reads differently cannot hide a frame", previewable, async (t) => {
+test("a GIF is sized only when the image sample holds all of it, by a strict walk of every block, so no block a decoder reads differently can hide a frame", previewable, async (t) => {
   const { root, write } = fixture(t);
   const screen = Buffer.alloc(13);
   screen.write("GIF89a", 0, "latin1"); screen.writeUInt16LE(10, 6); screen.writeUInt16LE(10, 8);
@@ -591,12 +591,18 @@ test("a GIF is sized by a strict walk of every block in bounded reads, so a bloc
   const netscape = (...subBlocks) => Buffer.concat([Buffer.from([0x21, 0xff, 11]), Buffer.from("NETSCAPE2.0", "latin1"), Buffer.from(subBlocks)]);
   const control = Buffer.from([0x21, 0xf9, 4, 0, 10, 0, 0, 0]);
   const comment = (length) => Buffer.concat([Buffer.from([0x21, 0xfe]), ...Array.from({ length: Math.ceil(length / 256) }, () => Buffer.concat([Buffer.from([255]), Buffer.alloc(255, 0x61)])), Buffer.from([0])]);
+  // A comment of `count` one-byte sub-blocks.
+  const tiny = (count) => Buffer.concat([Buffer.from([0x21, 0xfe]), Buffer.alloc(2 * count, Buffer.from([1, 0x61])), Buffer.from([0])]);
   const gif = (...blocks) => Buffer.concat([screen, ...blocks]);
   const end = Buffer.from([0x3b]);
   const cases = [
     ["animated.gif", gif(netscape(3, 1, 0, 0, 0), control, frame(10, 10), control, frame(10, 10), netscape(5, 2, 0, 0, 0, 0, 0), control, frame(4, 4), end), "image"],
     ["plain.gif", gif(frame(10, 10), end), "image"],
-    ["long.gif", gif(frame(10, 10), comment(1200 * 1024), frame(20, 30), end), "image"],
+    ["long.gif", gif(frame(10, 10), comment(900 * 1024), frame(20, 30), end), "image"],
+    ["tiny-blocks.gif", gif(tiny(400_000), frame(10, 10), end), "image"],
+    // Past the 1 MiB sample a GIF is oversized, however its blocks are split.
+    ["past-sample.gif", gif(frame(10, 10), comment(1200 * 1024), frame(20, 30), end), "oversized"],
+    ["past-sample-tiny.gif", gif(tiny(1_000_000), frame(1, 1), end), "oversized"],
     // A decoder reads at least 4 bytes of a graphic control extension, and at
     // least 3 of a NETSCAPE sub-block: past what a declared 1 says, the 0x3B
     // below is not a trailer, and an 8000 × 8000 frame follows.
@@ -606,21 +612,21 @@ test("a GIF is sized by a strict walk of every block in bounded reads, so a bloc
     ["code-size.gif", gif(frame(10, 10, Buffer.from([12, 0])), end), "unsupported"],
     ["over-bytes.gif", Buffer.concat([gif(frame(10, 10), end), Buffer.alloc(FILE_BROWSER_LIMITS.imageBytes)]), "oversized"],
   ];
-  // Every read a preview makes, sized: none may hold more than the sample.
+  // Every read a preview makes: together they read at most the sample.
   const opened = await open(root);
   const prototype = Object.getPrototypeOf(opened);
   await opened.close();
   const read = prototype.read;
-  let largest = 0;
-  prototype.read = function (buffer, offset, length, position) { largest = Math.max(largest, length ?? 0); return read.call(this, buffer, offset, length, position); };
+  let total = 0;
+  prototype.read = async function (...input) { const result = await read.apply(this, input); total += result.bytesRead; return result; };
   t.after(() => { prototype.read = read; });
   const files = createFileBrowser();
   for (const [name, bytes, type] of cases) {
     write(name, bytes);
-    largest = 0;
+    total = 0;
     const preview = await files.preview(root, name);
     assert.equal(preview.previewType, type, name);
-    assert.ok(largest <= 1024 * 1024, `${name}: one read of ${largest} bytes`);
+    assert.ok(total <= 1024 * 1024, `${name}: ${total} bytes read`);
     const { request, response, body } = capture();
     if (type === "image") {
       await files.raw(root, name, preview.version, request, response);
