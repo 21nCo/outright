@@ -247,6 +247,38 @@ test("raw bytes are served only for verified images and PDFs, sandboxed, same-si
   assert.equal(await refused("logo.png", version), "FILE_CHANGED");
 });
 
+test("a previewed version is FILE_CHANGED once the file changes, whatever it became; without a version the new content's refusal stands", previewable, async (t) => {
+  const { root, write } = fixture(t);
+  const files = createFileBrowser();
+  const screen = Buffer.alloc(13);
+  screen.write("GIF89a", 0, "latin1"); screen.writeUInt16LE(1, 6); screen.writeUInt16LE(1, 8);
+  const descriptor = Buffer.alloc(10); descriptor[0] = 0x2c; descriptor.writeUInt16LE(1, 5); descriptor.writeUInt16LE(1, 7);
+  const gif = (...comment) => Buffer.concat([screen, ...comment, descriptor, Buffer.from([2, 2, 0x4c, 0x01, 0, 0x3b])]);
+  const big = Buffer.concat([Buffer.from([0x21, 0xfe]), Buffer.alloc(256 * 4200, Buffer.concat([Buffer.from([255]), Buffer.alloc(255, 0x61)])), Buffer.from([0])]);
+  const raw = async (file, fileVersion) => {
+    const { request, response, body } = capture();
+    const refused = await refusal(files.raw(root, file, fileVersion, request, response));
+    const record = files.operations().at(-1);
+    return [refused.status, refused.code, record.code, body().length];
+  };
+  for (const [file, before, after, status, code] of [
+    ["sample.gif", gif(), gif(big), 413, "OVERSIZED"],
+    ["size.png", PNG, png(1, 1, Buffer.alloc(FILE_BROWSER_LIMITS.imageBytes)), 413, "OVERSIZED"],
+    ["pixels.png", PNG, png(10_000, 10_000), 413, "OVERSIZED"],
+    ["binary.png", PNG, Buffer.from([0, 1, 2, 3]), 415, "NOT_RAW_PREVIEW"],
+  ]) {
+    write(file, before);
+    const { previewType, version } = await files.preview(root, file);
+    assert.equal(previewType, "image", file);
+    const served = capture();
+    await files.raw(root, file, version, served.request, served.response);
+    assert.deepEqual(served.body(), before, `${file} unchanged is served whole`);
+    write(file, after);
+    assert.deepEqual(await raw(file, version), [409, "FILE_CHANGED", "FILE_CHANGED", 0], `${file} with its previewed version`);
+    for (const none of [null, ""]) assert.deepEqual(await raw(file, none), [status, code, code, 0], `${file} with version ${JSON.stringify(none)}`);
+  }
+});
+
 test("an image's decoded size is read from its header and bounded in every raster format, for preview and raw", previewable, async (t) => {
   const { root, write } = fixture(t);
   const gif = ([screenWidth, screenHeight], [frameWidth, frameHeight]) => {

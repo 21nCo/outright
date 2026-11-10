@@ -265,11 +265,12 @@ export function createFileBrowser({ limits = FILE_BROWSER_LIMITS, hooks = {}, ha
         try { await opened?.release(); }
         finally { await binding.close(); }
       }
+      // A stale version is FILE_CHANGED whatever the file has become.
+      if (version && version !== opened.info.version) throw fileError(409, "The file changed after it was previewed", "FILE_CHANGED");
       if (kind.previewType === "oversized") throw fileError(413, "The file is over its preview limit", "OVERSIZED");
       if (kind.previewType !== "image" && kind.previewType !== "pdf") {
         throw fileError(415, "Only verified image and PDF previews are served as files", "NOT_RAW_PREVIEW");
       }
-      if (version && version !== opened.info.version) throw fileError(409, "The file changed after it was previewed", "FILE_CHANGED");
       response.statusCode = 200;
       for (const [name, value] of Object.entries(RAW_HEADERS)) response.setHeader(name, value);
       response.setHeader("Content-Type", kind.mimeType);

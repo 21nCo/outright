@@ -3859,6 +3859,14 @@ test("file routes browse only a discovered project worktree and serve previews f
       await runtime.handleRequest(requestStream("GET", at("/api/files/raw", { projectId: project.id, path: worktree.path, file: "logo.png", ...(version === undefined ? {} : { version }) })), current);
       assert.deepEqual([current.statusCode, current.headers["content-type"], Buffer.concat(parts).equals(rewritten)], [200, "image/png", true], `version ${JSON.stringify(version)}`);
     }
+    // A previewed version is FILE_CHANGED even once the file is no longer an image;
+    // without a version the new content's refusal stands.
+    writeFileSync(path.join(worktree.path, "logo.png"), Buffer.from([0, 1, 2, 3]));
+    for (const [version, status, code] of [[image.body.version, 409, "FILE_CHANGED"], [undefined, 415, "NOT_RAW_PREVIEW"]]) {
+      const refused = await callRuntime(runtime, "GET", at("/api/files/raw", { projectId: project.id, path: worktree.path, file: "logo.png", ...(version === undefined ? {} : { version }) }));
+      const record = runtime.files.operations().find((item) => item.operationId === refused.headers["X-Outright-Operation"]);
+      assert.deepEqual([refused.statusCode, refused.body.code, record?.code], [status, code, code], refused.raw);
+    }
   }
   const missing = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "gone.md" }));
   // Without a root handle nothing below the root is looked at, so a missing name answers alike.
