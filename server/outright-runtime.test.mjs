@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
-import { PassThrough, Readable } from "node:stream";
+import { PassThrough, Readable, Writable } from "node:stream";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
@@ -17,6 +17,7 @@ import { AGENT_SUPERVISOR, createAgentManager, LAUNCH_AUTHORIZED_CONTROL } from 
 import { createTerminalManager } from "./terminal-manager.mjs";
 import { openTerminalHistory } from "./terminal-history.mjs";
 import { createSubprocessBudget } from "./subprocess-budget.mjs";
+import { createFileBrowser } from "./file-browser.mjs";
 import { randomUUID } from "node:crypto";
 import { writeNodeCommand } from "../tests/fixtures/node-command.mjs";
 
@@ -3802,6 +3803,113 @@ async function within(promise, what, signal, ms = 15_000) {
       .then(() => assert.fail(`timed out waiting for ${what}`))]);
   } finally { settled.abort(); }
 }
+
+test("file routes browse only a discovered project worktree and serve previews from it", withWorktreeRuntime(async (runtime, { project, worktree }) => {
+  writeFileSync(path.join(worktree.path, "README.md"), "# Fixture\n");
+  mkdirSync(path.join(worktree.path, "docs"));
+  const at = (route, parameters) => `${route}?${new URLSearchParams(parameters)}`;
+  const listed = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: worktree.path }));
+  // A host without a handle-bound folder path (Windows, among others) refuses
+  // its folders and files (OUT-144); probed, not inferred from the platform.
+  const anchored = await createFileBrowser().list(worktree.path).then(() => true, (error) => error.details?.code !== "LISTING_UNAVAILABLE");
+  if (process.platform === "win32") assert.equal(anchored, false, "Windows cannot read through a root handle");
+  // CI's Linux and macOS runners can, so a regression there cannot pass on the 501 branch.
+  if (process.env.CI && ["linux", "darwin"].includes(process.platform)) assert.equal(anchored, true, "a CI Linux or macOS host refused its root handle");
+  if (!anchored) assert.deepEqual([listed.statusCode, listed.body.code], [501, "LISTING_UNAVAILABLE"], listed.raw);
+  else {
+    assert.equal(listed.statusCode, 200, listed.raw);
+    assert.deepEqual(listed.body.entries.map((entry) => [entry.name, entry.kind]), [["docs", "directory"], ["README.md", "file"]]);
+  }
+  const preview = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "README.md" }));
+  // Nor can it prove where an opened file is, so files are not previewed.
+  if (!anchored) assert.deepEqual([preview.statusCode, preview.body.code], [501, "PREVIEW_UNAVAILABLE"], preview.raw);
+  else assert.deepEqual([preview.statusCode, preview.body.previewType, preview.body.text], [200, "markdown", "# Fixture\n"]);
+  // Every response the file browser answered names its operation record.
+  const operationId = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/;
+  for (const answered of [listed, preview]) assert.match(answered.headers["X-Outright-Operation"], operationId);
+  if (anchored) {
+    // A 1×1 PNG: its raw bytes come with their type and the sandbox headers,
+    // for the previewed version only.
+    const png = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da63f8ffff3f0005fe02fea7d6a4a70000000049454e44ae426082", "hex");
+    writeFileSync(path.join(worktree.path, "logo.png"), png);
+    const image = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "logo.png" }));
+    assert.deepEqual([image.statusCode, image.body.previewType, image.body.width, image.body.height], [200, "image", 1, 1], image.raw);
+    const chunks = [];
+    const served = new Writable({ write(chunk, _encoding, done) { chunks.push(chunk); done(); } });
+    served.headers = {};
+    served.setHeader = (name, value) => { served.headers[name.toLowerCase()] = value; };
+    await runtime.handleRequest(requestStream("GET", at("/api/files/raw", { projectId: project.id, path: worktree.path, file: "logo.png", version: image.body.version })), served);
+    assert.deepEqual([served.statusCode, served.headers["content-type"], served.headers["content-length"], served.headers["x-content-type-options"], Buffer.concat(chunks).equals(png)], [200, "image/png", String(png.length), "nosniff", true]);
+    assert.match(served.headers["content-security-policy"], /sandbox/);
+    assert.match(served.headers["x-outright-operation"], operationId);
+    const stale = await callRuntime(runtime, "GET", at("/api/files/raw", { projectId: project.id, path: worktree.path, file: "logo.png", version: `${image.body.version}-old` }));
+    assert.deepEqual([stale.statusCode, stale.body.code], [409, "FILE_CHANGED"], stale.raw);
+    assert.match(stale.headers["X-Outright-Operation"], operationId);
+    // As the README says: after a rewrite the previewed version is refused, and
+    // a request without a version, or with an empty one, gets the version it verifies.
+    const rewritten = Buffer.concat([png, Buffer.from("tail")]);
+    writeFileSync(path.join(worktree.path, "logo.png"), rewritten);
+    const previewed = await callRuntime(runtime, "GET", at("/api/files/raw", { projectId: project.id, path: worktree.path, file: "logo.png", version: image.body.version }));
+    assert.deepEqual([previewed.statusCode, previewed.body.code], [409, "FILE_CHANGED"], previewed.raw);
+    for (const version of [undefined, ""]) {
+      const parts = [];
+      const current = new Writable({ write(chunk, _encoding, done) { parts.push(chunk); done(); } });
+      current.headers = {};
+      current.setHeader = (name, value) => { current.headers[name.toLowerCase()] = value; };
+      await runtime.handleRequest(requestStream("GET", at("/api/files/raw", { projectId: project.id, path: worktree.path, file: "logo.png", ...(version === undefined ? {} : { version }) })), current);
+      assert.deepEqual([current.statusCode, current.headers["content-type"], Buffer.concat(parts).equals(rewritten)], [200, "image/png", true], `version ${JSON.stringify(version)}`);
+    }
+    // A previewed version is FILE_CHANGED even once the file is no longer an image;
+    // without a version the new content's refusal stands.
+    writeFileSync(path.join(worktree.path, "logo.png"), Buffer.from([0, 1, 2, 3]));
+    for (const [version, status, code] of [[image.body.version, 409, "FILE_CHANGED"], [undefined, 415, "NOT_RAW_PREVIEW"]]) {
+      const refused = await callRuntime(runtime, "GET", at("/api/files/raw", { projectId: project.id, path: worktree.path, file: "logo.png", ...(version === undefined ? {} : { version }) }));
+      const record = runtime.files.operations().find((item) => item.operationId === refused.headers["X-Outright-Operation"]);
+      assert.deepEqual([refused.statusCode, refused.body.code, record?.code], [status, code, code], refused.raw);
+    }
+  }
+  const missing = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "gone.md" }));
+  // Without a root handle nothing below the root is looked at, so a missing name answers alike.
+  assert.deepEqual([missing.statusCode, missing.body.code], anchored ? [404, "MISSING"] : [501, "PREVIEW_UNAVAILABLE"], missing.raw);
+  const outsider = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), "outright-undiscovered-")));
+  let undiscovered;
+  try {
+    undiscovered = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: outsider }));
+    assert.equal(undiscovered.statusCode, 403, undiscovered.raw);
+  } finally { rmSync(outsider, { recursive: true, force: true }); }
+  const otherProject = await callRuntime(runtime, "GET", at("/api/files", { projectId: "another-project", path: worktree.path }));
+  assert.equal(otherProject.statusCode, 400, otherProject.raw);
+  const noPath = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, file: "README.md" }));
+  assert.equal(noPath.statusCode, 400, noPath.raw);
+  // A request refused before the file browser looks at the worktree is recorded too.
+  for (const [refused, operation, status, code] of [[undiscovered, "list", 403, "WORKTREE_UNKNOWN"], [otherProject, "list", 400, "PROJECT_MISMATCH"], [noPath, "preview", 400, "PATH_REQUIRED"]]) {
+    const record = runtime.files.operations().find((item) => item.operationId === refused.headers["X-Outright-Operation"]);
+    assert.deepEqual([record?.operation, record?.status, record?.outcome, record?.code, refused.body.code], [operation, status, "failed", code, code], refused.raw);
+  }
+  const escaping = await callRuntime(runtime, "GET", at("/api/files", { projectId: project.id, path: worktree.path, dir: ".." }));
+  assert.deepEqual([escaping.statusCode, escaping.body.code], [403, "PATH_OUTSIDE"]);
+  // OUTRIGHT_FILES=off turns every Files route off, recorded like any refusal, until it is unset.
+  const setting = process.env.OUTRIGHT_FILES;
+  process.env.OUTRIGHT_FILES = "off";
+  try {
+    for (const [route, operation, parameters] of [["/api/files", "list", {}], ["/api/files/preview", "preview", { file: "README.md" }], ["/api/files/raw", "raw", { file: "logo.png" }]]) {
+      const off = await callRuntime(runtime, "GET", at(route, { projectId: project.id, path: worktree.path, ...parameters }));
+      const record = runtime.files.operations().find((item) => item.operationId === off.headers["X-Outright-Operation"]);
+      assert.deepEqual([off.statusCode, off.body.code, record?.operation, record?.code], [503, "FILES_DISABLED", operation, "FILES_DISABLED"], off.raw);
+    }
+  } finally {
+    if (setting === undefined) delete process.env.OUTRIGHT_FILES; else process.env.OUTRIGHT_FILES = setting;
+  }
+  const on = await callRuntime(runtime, "GET", at("/api/files/preview", { projectId: project.id, path: worktree.path, file: "README.md" }));
+  assert.equal(on.statusCode, anchored ? 200 : 501, on.raw);
+  // The server's own checks (here the Host gate) answer before the Files routes, so that refusal names no record.
+  const recorded = runtime.files.operations().length;
+  const foreign = requestStream("GET", at("/api/files", { projectId: project.id, path: worktree.path }));
+  foreign.headers.host = "attacker.example";
+  const rejected = responseCapture();
+  await runtime.handleRequest(foreign, rejected);
+  assert.deepEqual([rejected.statusCode, rejected.headers?.["X-Outright-Operation"], runtime.files.operations().length], [403, undefined, recorded], rejected.raw);
+}));
 
 let checkpointAgentOptions;
 let checkpointGate = null;

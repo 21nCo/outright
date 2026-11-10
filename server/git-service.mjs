@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { access, readdir, readFile, realpath } from "node:fs/promises";
+import { access, lstat, readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { utilityBudgetUnavailable, utilityProcesses } from "./subprocess-budget.mjs";
 
@@ -8,7 +8,9 @@ import { utilityBudgetUnavailable, utilityProcesses } from "./subprocess-budget.
 // ends the admission, given the failure if there was one (a Git process
 // whose ownership was lost keeps the worktree held). Check and admission
 // are synchronous.
-export function createGitService({ database, getProjects, getConfig, subprocesses = utilityProcesses, admitWriter = () => () => {} }) {
+// `hooks.beforeEditorLookup(path)` runs before each name of a path for the
+// editor is looked at, so tests can replace a folder at exactly that moment.
+export function createGitService({ database, getProjects, getConfig, subprocesses = utilityProcesses, admitWriter = () => () => {}, hooks = {} }) {
   const git = (cwd, args, overrides = {}) => runGit(subprocesses, cwd, args, overrides);
   const safeGit = async (cwd, args, overrides = {}) => {
     try { return await git(cwd, args, overrides); }
@@ -186,7 +188,7 @@ export function createGitService({ database, getProjects, getConfig, subprocesse
 
   async function openInEditor(worktreePath, filePath, editor) {
     const cwd = await requireWorktree(worktreePath);
-    const target = filePath ? await requireChildPath(cwd, filePath) : cwd;
+    const target = filePath ? await requireCanonicalChild(cwd, filePath, hooks) : await requireAdmittedRoot(cwd);
     const configured = editor || database.getSettings().editor;
     const commands = {
       zed: ["zed", [target]],
@@ -296,7 +298,77 @@ function parsePorcelain(output) {
 }
 async function validateFiles(cwd, files) { if (!Array.isArray(files) || !files.length) throw httpError(400, "At least one file is required"); for (const file of files) await requireChildPath(cwd, file); return files; }
 async function requireChildPath(root, child) { const resolved = path.resolve(root, child); if (!isWithin(root, resolved)) throw httpError(403, "File path escapes the worktree"); return resolved; }
-function isWithin(root, target) { const relative = path.relative(root, target); return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative)); }
+// The editor opens what a path leads to, so a link inside the worktree (the
+// file or any folder above it) that leads out is refused like a path that
+// does. The path is walked one name at a time from the canonical root: a
+// link must lead to an existing place inside, so a dangling link (whose
+// target a save would create, wherever it points) is refused too. Only a
+// name that is genuinely absent ends the walk, and the rest is appended to
+// the canonical folder reached so far.
+// The walk's answer is then checked as a whole, because a folder it passed
+// may have been replaced since: the deepest existing place must still
+// resolve (realpath, every link followed now) to a place inside the root,
+// and an absent name must still be absent there; otherwise nothing is
+// launched (409, retry). That canonical path is what the editor is given.
+// Once the editor has the path, a later replacement of a folder on it is
+// outside what a path can guard; only the moment of the decision is checked.
+// The base is the canonical root requireWorktree admitted (requireAdmittedRoot).
+// An editor opens an existing path as it is, but Zed trims an absent one
+// (Unicode white space, U+0085 too) and reads a ":" anywhere in it, or a name
+// ending in "(12)" or "(12,5)" in any digits, as a place in another file.
+async function requireCanonicalChild(root, child, hooks = {}) {
+  const names = path.relative(root, await requireChildPath(root, child)).split(path.sep).filter(Boolean);
+  const changed = () => httpError(409, "The path changed while it was checked; retry");
+  const base = await requireAdmittedRoot(root);
+  let current = base;
+  let absent = names.length;
+  for (const [index, name] of names.entries()) {
+    const next = path.join(current, name);
+    await hooks.beforeEditorLookup?.(next);
+    let info;
+    try { info = await lstat(next); }
+    catch (error) {
+      // Absent here (or under a file, which has no children): nothing to follow.
+      if (["ENOENT", "ENOTDIR"].includes(error?.code)) { absent = index; break; }
+      throw httpError(403, "File path cannot be checked inside the worktree");
+    }
+    if (!info.isSymbolicLink()) { current = next; continue; }
+    try { current = await realpath(next); }
+    catch { throw httpError(403, "File path is a link whose target cannot be checked inside the worktree"); }
+    if (!isWithin(base, current)) throw httpError(403, "File path leads outside the worktree");
+  }
+  let found;
+  try { found = await realpath(current); } catch { throw changed(); }
+  if (!isWithin(base, found)) throw changed();
+  if (absent === names.length) return found;
+  // The name is absent there, and the folder it is absent from is still the
+  // canonical one (`found` came from realpath, so it is its own realpath).
+  const missing = path.join(found, names[absent]);
+  let gone = false;
+  try { await lstat(missing); }
+  catch (error) { gone = ["ENOENT", "ENOTDIR"].includes(error?.code); }
+  if (!gone || await realpath(found).catch(() => null) !== found) throw changed();
+  const target = path.join(missing, ...names.slice(absent + 1));
+  const name = names.at(-1);
+  const open = name.lastIndexOf("(");
+  const position = open > 0 && name.endsWith(")") ? name.slice(open + 1, -1) : "";
+  if (target.slice(path.parse(target).root.length).includes(":") || /^[\s\u0085]|[\s\u0085]$/u.test(name) || /^\p{Nd}+(?:,\p{Nd}+)?$/u.test(position)) throw httpError(403, "A path to a new file cannot hold a \":\" anywhere (in the worktree path, a folder or the name), and its name cannot end in a line locator such as (12) or have white space around it, which an editor reads as another file");
+  return target;
+}
+// The canonical root requireWorktree admitted must still resolve to itself:
+// one replaced since (by a link elsewhere) is 409, and nothing is launched.
+async function requireAdmittedRoot(root) {
+  let current;
+  try { current = await realpath(root); } catch { throw httpError(403, "The worktree cannot be checked"); }
+  if (current !== root) throw httpError(409, "The path changed while it was checked; retry");
+  return root;
+}
+// Containment by path segment: "..large.log" or "..cache/x" is a child, while
+// ".." and "../x" (or another drive on Windows) are not.
+function isWithin(root, target) {
+  const relative = path.relative(root, target);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
 async function canonicalPath(target) { try { return await realpath(target); } catch { return path.resolve(target); } }
 async function exists(target) { try { await access(target); return true; } catch { return false; } }
 function httpError(statusCode, message) { const error = new Error(message); error.statusCode = statusCode; return error; }
