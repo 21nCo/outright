@@ -62,10 +62,12 @@ async function run() {
   // Page 3 arrives after page 4 was asked for.
   next();
   await until(() => pages[3], "page 3 asked for");
+  // While page 3 is on its way, page 2's drawing is not shown as page 3.
+  const pending = { canvasHidden: document.querySelector("canvas").hidden, canvasLabel: document.querySelector("canvas").getAttribute("aria-label"), loading: document.querySelector(".pdf-frame [role=status]")?.textContent ?? "" };
   next();
   await until(() => status() === "Page 4 of 5" && pageText()?.length > 1000, "page 4 text");
   await wait(300);
-  result.skipped = { page2: snapshot(2), page3: snapshot(3), page4: snapshot(4), textLength: pageText().length };
+  result.skipped = { page2: snapshot(2), page3: snapshot(3), page4: snapshot(4), textLength: pageText().length, pending };
 
   // A page pdf.js cannot read settles its text, and Retry opens the document again.
   next();
@@ -100,6 +102,19 @@ async function run() {
   const brokenDocuments = documents.filter((record) => record.url === "/broken.pdf");
   result.brokenRefreshed = { opened: brokenDocuments.length, firstEnded: broken.destroyed && broken.port.destroyed, alert: document.querySelector("[role=alert]")?.textContent ?? "", failures: brokenFailures };
   brokenRoot.unmount();
+
+  // The error's own Retry opens a document again, with no refresh.
+  const retriedFailures = [];
+  const retryRoot = createRoot(host);
+  flushSync(() => retryRoot.render(<PdfPreview url="/broken-again.pdf" name="broken-again.pdf" refreshKey={0} onFailed={(message) => retriedFailures.push(message)} />));
+  await until(() => document.querySelector("[role=alert]")?.textContent.includes("This PDF could not be read"), "the second broken document");
+  const retryButton = document.querySelector("[role=alert] button");
+  const button = retryButton?.textContent ?? "";
+  retryButton?.click();
+  await until(() => status() === "Page 1 of 5", "the second broken document retried");
+  const again = documents.filter((record) => record.url === "/broken-again.pdf");
+  result.brokenRetried = { button, alert: document.querySelector("[role=alert]")?.textContent ?? "", opened: again.length, firstEnded: again[0].destroyed && again[0].port.destroyed, failures: retriedFailures };
+  retryRoot.unmount();
 
   await fetch("/retire-worker", { method: "POST" });
   const failures = [];

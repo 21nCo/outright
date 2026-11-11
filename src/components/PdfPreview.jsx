@@ -39,9 +39,10 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
   const onFailedRef = useRef(onFailed);
   useEffect(() => { onFailedRef.current = onFailed; });
   const [page, setPage] = useState(1);
-  // The page on show, fetched once per page and document: { proxy, signal }.
-  // The signal aborts when the page is left, which stops its drawing and
-  // text reading before the page is released.
+  // The page on show, fetched once per page and document: { proxy, signal,
+  // page }. The signal aborts when the page is left, which stops its drawing
+  // and text reading before the page is released. Until the asked-for page
+  // arrives, the canvas (still holding the last page) is hidden and cleared.
   const [pageSession, setPageSession] = useState(null);
   const [width, setWidth] = useState(0);
   const [pageText, setPageText] = useState({ status: "loading" });
@@ -123,12 +124,13 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     setPageSession(null);
     setPageError(null);
     setPageText({ status: "loading" });
+    if (canvasRef.current) canvasRef.current.width = 0;
     if (!pdf) return undefined;
     const session = new AbortController();
     let proxy;
     pdf.getPage(page).then((value) => {
       proxy = value;
-      if (session.signal.aborted) value.cleanup(); else setPageSession({ proxy: value, signal: session.signal });
+      if (session.signal.aborted) value.cleanup(); else setPageSession({ proxy: value, signal: session.signal, page });
     }, (error) => {
       if (session.signal.aborted) return;
       setPageError({ message: `This page could not be read: ${error?.message || "unknown error"}`, retry: "reopen" });
@@ -186,7 +188,8 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
   if (pdfState.status === "reload") return <div className="preview-state" role="alert"><WarningCircle /><p>Outright was updated, or part of it did not load, so the PDF viewer needs a page reload. Reloading clears unsent messages.</p>
     <Button variant="outline" size="xs" onClick={() => window.location.reload()}><ArrowsClockwise />Reload page</Button>
     {pdfState.retryable && <Button variant="ghost" size="xs" onClick={() => setReopen((value) => value + 1)}>Try again</Button>}</div>;
-  if (pdfState.status === "error") return <div className="preview-state" role="alert"><WarningCircle />This PDF could not be read: {pdfState.message}</div>;
+  if (pdfState.status === "error") return <div className="preview-state" role="alert"><WarningCircle /><p>This PDF could not be read: {pdfState.message}</p><Button variant="outline" size="xs" onClick={() => setReopen((value) => value + 1)}><ArrowsClockwise />Retry</Button></div>;
+  const pageShown = pageSession?.page === page;
   return <div className="pdf-preview">
     <div className="pdf-toolbar" role="group" aria-label="PDF pages">
       <Button variant="ghost" size="icon-xs" aria-label="Previous page" disabled={page <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}><CaretLeft /></Button>
@@ -194,7 +197,8 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
       <Button variant="ghost" size="icon-xs" aria-label="Next page" disabled={page >= pdfState.pages} onClick={() => setPage((value) => Math.min(pdfState.pages, value + 1))}><CaretRight /></Button>
     </div>
     <div className="pdf-frame" ref={frameRef}>
-      <canvas ref={canvasRef} role="img" hidden={Boolean(pageError)} aria-label={`Page ${page} of ${pdfState.pages} of ${name}`} />
+      <canvas ref={canvasRef} role="img" hidden={Boolean(pageError) || !pageShown} aria-label={`Page ${page} of ${pdfState.pages} of ${name}`} />
+      {!pageError && !pageShown && <div className="preview-state" role="status"><SpinnerGap className="spin" />Reading page {page}…</div>}
       {pageError && <div className="preview-state" role="alert"><p>{pageError.message}</p>{pageError.retry && <Button variant="outline" size="xs" onClick={retryPage}><ArrowsClockwise />Retry</Button>}</div>}
     </div>
     <details className="pdf-text"><summary>Page text</summary><p>{{ loading: "Reading page text…", failed: "This page's text could not be read." }[pageText.status] ?? (pageText.text || "No text found on this page.")}</p></details>
