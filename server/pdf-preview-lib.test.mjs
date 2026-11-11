@@ -87,6 +87,25 @@ test("an error naming no same-origin address is retried with the original import
   assert.equal(failedModuleUrl(fetchFailure("https://elsewhere.test/x.js"), origin), null);
 });
 
+test("an import that keeps failing without naming an address offers a reload, and can still be tried again", async () => {
+  let calls = 0;
+  let online = false;
+  const load = retryingImport(() => { calls += 1; return online ? Promise.resolve(pdfjs) : Promise.reject(new TypeError("Importing a module script failed.")); }, options({
+    importUrl: () => assert.fail("no address to retry"),
+    probe: () => assert.fail("nothing to ask about"),
+  }));
+  const first = await load().catch((error) => error);
+  assert.equal(first.reloadRequired, undefined, "one failure is retried in place");
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const error = await load().catch((caught) => caught);
+    assert.equal(error.reloadRequired, true);
+    assert.equal(error.retryable, true);
+  }
+  assert.equal(calls, 3, "each attempt imports again");
+  online = true;
+  assert.equal(await load(), pdfjs);
+});
+
 test("probing a script tells a gone file from a present one and from an unreachable server", async () => {
   let cancelled = 0;
   const answer = (status, type) => async (href, init) => {
@@ -167,6 +186,28 @@ test("a silent pdf.js worker is ended at its startup deadline and its failure se
   assert.equal(silent.worker.listeners(), 0);
 });
 
+test("a pdf.js worker start abandoned before it is ready ends quietly: no probe, no failure counted, no timer left", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const fake = fakeWorkers();
+  const probed = [];
+  const start = pdfWorkerStarter({ createWorker: fake.createWorker, base: () => `${origin}/`, startupMs: 1000, probe: async (href) => { probed.push(href); return "present"; } });
+  const abandoned = start("/assets/pdf.worker.mjs");
+  abandoned.cancel();
+  const error = await abandoned.ready.catch((caught) => caught);
+  assert.equal(error.name, "AbortError");
+  assert.ok(abandoned.worker.terminated);
+  assert.equal(abandoned.worker.listeners(), 0);
+  t.mock.timers.tick(5000);
+  abandoned.worker.emit("error", {});
+  assert.deepEqual(probed, []);
+  const next = start("/assets/pdf.worker.mjs");
+  assert.equal(new URL(next.worker.url).search, "", "the next start asks for the script as usual");
+  next.worker.emit("message", { data: { sourceName: "worker", action: "ready" } });
+  await next.ready;
+  next.cancel();
+  assert.equal(next.worker.terminated, false, "cancelling a started worker leaves it to its document");
+});
+
 // The pre-change normalisation, which copied the whole page's text first.
 const wholePageText = (items) => items.map((item) => item.str ?? "").join(" ").replace(/\s+/g, " ").trim();
 function textStream(chunks, counters = {}) {
@@ -203,6 +244,27 @@ test("a page with endless text is read only up to the limit, and pdf.js's stream
   assert.ok(counters.cancelled);
   // 100 items of 250 characters each cover the limit in four chunks.
   assert.ok(counters.pulls <= 6, `pulled ${counters.pulls} chunks`);
+});
+
+test("page text stops at its input budget for endless whitespace, empty items and empty chunks, and cancels the stream", async () => {
+  const spaces = {};
+  // A million spaces in a thousand chunks: no text, but no more than the default budget is read.
+  assert.equal(await readPageText(textStream((index) => index < 1000 ? [{ str: " ".repeat(1000) }] : null, spaces)), "");
+  assert.ok(spaces.cancelled);
+  assert.ok(spaces.pulls <= 4 * PAGE_TEXT_LIMIT / 1000 + 2, `pulled ${spaces.pulls} chunks`);
+  const empty = {};
+  assert.equal(await readPageText(textStream(() => Array.from({ length: 10 }, () => ({})), empty), { max: 10, maxItems: 50 }), "");
+  assert.ok(empty.cancelled && empty.pulls <= 6, `pulled ${empty.pulls} chunks`);
+  const none = {};
+  assert.equal(await readPageText(textStream(() => [], none), { max: 10, maxItems: 50 }), "");
+  assert.ok(none.cancelled && none.pulls <= 51, `pulled ${none.pulls} chunks`);
+});
+
+test("page text scans no item past the input budget and keeps no more of a huge word than fits", async () => {
+  assert.equal(await readPageText(textStream([[{ str: `${" ".repeat(15)}abcdefghijklmnop` }]]), { max: 10, maxInput: 20 }), "abcde");
+  assert.equal(await readPageText(textStream([[{ str: "a b" }, { str: "cdefghij" }]]), { max: 10, maxInput: 5 }), "a b cd");
+  const huge = await readPageText(textStream([[{ str: "x".repeat(3_000_000) }]]));
+  assert.equal(huge.length, PAGE_TEXT_LIMIT);
 });
 
 test("abandoning a page's text cancels pdf.js's stream", async () => {

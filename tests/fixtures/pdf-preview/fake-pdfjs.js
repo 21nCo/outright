@@ -1,9 +1,16 @@
 // Stands in for pdfjs-dist in the PdfPreview browser fixture and records
-// what the viewer asks of each page. Page 2 fails to draw, page 3 arrives
-// only after page 4 is asked for, and page 4 has endless text.
+// what the viewer asks of each page. Like pdf.js, a document answers each
+// page number with one promise, kept for as long as the document is open,
+// failures included. Page 2's first drawing fails, page 3 arrives only after
+// page 4 is asked for, page 4 has endless text, page 5 cannot be read the
+// first time /doc.pdf is opened and its first text read fails. /broken.pdf
+// cannot be opened. While control.holdDrawing is set, a drawing runs until
+// it is cancelled.
 export const pages = {};
 export const documents = [];
-const WORDS = ["", "one", "two", "three"];
+export const ports = [];
+export const control = { holdDrawing: false };
+const WORDS = ["", "one", "two", "three", "four", "five"];
 
 class FakePage {
   constructor(number) {
@@ -14,10 +21,12 @@ class FakePage {
 
   render() {
     this.renders += 1;
+    const attempt = this.renders;
     let cancel;
     let settled = false;
     const promise = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { settled = true; this.settledRenders += 1; if (this.number === 2) reject(new Error("broken drawing")); else resolve(); }, 30);
+      const finish = () => { settled = true; this.settledRenders += 1; if (this.number === 2 && attempt === 1) reject(new Error("broken drawing")); else resolve(); };
+      const timer = control.holdDrawing ? null : setTimeout(finish, 30);
       // Like pdf.js, cancelling a finished drawing does nothing.
       cancel = () => {
         if (settled) return;
@@ -35,10 +44,12 @@ class FakePage {
   streamTextContent() {
     this.textReads += 1;
     const page = this;
+    const read = this.textReads;
     let sent = false;
     return new ReadableStream({
       pull(controller) {
         if (page.number === 4) controller.enqueue({ items: Array.from({ length: 100 }, () => ({ str: "endless text " })) });
+        else if (page.number === 5 && read === 1) controller.error(new Error("broken text"));
         else if (sent) controller.close();
         else { sent = true; controller.enqueue({ items: [{ str: `Page ${WORDS[page.number]}` }, { str: "  text " }] }); }
       },
@@ -54,24 +65,32 @@ class FakePage {
 }
 
 export class PDFWorker {
-  constructor({ port }) { this.port = port; }
+  constructor({ port }) { Object.assign(this, { port, destroyed: false }); ports.push(this); }
   destroy() { this.destroyed = true; }
 }
 
 let releasePage3;
 const page3Released = new Promise((resolve) => { releasePage3 = resolve; });
 
-export function getDocument({ url }) {
-  const record = { url, destroyed: false };
+export function getDocument({ url, worker }) {
+  const record = { url, destroyed: false, port: worker };
   documents.push(record);
+  const opened = documents.filter((each) => each.url === url).length;
+  const promises = new Map();
   const pdf = {
-    numPages: 4,
+    numPages: 5,
     getPage(number) {
-      pages[number] ??= new FakePage(number);
-      if (number === 4) releasePage3();
-      const ready = number === 3 ? page3Released : Promise.resolve();
-      return ready.then(() => new Promise((resolve) => setTimeout(() => resolve(pages[number]), 5)));
+      if (!promises.has(number)) {
+        pages[number] ??= new FakePage(number);
+        if (number === 4) releasePage3();
+        const ready = number === 3 ? page3Released : Promise.resolve();
+        promises.set(number, ready.then(() => new Promise((resolve, reject) => setTimeout(() => {
+          if (number === 5 && opened === 1) reject(new Error("bad page object")); else resolve(pages[number]);
+        }, 5))));
+      }
+      return promises.get(number);
     },
   };
-  return { promise: Promise.resolve(pdf), destroy: async () => { record.destroyed = true; } };
+  const promise = url === "/broken.pdf" ? Promise.reject(new Error("Invalid PDF structure")) : Promise.resolve(pdf);
+  return { promise, destroy: async () => { record.destroyed = true; } };
 }

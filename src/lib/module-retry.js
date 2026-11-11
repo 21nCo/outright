@@ -18,6 +18,11 @@
 // gave a module without the names asked for (the error named one of its
 // imports, not the module). A network that is still down is not one: the
 // next attempt retries.
+//
+// An error that names no address cannot be probed, so a chunk that is gone
+// would fail every retry. After failing twice in a row that way, the error
+// carries reloadRequired and retryable: the viewer offers the reload, and
+// still lets the user try again in case the network was down.
 let attempts = 0;
 
 export function failedModuleUrl(error, origin) {
@@ -45,6 +50,7 @@ export async function probeScript(href, { fetchImpl = globalThis.fetch, timeoutM
 export function retryingImport(load, { exports = [], importUrl = (href) => import(/* @vite-ignore */ href), origin, probe = probeScript } = {}) {
   let loaded = null;
   let failedUrl = null;
+  let unnamed = 0;
   return () => {
     if (loaded) return loaded;
     let retried = null;
@@ -61,6 +67,8 @@ export function retryingImport(load, { exports = [], importUrl = (href) => impor
     }, async (error) => {
       const named = failedModuleUrl(error, origin ?? globalThis.location?.origin);
       failedUrl = named ?? failedUrl;
+      unnamed = failedUrl ? 0 : unnamed + 1;
+      if (unnamed >= 2) Object.assign(error, { reloadRequired: true, retryable: true });
       const state = named || retried ? await probe((named ?? retried).href) : "unreachable";
       if (state === "gone" || (state === "present" && retried)) Object.assign(error, { reloadRequired: true });
       throw error;

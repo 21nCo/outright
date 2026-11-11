@@ -92,21 +92,21 @@ function runChrome(executable, profile, url, timeoutMs) {
   });
 }
 
-test("the PDF viewer reads each page once, releases pages it leaves, keeps text when drawing fails, redraws a dragged pane once and asks for a reload when its worker is gone", { timeout: 120_000 }, async (t) => {
+test("the PDF viewer reads each page once, stops a page's work before releasing it, retries only what failed, ends documents that fail, redraws a dragged pane once and asks for a reload when its worker is gone", { timeout: 180_000 }, async (t) => {
   const executable = chromeExecutable();
   assert.ok(executable, "Chrome or Chromium is required to run the PDF viewer fixture");
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-pdf-preview-"));
   t.after(() => rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   const script = (await bundle()).replaceAll("</script", "<\\/script");
-  const { server, done } = fixtureServer(`<!doctype html><meta charset="utf-8"><body><div id="host"></div><script>${script}</script><img src="/hold" alt=""></body>`, 60_000);
+  const { server, done } = fixtureServer(`<!doctype html><meta charset="utf-8"><body><div id="host"></div><script>${script}</script><img src="/hold" alt=""></body>`, 140_000);
   t.after(() => new Promise((resolve) => { server.closeAllConnections(); server.close(resolve); }));
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const run = await runChrome(executable, path.join(directory, "profile"), `http://127.0.0.1:${server.address().port}/`, 90_000);
+  const run = await runChrome(executable, path.join(directory, "profile"), `http://127.0.0.1:${server.address().port}/`, 150_000);
   const posted = await Promise.race([done, null]);
   assert.ok(posted, `the fixture did not finish: exit ${run.code ?? run.signal}; ${run.stderr}`);
   const outcome = JSON.parse(posted);
   assert.ok(outcome.ok, outcome.error);
-  const { opened, dragged, failedDraw, skipped, closed, retired } = outcome.result;
+  const { opened, dragged, failedDraw, retried, skipped, unreadable, reopened, refreshed, closed, broken, retired } = outcome.result;
 
   // Opening draws page 1 once and reads its text once.
   assert.equal(opened.renders, 1);
@@ -115,12 +115,18 @@ test("the PDF viewer reads each page once, releases pages it leaves, keeps text 
   assert.equal(dragged.renders, 2 + dragged.stalls, JSON.stringify(dragged));
   assert.equal(dragged.textReads, 1);
   assert.equal(dragged.canvasWidth, "448px");
-  // Leaving page 1 releases it, after its drawing has stopped.
+  // Leaving page 1 while it is drawn cancels the drawing before the page is released.
   assert.deepEqual(failedDraw.page1.cleanups, [0]);
+  assert.equal(failedDraw.page1.cancelledRenders, 1);
   // A page that fails to draw still offers its text, and a Retry.
   assert.match(failedDraw.alert, /could not be drawn: broken drawing/);
   assert.equal(failedDraw.text, "Page two text");
   assert.ok(failedDraw.retry);
+  // Retry draws it again, though pdf.js gives back the same page at once, and does not read its text again.
+  assert.equal(retried.page2.renders, 2);
+  assert.equal(retried.page2.textReads, 1);
+  assert.equal(retried.text, "Page two text");
+  assert.equal(retried.canvasHidden, false);
   // A page left before it arrived is released and never drawn or read.
   assert.equal(skipped.page2.cleanups.length, 1);
   assert.equal(skipped.page3.renders, 0);
@@ -129,9 +135,24 @@ test("the PDF viewer reads each page once, releases pages it leaves, keeps text 
   // Endless page text stops at the limit and pdf.js's stream is cancelled.
   assert.equal(skipped.textLength, 100_000);
   assert.ok(skipped.page4.textCancelled);
-  // Closing releases the shown page and ends the document.
-  assert.equal(closed.page4.cleanups.length, 1);
-  assert.ok(closed.destroyed);
+  // A page pdf.js cannot read says its text cannot be read, not that it is being read.
+  assert.match(unreadable.alert, /page could not be read: bad page object/);
+  assert.equal(unreadable.text, "This page's text could not be read.");
+  // Its Retry opens the document again on the same page and ends the old one.
+  assert.equal(reopened.opened, 2);
+  assert.ok(reopened.firstEnded);
+  assert.equal(reopened.page5.renders, 1);
+  assert.equal(reopened.text, "This page's text could not be read.");
+  // A refresh reads failed text again and leaves the drawn page as it is.
+  assert.equal(refreshed.page5.textReads, 2);
+  assert.equal(refreshed.page5.renders, 1);
+  // Closing releases the shown page and ends every document and its worker port.
+  assert.equal(closed.page5.cleanups.length, 1);
+  assert.ok(closed.ended);
+  // A document that cannot be opened is reported once and ended while its error is shown.
+  assert.equal(broken.url, "/broken.pdf");
+  assert.deepEqual(broken.failures, ["Invalid PDF structure"]);
+  assert.ok(broken.destroyed && broken.portDestroyed);
   // A worker script gone after an update asks for a reload the user starts, not a Retry that cannot work.
   assert.match(retired.alert, /needs a page reload/);
   assert.equal(retired.button, "Reload page");

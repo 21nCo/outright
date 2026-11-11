@@ -8,7 +8,8 @@
 // within startupMs is treated as failed, so a silent one cannot leave the
 // preview reading forever. A failure whose script the server no longer has
 // (an update replaced its hashed name) carries reloadRequired, since no
-// retry of that address can start it.
+// retry of that address can start it. A start its caller abandons is
+// cancelled: the worker ends, and nothing is probed or counted as failed.
 import { probeScript } from "./module-retry.js";
 
 export function pdfWorkerStarter({ createWorker = (url) => new Worker(url, { type: "module" }), base = () => globalThis.location?.href, startupMs = 20_000, probe = probeScript } = {}) {
@@ -18,17 +19,19 @@ export function pdfWorkerStarter({ createWorker = (url) => new Worker(url, { typ
     const address = new URL(scriptUrl, base());
     if (failed) address.searchParams.set("retry", String(++retries));
     const worker = createWorker(address.href);
+    let cancel;
     const ready = new Promise((resolve, reject) => {
-      const settle = () => { clearTimeout(timer); worker.removeEventListener("message", onMessage); worker.removeEventListener("error", onError); };
+      let pending = true;
+      // Ends the start once: true only for the first caller.
+      const settle = () => { const was = pending; pending = false; clearTimeout(timer); worker.removeEventListener("message", onMessage); worker.removeEventListener("error", onError); return was; };
       // pdf.js's worker says "ready" once it can take a document.
       const onMessage = ({ data }) => {
-        if (data?.sourceName !== "worker" || data?.action !== "ready") return;
-        settle();
+        if (data?.sourceName !== "worker" || data?.action !== "ready" || !settle()) return;
         failed = false;
         resolve();
       };
       const fail = (reason) => {
-        settle();
+        if (!settle()) return;
         failed = true;
         worker.terminate();
         const error = new Error(`The PDF reader did not start${reason}`);
@@ -38,7 +41,12 @@ export function pdfWorkerStarter({ createWorker = (url) => new Worker(url, { typ
       const timer = setTimeout(() => fail(" in time"), startupMs);
       worker.addEventListener("message", onMessage);
       worker.addEventListener("error", onError);
+      cancel = () => {
+        if (!settle()) return;
+        worker.terminate();
+        reject(Object.assign(new Error("The PDF reader was no longer needed"), { name: "AbortError" }));
+      };
     });
-    return { worker, ready };
+    return { worker, ready, cancel };
   };
 }
