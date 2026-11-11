@@ -27,8 +27,8 @@ const startWorker = pdfWorkerStarter();
 // preview offers Retry and a refresh opens it afresh, unless only a page
 // reload can load the viewer again (see module-retry.js): then this offers
 // the reload, which the user starts. A page that fails to draw offers its
-// own Retry (a stalled one fails the document), and is drawn again on the
-// next refresh; text that fails to read is read again on the next refresh.
+// own Retry (a stalled one opens the document again), and is drawn again on
+// the next refresh; text that fails to read is read again on the next refresh.
 // A page that cannot be read at all (pdf.js keeps that failure for the open
 // document) is retried by opening the document again.
 export default function PdfPreview({ url, name, refreshKey, onFailed }) {
@@ -64,7 +64,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
   const reopenDocument = () => { rootRef.current?.focus(); setReopen((value) => value + 1); };
 
   useEffect(() => {
-    const doc = { release: null, fail: null }; // Used by the page on show.
+    const doc = { release: null }; // The page on show puts its release here.
     const key = reopen;
     const download = new AbortController();
     let cancelled = false;
@@ -98,7 +98,6 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
       setPdfState({ key, status: "error", message });
       onFailedRef.current?.(message);
     };
-    doc.fail = fail;
     (async () => {
       const [pdfjs, data] = await Promise.all([loadPdfjs(), fetchPdf(url, { signal: download.signal })]);
       // Unmounted or reopened while the viewer loaded: start nothing.
@@ -160,7 +159,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     const arriving = pdf.getPage(page);
     arriving.then((value) => {
       proxy = value;
-      if (session.signal.aborted) value.cleanup(); else setPageSession({ proxy: value, signal: session.signal, key: pageKey, doc });
+      if (session.signal.aborted) value.cleanup(); else setPageSession({ proxy: value, signal: session.signal, key: pageKey });
     }, () => {});
     withDeadline(arriving, PDF_DEADLINES.stallMs, "it did not arrive in time").catch((error) => {
       if (session.signal.aborted) return;
@@ -174,8 +173,9 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
   // Drawing follows the page, the pane's width and Retry. A cancelled
   // drawing is not an error: a newer one replaces it.
   useEffect(() => {
-    if (!pageSession || pageSession.signal.aborted || !width || !canvasRef.current) return undefined;
-    const { proxy, signal, key, doc: owner } = pageSession;
+    // A visit whose drawing stalled is not drawn again, even on a resize.
+    if (!pageSession || pageSession.signal.aborted || !width || !canvasRef.current || pageError?.retry === "reopen") return undefined;
+    const { proxy, signal, key } = pageSession;
     let cancelled = false;
     setPageError(null);
     // The canvas is sized within a pixel budget before it is allocated.
@@ -194,11 +194,12 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     const render = proxy.render({ canvas, canvasContext: canvas.getContext("2d"), viewport: proxy.getViewport({ scale: size.scale }) });
     const stop = () => { if (!cancelled) { cancelled = true; render.cancel(); } };
     signal.addEventListener("abort", stop, { once: true });
-    // A drawing with no progress for stallMs fails its document, as the worker
-    // may no longer answer: only opening it again can retry it. A hidden page
-    // pauses drawing (pdf.js draws in animation frames), so it never stalls.
+    // A drawing with no progress for stallMs is stopped; as the worker may no
+    // longer answer, its Retry opens the document again, and other pages can
+    // still be visited. A hidden page pauses drawing (pdf.js draws in
+    // animation frames), so it never stalls.
     let timer;
-    const progress = () => { clearTimeout(timer); timer = setTimeout(() => { if (document.hidden) { progress(); return; } stop(); owner.fail(new Error("A page stopped drawing")); }, PDF_DEADLINES.stallMs); };
+    const progress = () => { clearTimeout(timer); timer = setTimeout(() => { if (document.hidden) { progress(); return; } stop(); setPageError({ key, message: "This page could not be drawn: it stopped making progress", retry: "reopen" }); }, PDF_DEADLINES.stallMs); };
     render.onContinue = (next) => { progress(); next(); };
     progress();
     render.promise.finally(() => clearTimeout(timer)).catch((error) => {
@@ -240,7 +241,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     <div className="pdf-frame" ref={frameRef}>
       <canvas ref={canvasRef} role="img" hidden={Boolean(pageError) || !pageShown} aria-label={`Page ${page} of ${shown.pages} of ${name}`} />
       {!pageError && !pageShown && <div className="preview-state" role="status"><SpinnerGap className="spin" />Reading page {page}…</div>}
-      {!pageError && pageShown && refusedImage === reopen && <p className="preview-state" role="status">Some images in this PDF are too large to show. Each page's text is below it.</p>}
+      <p role="status" className={refusedImage === reopen ? "preview-state" : undefined}>{refusedImage === reopen && "Some images in this PDF are too large to show. Each page's text is below it."}</p>
       {pageError && <div className="preview-state" role="alert"><p>{pageError.message}</p>{pageError.retry && <Button variant="outline" size="xs" onClick={retryPage}><ArrowsClockwise />Retry</Button>}</div>}
     </div>
     <details className="pdf-text"><summary>Page text</summary><p>{{ loading: "Reading page text…", failed: "This page's text could not be read." }[pageText.status] ?? (pageText.text || "No text found on this page.")}</p></details>

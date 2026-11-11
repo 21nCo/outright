@@ -194,15 +194,18 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
     assert.deepEqual(ended.slice(0, 2).sort(), ["render-cancel", "text-cancel"], JSON.stringify(ended));
     assert.deepEqual(ended.slice(2), ["cleanup", "destroy", "port-destroy", "terminate"], JSON.stringify(ended));
   }
-  // A drawing with no progress in time is cancelled and fails its document, which then ends in order.
-  assert.match(slow.alert, /could not be read: A page stopped drawing/);
+  // A drawing with no progress in time is cancelled, keeps its text, and fails only its page, which a resize neither clears nor draws again.
+  assert.match(slow.alert, /could not be drawn: it stopped making progress/);
   assert.equal(slow.page1.cancelledRenders, 1);
-  assert.deepEqual(slow.failures, ["A page stopped drawing"]);
-  assert.deepEqual(slow.ended, ["render-cancel", "cleanup", "destroy", "port-destroy", "terminate"]);
-  // A resize neither clears that failure nor draws on the ended document; Retry opens it again.
+  assert.equal(slow.text, "Page one text");
+  assert.deepEqual(slow.failures, []);
   assert.equal(slow.resized.alert, slow.alert);
   assert.equal(slow.resized.renders, slow.page1.renders);
+  // Its Retry opens the document again, after the stalled one has ended in order.
+  assert.deepEqual(slow.reopened.slowEnded, ["render-cancel", "cleanup", "destroy", "port-destroy", "terminate"]);
   assert.ok(slow.reopened.focusKept);
+  // After a stall, another page of the same document can still be visited and drawn.
+  assert.deepEqual(slow.otherPage, { renders: 1, opened: 1 });
   // A drawing that keeps making progress past the deadline finishes.
   assert.deepEqual([progressing.page1.renders, progressing.page1.cancelledRenders, progressing.alert, progressing.canvasHidden], [1, 0, "", false]);
   // A page that arrives after its deadline is released once on arrival and never drawn or read, whether another page is on show or the viewer has closed.

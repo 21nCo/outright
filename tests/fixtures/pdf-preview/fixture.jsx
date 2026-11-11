@@ -179,25 +179,35 @@ async function run() {
   control.holdText = false;
   result.order = { firstCommit: commits.find((commit) => commit.url === "/b.pdf"), returnCommit: commits.filter((commit) => commit.url === "/b.pdf")[1], replaced: teardown(replaced), returned: teardown(returned), closed: teardown(closedRecord) };
 
-  // A drawing with no progress in time fails its document, which stays failed
-  // when the pane is resized, and its Retry opens the document again.
+  // A drawing with no progress in time is stopped and its page fails, also
+  // after the pane is resized; its text stays, and its Retry opens the
+  // document again. Another page can still be visited instead.
   PDF_DEADLINES.stallMs = 300;
   control.holdDrawing = true;
   const slowFailures = [];
   const slowRoot = createRoot(host);
   flushSync(() => slowRoot.render(<PdfPreview url="/slow.pdf" name="slow.pdf" refreshKey={0} onFailed={(message) => slowFailures.push(message)} />));
   const docAlert = () => document.querySelector("[role=alert]")?.textContent ?? "";
-  await until(() => docAlert().includes("stopped drawing") && teardown(documents.at(-1)).includes("terminate"), "the stalled drawing");
+  await until(() => alertText().includes("stopped making progress") && pageText() === "Page one text", "the stalled drawing");
   const slow = documents.at(-1);
-  result.slow = { alert: docAlert(), page1: snapshot(1), failures: [...slowFailures], ended: teardown(slow) };
+  result.slow = { alert: alertText(), page1: snapshot(1), text: pageText(), failures: [...slowFailures] };
   host.style.width = "450px";
   await wait(400);
-  result.slow.resized = { alert: docAlert(), renders: pages[1].renders };
+  result.slow.resized = { alert: alertText(), renders: pages[1].renders };
   control.holdDrawing = false;
-  press(document.querySelector("[role=alert] button"));
-  await until(() => documents.at(-1) !== slow && pages[1]?.settledRenders === 1 && !docAlert(), "slow.pdf opened again");
-  result.slow.reopened = { focusKept: focusKept() };
+  retry();
+  await until(() => documents.at(-1) !== slow && pages[1]?.settledRenders === 1 && !alertText(), "slow.pdf opened again");
+  result.slow.reopened = { slowEnded: teardown(slow), focusKept: focusKept() };
   slowRoot.unmount();
+  control.holdDrawing = true;
+  const stuckRoot = createRoot(host);
+  flushSync(() => stuckRoot.render(<PdfPreview url="/stuck.pdf" name="stuck.pdf" refreshKey={0} />));
+  await until(() => alertText().includes("stopped making progress"), "the stalled drawing of stuck.pdf");
+  control.holdDrawing = false;
+  next();
+  await until(() => status() === "Page 2 of 5" && pages[2]?.settledRenders === 1, "stuck.pdf page 2");
+  result.slow.otherPage = { renders: pages[2].renders, opened: documents.filter((record) => record.url === "/stuck.pdf").length };
+  stuckRoot.unmount();
 
   // A drawing that keeps making progress for longer than the deadline is not stopped.
   control.progressDrawing = 6;
