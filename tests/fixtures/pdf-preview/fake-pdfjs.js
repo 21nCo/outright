@@ -8,7 +8,7 @@
 // for, page 4 has endless text, page 5 cannot be read the first time
 // /doc.pdf is opened and its first text read fails. Each /broken*.pdf cannot
 // be opened the first time. /single.pdf has one page, whose first text read
-// fails. While control.holdDrawing is set, a drawing runs until it is
+// fails; /single-again.pdf is the same, but its first two text reads fail. While control.holdDrawing is set, a drawing runs until it is
 // cancelled or control.resumeDrawing() lets it finish; while control.holdText
 // is set, text never arrives.
 // control.progressDrawing steps of 100 ms each report progress (onContinue)
@@ -67,6 +67,7 @@ class FakePage {
         if (control.holdText) return new Promise(() => {});
         if (this.number === 4) controller.enqueue({ items: Array.from({ length: 100 }, () => ({ str: "endless text " })) });
         else if ((this.number === 5 || this.record.url === "/single.pdf") && read === 1) controller.error(new Error("broken text"));
+        else if (this.record.url === "/single-again.pdf" && read <= 2) controller.error(new Error("broken text"));
         else if (sent) controller.close();
         else { sent = true; controller.enqueue({ items: [{ str: `Page ${WORDS[this.number]}` }, { str: "  text " }] }); }
         return undefined;
@@ -101,7 +102,7 @@ export function getDocument({ data, url: address, worker }) {
   let releasePage3;
   const page3Released = new Promise((resolve) => { releasePage3 = resolve; });
   const pdf = {
-    numPages: url === "/single.pdf" ? 1 : 5,
+    numPages: url.startsWith("/single") ? 1 : 5,
     getPage(number) {
       if (record.destroyed) events.push(`${record.id} getPage-after-destroy`);
       if (!promises.has(number)) {

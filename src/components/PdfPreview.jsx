@@ -26,9 +26,9 @@ const startWorker = pdfWorkerStarter();
 // A document that fails to load is reported through onFailed, so the
 // preview offers Retry and a refresh opens it afresh, unless only a page
 // reload can load the viewer again (see module-retry.js): then this offers
-// the reload, which the user starts. A page that fails to draw offers its
-// own Retry (a stalled one opens the document again), and is drawn again on
-// the next refresh; text that fails to read has its own Retry, and the refresh.
+// the reload, which the user starts. A page that fails to draw has its own
+// Retry (a stalled one opens the document again) and is drawn again on a
+// refresh. Text that fails to read is read again by its own button or a refresh.
 // A page that cannot be read at all (pdf.js keeps that failure for the open
 // document) is retried by opening the document again.
 export default function PdfPreview({ url, name, refreshKey, onFailed }) {
@@ -36,7 +36,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
   const [reopen, setReopen] = useState(0);
   const [pageFailure, setPageError] = useState(null);
   const [drawAttempt, setDrawAttempt] = useState(0);
-  const [textAttempt, setTextAttempt] = useState(0);
+  const [textRetry, setTextRetry] = useState({});
   const onFailedRef = useRef(onFailed);
   useEffect(() => { onFailedRef.current = onFailed; });
   const [page, setPage] = useState(1);
@@ -139,7 +139,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     const again = shown.status === "error" || shown.retryable || pageError?.retry === "reopen";
     if (again) setReopen((value) => value + 1);
     if (pageError?.retry === "draw") setDrawAttempt((value) => value + 1);
-    if (pageText.status === "failed" && !again) setTextAttempt((value) => value + 1);
+    if (pageText.status === "failed" && !again) setTextRetry({});
   }, [refreshKey]);
 
   // The page session. Leaving a page, or its document, first stops its
@@ -192,18 +192,18 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     canvas.style.width = `${size.cssWidth}px`;
     canvas.style.height = `${size.cssHeight}px`;
     const render = proxy.render({ canvas, canvasContext: canvas.getContext("2d"), viewport: proxy.getViewport({ scale: size.scale }) });
-    let timer;
-    const quiet = () => { clearTimeout(timer); document.removeEventListener("visibilitychange", arm); };
+    let timer, since = null, left = PDF_DEADLINES.stallMs;
+    const quiet = () => { clearTimeout(timer); document.removeEventListener("visibilitychange", clock); };
     const stop = () => { quiet(); if (!cancelled) { cancelled = true; render.cancel(); } };
     signal.addEventListener("abort", stop, { once: true });
-    // A drawing with no progress for stallMs of visible time is stopped; as the
-    // worker may no longer answer, its Retry opens the document again, and other
-    // pages can still be visited. A hidden page pauses drawing (pdf.js draws in
-    // animation frames), so hiding it stops the clock and showing it restarts it.
-    const arm = () => { clearTimeout(timer); if (!document.hidden) timer = setTimeout(() => { stop(); setPageError({ key, message: "This page could not be drawn: it stopped making progress", retry: "reopen" }); }, PDF_DEADLINES.stallMs); };
-    document.addEventListener("visibilitychange", arm);
-    render.onContinue = (next) => { arm(); next(); };
-    arm();
+    // A drawing with stallMs of visible time left without progress is stopped; as
+    // the worker may no longer answer, its Retry opens the document again, and
+    // other pages can still be visited. pdf.js draws in animation frames, so hiding
+    // the page pauses the clock and showing it resumes with what was left.
+    const clock = () => { clearTimeout(timer); if (since !== null) left -= performance.now() - since; since = document.hidden ? null : performance.now(); if (since !== null) timer = setTimeout(() => { stop(); setPageError({ key, message: "This page could not be drawn: it stopped making progress", retry: "reopen" }); }, left); };
+    document.addEventListener("visibilitychange", clock);
+    render.onContinue = (next) => { since = null; left = PDF_DEADLINES.stallMs; clock(); next(); };
+    clock();
     render.promise.finally(quiet).catch((error) => {
       if (!cancelled && error?.name !== "RenderingCancelledException") setPageError({ key, message: `This page could not be drawn: ${error?.message || "unknown error"}`, retry: "draw" });
     });
@@ -225,7 +225,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
       (text) => { if (!controller.signal.aborted) setPageText({ key, status: "ready", text }); },
       () => { if (!controller.signal.aborted) setPageText({ key, status: "failed" }); });
     return () => { clearTimeout(late); pageSession.signal.removeEventListener("abort", stop); stop(); };
-  }, [pageSession, textAttempt]);
+  }, [pageSession, textRetry]);
 
   const retryPage = () => { rootRef.current?.focus(); (pageError?.retry === "reopen" ? setReopen : setDrawAttempt)((value) => value + 1); };
   if (shown.status === "loading") return <div ref={rootRef} tabIndex={-1} className="preview-state" role="status"><SpinnerGap className="spin" />Reading PDF…</div>;
@@ -247,6 +247,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
       {pageError && <div className="preview-state" role="alert"><p>{pageError.message}</p>{pageError.retry && <Button variant="outline" size="xs" onClick={retryPage}><ArrowsClockwise />Retry</Button>}</div>}
     </div>
     <details className="pdf-text"><summary>Page text</summary><p>{{ loading: "Reading page text…", failed: "This page's text could not be read." }[pageText.status] ?? (pageText.text || "No text found on this page.")}</p>
-      {pageText.status === "failed" && pageError?.retry !== "reopen" && <Button variant="outline" size="xs" onClick={() => { rootRef.current?.focus(); setTextAttempt((value) => value + 1); }}><ArrowsClockwise />Read text again</Button>}</details>
+      {pageText.status === "failed" && pageError?.retry !== "reopen" && <Button variant="outline" size="xs" onClick={(event) => { event.currentTarget.closest("details").querySelector("summary").focus(); setPageText({ key: pageKey, status: "loading" }); setTextRetry({ key: pageKey }); }}><ArrowsClockwise />Read text again</Button>}
+      <p role="status">{textRetry.key === pageKey && { loading: "Reading page text…", ready: "Page text read.", failed: "This page's text could not be read again." }[pageText.status]}</p></details>
   </div>;
 }

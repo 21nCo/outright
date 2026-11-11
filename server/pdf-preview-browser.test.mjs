@@ -218,10 +218,26 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
   }
   // A drawing left for another page, or closed, leaves no visibility listener.
   assert.deepEqual([hidden.left.page1.cancelledRenders, hidden.left.listeners, hidden.left.closed], [1, 1, 0], JSON.stringify(hidden.left));
+  // Showing a page again resumes its stall clock with what was left (1000 ms allowance): 800 ms used, hidden, shown, it stops about 200 ms later, not a full allowance later.
+  assert.match(hidden.remainder.alert, /stopped making progress/, JSON.stringify(hidden.remainder));
+  assert.ok(hidden.remainder.afterLastShow < 600, JSON.stringify(hidden.remainder));
+  // Hidden and shown every 400 visible ms, it still stops once its visible time reaches the allowance, in the third span.
+  assert.match(hidden.cycled.alert, /stopped making progress/, JSON.stringify(hidden.cycled));
+  assert.ok(hidden.cycled.spans.length <= 3, JSON.stringify(hidden.cycled));
+  for (const stopped of [hidden.remainder, hidden.cycled]) assert.deepEqual([stopped.page1.cancelledRenders, stopped.listeners], [1, 0], JSON.stringify(stopped));
   // Text that failed to read has its own Retry, also on a one-page PDF: it reads the text again without drawing the page again and keeps focus in the viewer.
   assert.deepEqual([textRetry.status, textRetry.button], ["Page 1 of 1", "Read text again"]);
   assert.deepEqual([textRetry.page1.textReads, textRetry.page1.renders, textRetry.after], [2, 1, false]);
   assert.ok(textRetry.focusKept);
+  // Only a text read asked for again is announced, with its outcome, and focus moves to the named Page text disclosure.
+  assert.deepEqual([textRetry.before, textRetry.outcome, textRetry.focus], ["", "Page text read.", "Page text"]);
+  // A read that fails again says it is reading and then that it failed, never the earlier failure first; it keeps its button and focus on the disclosure, and the page is not drawn again.
+  assert.deepEqual(textRetry.again, { said: ["Reading page text…", "This page's text could not be read again."], outcome: "This page's text could not be read again.", button: true, focusKept: true, focus: "Page text", page1: textRetry.again.page1 }, JSON.stringify(textRetry.again));
+  assert.deepEqual([textRetry.again.page1.textReads, textRetry.again.page1.renders], [2, 1]);
+  // Going to another page clears the announcement of a text read asked for again.
+  assert.deepEqual([textRetry.paged.outcome, textRetry.paged.page5.textReads], ["", 2], JSON.stringify(textRetry.paged));
+  // A refresh reads failed text again without announcing it.
+  assert.equal(refreshed.outcome, "");
   // A page that arrives after its deadline is released once on arrival and never drawn or read, whether another page is on show or the viewer has closed.
   assert.deepEqual(late.page2.cleanups, [0]);
   assert.equal(late.page2.renders + late.page2.textReads, 0);

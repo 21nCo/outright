@@ -37,6 +37,8 @@ async function until(check, label, ms = 5000) {
   }
 }
 const pageText = () => document.querySelector(".pdf-text p")?.textContent;
+// What the text disclosure announces about a text read asked for again.
+const textOutcome = () => document.querySelector(".pdf-text [role=status]")?.textContent ?? null;
 const status = () => document.querySelector(".pdf-toolbar [role=status]")?.textContent;
 const alertText = () => document.querySelector(".pdf-frame [role=alert]")?.textContent ?? "";
 // Buttons are pressed as from the keyboard: focused, then activated.
@@ -124,7 +126,7 @@ async function run() {
   // A refresh reads the failed text again without drawing the page again.
   flushSync(() => root.render(<PdfPreview url="/doc.pdf" name="doc.pdf" refreshKey={1} />));
   await until(() => pageText() === "Page five text", "page 5 text read again");
-  result.refreshed = { page5: snapshot(5) };
+  result.refreshed = { page5: snapshot(5), outcome: textOutcome() };
 
   root.unmount();
   await wait(50);
@@ -254,6 +256,36 @@ async function run() {
     return outcome;
   };
   result.hidden = { long: await hiddenDraw("/hidden-long.pdf", 2 * PDF_DEADLINES.stallMs - 50), short: await hiddenDraw("/hidden-short.pdf", PDF_DEADLINES.stallMs - 60) };
+  // Showing the page again does not restore the allowance: a drawing with no
+  // progress that used most of it, then was hidden and shown, stops on what was
+  // left, and hiding and showing it often does not keep it running.
+  PDF_DEADLINES.stallMs = 1000;
+  const stallAfter = async (url, visibleSpans) => {
+    control.holdDrawing = true;
+    const cycledRoot = createRoot(host);
+    flushSync(() => cycledRoot.render(<PdfPreview url={url} name={url.slice(1)} refreshKey={0} />));
+    await until(() => documents.at(-1).url === url && pages[1]?.renders === 1, `${url} drawing`);
+    const spans = [];
+    for (const span of visibleSpans) {
+      const before = performance.now();
+      await wait(span);
+      spans.push(Math.round(performance.now() - before));
+      if (alertText()) break;
+      setHidden(true);
+      await wait(400);
+      setHidden(false);
+    }
+    const shown = performance.now();
+    await until(() => alertText().includes("stopped making progress"), `${url} stopped`, 3000).catch(() => {});
+    const outcome = { spans, afterLastShow: Math.round(performance.now() - shown), alert: alertText(), page1: snapshot(1) };
+    control.holdDrawing = false;
+    cycledRoot.unmount();
+    outcome.listeners = visibilityListeners.size;
+    return outcome;
+  };
+  result.hidden.remainder = await stallAfter("/hidden-remainder.pdf", [800]);
+  result.hidden.cycled = await stallAfter("/hidden-cycled.pdf", [400, 400, 400, 400, 400]);
+  PDF_DEADLINES.stallMs = 300;
   // A drawing left by closing its viewer, or by going to another page, leaves no listener behind.
   control.holdDrawing = true;
   const leftRoot = createRoot(host);
@@ -299,10 +331,39 @@ async function run() {
   document.querySelector(".pdf-text").open = true;
   await until(() => document.querySelector(".pdf-text button"), "the text Retry");
   result.textRetry = { status: status(), button: document.querySelector(".pdf-text button").textContent };
+  result.textRetry.before = textOutcome();
   press(document.querySelector(".pdf-text button"));
   await until(() => pageText() === "Page one text", "single.pdf text read again");
-  Object.assign(result.textRetry, { page1: snapshot(1), focusKept: focusKept(), after: Boolean(document.querySelector(".pdf-text button")) });
+  Object.assign(result.textRetry, { page1: snapshot(1), focusKept: focusKept(), focus: document.activeElement.textContent, outcome: textOutcome(), after: Boolean(document.querySelector(".pdf-text button")) });
   singleRoot.unmount();
+  // Read again and failing again says so, keeps the button, and keeps focus on the named disclosure.
+  const againRoot = createRoot(host);
+  flushSync(() => againRoot.render(<PdfPreview url="/single-again.pdf" name="single-again.pdf" refreshKey={0} />));
+  await until(() => documents.at(-1).url === "/single-again.pdf" && pages[1]?.settledRenders === 1 && pageText() === "This page's text could not be read.", "single-again.pdf text failure");
+  document.querySelector(".pdf-text").open = true;
+  // Everything the announcement says, in order.
+  const said = [];
+  const sayings = new MutationObserver(() => { if (said.at(-1) !== textOutcome()) said.push(textOutcome()); });
+  sayings.observe(document.querySelector(".pdf-text [role=status]"), { childList: true, characterData: true, subtree: true });
+  press(document.querySelector(".pdf-text button"));
+  await until(() => pages[1].textReads === 2 && textOutcome() === "This page's text could not be read again.", "single-again.pdf failing again");
+  await wait(50);
+  sayings.disconnect();
+  result.textRetry.again = { said, outcome: textOutcome(), button: Boolean(document.querySelector(".pdf-text button")), focusKept: focusKept(), focus: document.activeElement.textContent, page1: snapshot(1) };
+  againRoot.unmount();
+  // Going to another page clears the announcement: /doc.pdf opened again reads page 5 now, but its first text read still fails.
+  const pagedRoot = createRoot(host);
+  flushSync(() => pagedRoot.render(<PdfPreview url="/doc.pdf" name="doc.pdf" refreshKey={0} />));
+  await until(() => documents.at(-1).url === "/doc.pdf" && status() === "Page 1 of 5", "doc.pdf opened again");
+  for (const number of [2, 3, 4, 5]) { next(); await until(() => status() === `Page ${number} of 5`, `doc.pdf page ${number}`); }
+  await until(() => pageText() === "This page's text could not be read.", "doc.pdf page 5 text failure");
+  document.querySelector(".pdf-text").open = true;
+  press(document.querySelector(".pdf-text button"));
+  await until(() => textOutcome() === "Page text read.", "doc.pdf page 5 text read again");
+  previous();
+  await until(() => status() === "Page 4 of 5", "doc.pdf page 4");
+  result.textRetry.paged = { outcome: textOutcome(), page5: snapshot(5) };
+  pagedRoot.unmount();
 
   // The worker reports a left-out image while page 2 is on show; page 1 then
   // keeps the notice, and the document opened anew starts without it.
