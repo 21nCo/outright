@@ -114,7 +114,7 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
   assert.ok(posted, `the fixture did not finish: exit ${run.code ?? run.signal}; ${run.stderr}`);
   const outcome = JSON.parse(posted);
   assert.ok(outcome.ok, outcome.error);
-  const { opened, dragged, failedDraw, retried, skipped, unreadable, reopened, refreshed, closed, broken, brokenRefreshed, brokenRetried, order, slow, progressing, late, refused, crashed, crashRetried, held, retired } = outcome.result;
+  const { opened, dragged, failedDraw, retried, skipped, unreadable, reopened, refreshed, closed, broken, brokenRefreshed, brokenRetried, order, slow, progressing, hidden, late, textRetry, refused, crashed, crashRetried, held, retired } = outcome.result;
 
   // Opening draws page 1 once and reads its text once.
   assert.equal(opened.renders, 1);
@@ -156,6 +156,8 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
   assert.equal(unreadable.text, "This page's text could not be read.");
   // Next, disabled on the last page, keeps the focus it had.
   assert.equal(unreadable.focus, "Next page");
+  // Its text has no Retry of its own: the page's Retry opens the document again.
+  assert.equal(unreadable.textRetry, false);
   // Its Retry opens the document again on the same page and ends the old one.
   assert.equal(reopened.opened, 2);
   assert.ok(reopened.firstEnded);
@@ -208,6 +210,18 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
   assert.deepEqual(slow.otherPage, { renders: 1, opened: 1 });
   // A drawing that keeps making progress past the deadline finishes.
   assert.deepEqual([progressing.page1.renders, progressing.page1.cancelledRenders, progressing.alert, progressing.canvasHidden], [1, 0, "", false]);
+  // Hidden time does not use up a drawing's stall allowance: hidden for longer than it, or for most of it, a drawing that progresses once shown finishes.
+  for (const shown of [hidden.long, hidden.short]) {
+    assert.deepEqual([shown.page1.renders, shown.page1.cancelledRenders, shown.alert, shown.later], [1, 0, "", ""], JSON.stringify(shown));
+    // One visibility listener while drawing, none once the drawing has finished.
+    assert.deepEqual([shown.drawing, shown.finished], [1, 0], JSON.stringify(shown));
+  }
+  // A drawing left for another page, or closed, leaves no visibility listener.
+  assert.deepEqual([hidden.left.page1.cancelledRenders, hidden.left.listeners, hidden.left.closed], [1, 1, 0], JSON.stringify(hidden.left));
+  // Text that failed to read has its own Retry, also on a one-page PDF: it reads the text again without drawing the page again and keeps focus in the viewer.
+  assert.deepEqual([textRetry.status, textRetry.button], ["Page 1 of 1", "Read text again"]);
+  assert.deepEqual([textRetry.page1.textReads, textRetry.page1.renders, textRetry.after], [2, 1, false]);
+  assert.ok(textRetry.focusKept);
   // A page that arrives after its deadline is released once on arrival and never drawn or read, whether another page is on show or the viewer has closed.
   assert.deepEqual(late.page2.cleanups, [0]);
   assert.equal(late.page2.renders + late.page2.textReads, 0);

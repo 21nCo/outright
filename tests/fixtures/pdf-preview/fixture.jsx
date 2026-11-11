@@ -19,6 +19,15 @@ Worker.prototype.terminate = function end() {
 // before the document ends, and the document before its port and worker.
 const teardown = (record) => events.filter((event) => event.startsWith(`${record.id} `)).map((event) => event.split(" ")[1]);
 
+// The visibilitychange listeners on the document, and a tab hidden or shown on demand.
+const visibilityListeners = new Set();
+const { addEventListener: listen, removeEventListener: unlisten } = document;
+document.addEventListener = function add(type, listener, options) { if (type === "visibilitychange") visibilityListeners.add(listener); return listen.call(this, type, listener, options); };
+document.removeEventListener = function remove(type, listener, options) { if (type === "visibilitychange") visibilityListeners.delete(listener); return unlisten.call(this, type, listener, options); };
+let tabHidden = false;
+Object.defineProperty(document, "hidden", { configurable: true, get: () => tabHidden });
+const setHidden = (value) => { tabHidden = value; document.dispatchEvent(new Event("visibilitychange")); };
+
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function until(check, label, ms = 5000) {
   const end = performance.now() + ms;
@@ -105,7 +114,7 @@ async function run() {
   next();
   await until(() => alertText().includes("could not be read"), "page 5 failure");
   // Next, now disabled on the last page, keeps focus.
-  result.unreadable = { alert: alertText(), text: pageText(), page5: snapshot(5), focus: document.activeElement?.getAttribute("aria-label") };
+  result.unreadable = { alert: alertText(), text: pageText(), page5: snapshot(5), focus: document.activeElement?.getAttribute("aria-label"), textRetry: Boolean(document.querySelector(".pdf-text button")) };
   retry();
   await until(() => status() === "Page 5 of 5" && pages[5]?.settledRenders === 1 && pageText() !== "Reading page text…", "page 5 reopened");
   await wait(50);
@@ -218,6 +227,45 @@ async function run() {
   progressRoot.unmount();
   control.progressDrawing = 0;
 
+  // Only visible time counts towards a drawing's stall allowance. A drawing
+  // hidden for longer than the allowance, or for most of it, and shown again
+  // finishes if it progresses within the allowance once shown.
+  const hiddenDraw = async (url, hiddenMs) => {
+    control.holdDrawing = true;
+    const hiddenRoot = createRoot(host);
+    flushSync(() => hiddenRoot.render(<PdfPreview url={url} name={url.slice(1)} refreshKey={0} />));
+    await until(() => documents.at(-1).url === url && pages[1]?.renders === 1, `${url} drawing`);
+    const drawing = visibilityListeners.size;
+    setHidden(true);
+    await wait(hiddenMs);
+    setHidden(false);
+    await wait(100);
+    control.holdDrawing = false;
+    control.resumeDrawing();
+    await until(() => pages[1].settledRenders === 1, `${url} drawn`);
+    await wait(50);
+    const outcome = { drawing, page1: snapshot(1), alert: alertText(), finished: visibilityListeners.size };
+    // A finished drawing is not stopped by the tab being hidden and shown again.
+    setHidden(true);
+    setHidden(false);
+    await wait(PDF_DEADLINES.stallMs + 100);
+    outcome.later = alertText();
+    hiddenRoot.unmount();
+    return outcome;
+  };
+  result.hidden = { long: await hiddenDraw("/hidden-long.pdf", 2 * PDF_DEADLINES.stallMs - 50), short: await hiddenDraw("/hidden-short.pdf", PDF_DEADLINES.stallMs - 60) };
+  // A drawing left by closing its viewer, or by going to another page, leaves no listener behind.
+  control.holdDrawing = true;
+  const leftRoot = createRoot(host);
+  flushSync(() => leftRoot.render(<PdfPreview url="/hidden-left.pdf" name="hidden-left.pdf" refreshKey={0} />));
+  await until(() => documents.at(-1).url === "/hidden-left.pdf" && pages[1]?.renders === 1, "hidden-left.pdf drawing");
+  next();
+  await until(() => pages[2]?.renders === 1, "hidden-left.pdf page 2 drawing");
+  result.hidden.left = { page1: snapshot(1), listeners: visibilityListeners.size };
+  leftRoot.unmount();
+  result.hidden.left.closed = visibilityListeners.size;
+  control.holdDrawing = false;
+
   // A page that arrives after its deadline, once another page is on show, is
   // released on arrival and never shown; so is one arriving after its viewer closed.
   const lateRoot = createRoot(host);
@@ -242,6 +290,19 @@ async function run() {
   await wait(100);
   result.late.closed = { page1: snapshot(1), ended: teardown(lateClosed) };
   PDF_DEADLINES.stallMs = 30_000;
+
+  // Text that failed to read offers its own Retry, also on a one-page PDF:
+  // the text is read again, the page is not drawn again, and focus stays.
+  const singleRoot = createRoot(host);
+  flushSync(() => singleRoot.render(<PdfPreview url="/single.pdf" name="single.pdf" refreshKey={0} />));
+  await until(() => documents.at(-1).url === "/single.pdf" && pages[1]?.settledRenders === 1 && pageText() === "This page's text could not be read.", "single.pdf text failure");
+  document.querySelector(".pdf-text").open = true;
+  await until(() => document.querySelector(".pdf-text button"), "the text Retry");
+  result.textRetry = { status: status(), button: document.querySelector(".pdf-text button").textContent };
+  press(document.querySelector(".pdf-text button"));
+  await until(() => pageText() === "Page one text", "single.pdf text read again");
+  Object.assign(result.textRetry, { page1: snapshot(1), focusKept: focusKept(), after: Boolean(document.querySelector(".pdf-text button")) });
+  singleRoot.unmount();
 
   // The worker reports a left-out image while page 2 is on show; page 1 then
   // keeps the notice, and the document opened anew starts without it.

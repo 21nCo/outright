@@ -7,8 +7,10 @@
 // Page 2's first drawing fails, page 3 arrives only after page 4 is asked
 // for, page 4 has endless text, page 5 cannot be read the first time
 // /doc.pdf is opened and its first text read fails. Each /broken*.pdf cannot
-// be opened the first time. While control.holdDrawing is set, a drawing runs
-// until it is cancelled; while control.holdText is set, text never arrives.
+// be opened the first time. /single.pdf has one page, whose first text read
+// fails. While control.holdDrawing is set, a drawing runs until it is
+// cancelled or control.resumeDrawing() lets it finish; while control.holdText
+// is set, text never arrives.
 // control.progressDrawing steps of 100 ms each report progress (onContinue)
 // before a drawing finishes. The next page asked for whose number is
 // control.holdPage arrives only when control.releasePage() is called.
@@ -17,7 +19,7 @@
 export const documents = [];
 export const ports = [];
 export const events = [];
-export const control = { holdDrawing: false, holdText: false, progressDrawing: 0, holdPage: null, releasePage: null };
+export const control = { holdDrawing: false, resumeDrawing: null, holdText: false, progressDrawing: 0, holdPage: null, releasePage: null };
 const WORDS = ["", "one", "two", "three", "four", "five"];
 
 class FakePage {
@@ -40,6 +42,7 @@ class FakePage {
       const finish = () => { settled = true; this.settledRenders += 1; if (this.number === 2 && attempt === 1) reject(new Error("broken drawing")); else resolve(); };
       const step = () => { if (steps-- <= 0) finish(); else { task.onContinue?.(() => {}); timer = setTimeout(step, 100); } };
       if (!control.holdDrawing) timer = setTimeout(step, 30);
+      else control.resumeDrawing = () => { if (!settled) timer = setTimeout(step, 30); };
       // Like pdf.js, cancelling a finished drawing does nothing.
       task.cancel = () => {
         if (settled) return;
@@ -63,7 +66,7 @@ class FakePage {
       pull: (controller) => {
         if (control.holdText) return new Promise(() => {});
         if (this.number === 4) controller.enqueue({ items: Array.from({ length: 100 }, () => ({ str: "endless text " })) });
-        else if (this.number === 5 && read === 1) controller.error(new Error("broken text"));
+        else if ((this.number === 5 || this.record.url === "/single.pdf") && read === 1) controller.error(new Error("broken text"));
         else if (sent) controller.close();
         else { sent = true; controller.enqueue({ items: [{ str: `Page ${WORDS[this.number]}` }, { str: "  text " }] }); }
         return undefined;
@@ -98,7 +101,7 @@ export function getDocument({ data, url: address, worker }) {
   let releasePage3;
   const page3Released = new Promise((resolve) => { releasePage3 = resolve; });
   const pdf = {
-    numPages: 5,
+    numPages: url === "/single.pdf" ? 1 : 5,
     getPage(number) {
       if (record.destroyed) events.push(`${record.id} getPage-after-destroy`);
       if (!promises.has(number)) {
