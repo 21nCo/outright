@@ -8873,8 +8873,14 @@ async function responsiveFocusRegression() {
     await until(() => host.querySelector("#project-sidebar").getAttribute("aria-hidden") === "true", "narrow sidebar after closed selection");
     assert(document.activeElement === composerB, "Selecting a project while the drawer was closed left stale focus restoration state");
 
-    const terminalTrigger = host.querySelector('[aria-label="Terminal"]');
-    terminalTrigger.click();
+    // At 390px the pane toggles are items in the toolbar's Panes menu.
+    const terminalTrigger = host.querySelector('[aria-label="Show or hide panes"]');
+    const togglePane = async (label) => {
+      terminalTrigger.click();
+      await until(() => [...document.querySelectorAll('[role="menuitemcheckbox"]')].some((item) => item.textContent === label), `the narrow Panes menu did not offer ${label}`);
+      [...document.querySelectorAll('[role="menuitemcheckbox"]')].find((item) => item.textContent === label).click();
+    };
+    await togglePane("Terminal");
     await until(() => host.querySelector('#pane-tab-terminal[aria-selected="true"]'), "narrow terminal pane tab");
     await until(() => document.activeElement === host.querySelector("#pane-terminal"), "narrow terminal pane focus");
     const conversationPane = host.querySelector("#pane-conversation");
@@ -8920,9 +8926,9 @@ async function responsiveFocusRegression() {
     await until(() => !terminalPane.inert && conversationPane.inert, "pane tab click shows the terminal after the new chat");
 
     terminalTrigger.focus();
-    terminalTrigger.click();
+    await togglePane("Terminal");
     await until(() => !host.querySelector("#pane-terminal") && !host.querySelector('[role="tablist"][aria-label="Panes"]'), "toolbar closes the narrow terminal pane");
-    assert(document.activeElement === terminalTrigger, "Closing from the toolbar moved focus away from its toggle");
+    await until(() => document.activeElement === terminalTrigger, "Closing from the toolbar moved focus away from its toggle");
     assert(!host.querySelector("#pane-conversation").inert, "The remaining conversation pane stayed inert");
   } finally {
     root.render(null);
