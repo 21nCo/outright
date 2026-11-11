@@ -46,7 +46,7 @@ test("restoring refuses trees deeper than the view count instead of recursing th
   assert.ok(restored.problems.includes("node"));
 });
 
-test("each view has one pane, so a layout never holds more than four", () => {
+test("each view has one pane, so a layout never holds more than one pane per view", () => {
   let current = defaultPaneLayout();
   for (const view of [...PANE_VIEWS, ...PANE_VIEWS]) current = openView(current, view, current.focused, "right");
   assert.deepEqual([...layoutViews(current.root)].sort(), [...PANE_VIEWS].sort());
