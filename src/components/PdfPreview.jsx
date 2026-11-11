@@ -64,7 +64,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
   const reopenDocument = () => { rootRef.current?.focus(); setReopen((value) => value + 1); };
 
   useEffect(() => {
-    const doc = { release: null, worker: null, fail: null }; // Used by the page on show.
+    const doc = { release: null, fail: null }; // Used by the page on show.
     const key = reopen;
     const download = new AbortController();
     let cancelled = false;
@@ -109,7 +109,8 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
       // A worker that fails once started fails its document, open or not.
       const stopped = (event) => fail(new Error(`The PDF reader stopped${event?.message ? `: ${event.message}` : ""}`));
       for (const type of ["error", "messageerror"]) started.worker.addEventListener(type, stopped);
-      doc.worker = started.worker;
+      // pdf.js says only which document left out a too large image (pdf-worker-entry.js), so the notice is the document's.
+      started.worker.addEventListener("message", ({ data }) => { if (data?.action === "imageRefused" && !cancelled && !ended) setRefusedImage(key); });
       port = new pdfjs.PDFWorker({ port: started.worker });
       task = pdfjs.getDocument({ data, worker: port, ...PDF_DOCUMENT_OPTIONS,
         cMapUrl: assetUrl("cmaps"), cMapPacked: true, standardFontDataUrl: assetUrl("standard_fonts"), wasmUrl: assetUrl("wasm"), iccUrl: assetUrl("iccs") });
@@ -193,9 +194,6 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     const render = proxy.render({ canvas, canvasContext: canvas.getContext("2d"), viewport: proxy.getViewport({ scale: size.scale }) });
     const stop = () => { if (!cancelled) { cancelled = true; render.cancel(); } };
     signal.addEventListener("abort", stop, { once: true });
-    // The page says so when pdf.js leaves out a too large image (pdf-worker-entry.js).
-    const refused = ({ data }) => { if (data?.action === "imageRefused") setRefusedImage(key); };
-    owner.worker.addEventListener("message", refused);
     // A drawing with no progress for stallMs fails its document, as the worker
     // may no longer answer: only opening it again can retry it. A hidden page
     // pauses drawing (pdf.js draws in animation frames), so it never stalls.
@@ -206,7 +204,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     render.promise.finally(() => clearTimeout(timer)).catch((error) => {
       if (!cancelled && error?.name !== "RenderingCancelledException") setPageError({ key, message: `This page could not be drawn: ${error?.message || "unknown error"}`, retry: "draw" });
     });
-    return () => { clearTimeout(timer); owner.worker.removeEventListener("message", refused); signal.removeEventListener("abort", stop); stop(); };
+    return () => { clearTimeout(timer); signal.removeEventListener("abort", stop); stop(); };
   }, [pageSession, width, drawAttempt]);
 
   // The page's text is read once per page, apart from drawing, so a resize
@@ -242,7 +240,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     <div className="pdf-frame" ref={frameRef}>
       <canvas ref={canvasRef} role="img" hidden={Boolean(pageError) || !pageShown} aria-label={`Page ${page} of ${shown.pages} of ${name}`} />
       {!pageError && !pageShown && <div className="preview-state" role="status"><SpinnerGap className="spin" />Reading page {page}…</div>}
-      {!pageError && pageShown && refusedImage === pageKey && <p className="preview-state" role="status">Part of this page is too large to show. Its text is below.</p>}
+      {!pageError && pageShown && refusedImage === reopen && <p className="preview-state" role="status">Some images in this PDF are too large to show. Each page's text is below it.</p>}
       {pageError && <div className="preview-state" role="alert"><p>{pageError.message}</p>{pageError.retry && <Button variant="outline" size="xs" onClick={retryPage}><ArrowsClockwise />Retry</Button>}</div>}
     </div>
     <details className="pdf-text"><summary>Page text</summary><p>{{ loading: "Reading page text…", failed: "This page's text could not be read." }[pageText.status] ?? (pageText.text || "No text found on this page.")}</p></details>

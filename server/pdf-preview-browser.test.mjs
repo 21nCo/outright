@@ -65,7 +65,7 @@ function fixtureServer(html, holdMs, serve = () => false) {
   const server = createServer((request, response) => {
     if (serve(request, response)) return;
     if (request.url === "/") { response.setHeader("Content-Type", "text/html; charset=utf-8"); response.end(html); return; }
-    if (request.url === WORKER_PATH && !retired) { response.setHeader("Content-Type", "text/javascript"); response.end("postMessage({ sourceName: 'worker', action: 'ready' }); onmessage = ({ data }) => { if (data === 'crash') throw new Error('worker crashed'); };"); return; }
+    if (request.url === WORKER_PATH && !retired) { response.setHeader("Content-Type", "text/javascript"); response.end("postMessage({ sourceName: 'worker', action: 'ready' }); onmessage = ({ data }) => { if (data === 'crash') throw new Error('worker crashed'); if (data === 'refuse') postMessage({ action: 'imageRefused' }); };"); return; }
     // A PDF's bytes are its own address (see fake-pdfjs.js); /held.pdf sends a part and then nothing.
     if (request.url.startsWith("/held") && request.url.endsWith(".pdf")) { const held = { requested: true, closed: false }; heldPdfs[request.url] = held; response.on("close", () => { held.closed = true; }); response.writeHead(200, { "Content-Type": "application/pdf" }); response.write("%PDF"); return; }
     if (request.url === "/held-state") { response.setHeader("Content-Type", "application/json"); response.end(JSON.stringify(heldPdfs)); return; }
@@ -114,7 +114,7 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
   assert.ok(posted, `the fixture did not finish: exit ${run.code ?? run.signal}; ${run.stderr}`);
   const outcome = JSON.parse(posted);
   assert.ok(outcome.ok, outcome.error);
-  const { opened, dragged, failedDraw, retried, skipped, unreadable, reopened, refreshed, closed, broken, brokenRefreshed, brokenRetried, order, slow, progressing, late, crashed, crashRetried, held, retired } = outcome.result;
+  const { opened, dragged, failedDraw, retried, skipped, unreadable, reopened, refreshed, closed, broken, brokenRefreshed, brokenRetried, order, slow, progressing, late, refused, crashed, crashRetried, held, retired } = outcome.result;
 
   // Opening draws page 1 once and reads its text once.
   assert.equal(opened.renders, 1);
@@ -212,6 +212,9 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
   assert.deepEqual(late.closed.page1.cleanups, [0]);
   assert.equal(late.closed.page1.renders + late.closed.page1.textReads, 0);
   assert.deepEqual(late.closed.ended, ["destroy", "port-destroy", "terminate", "cleanup"]);
+  // A left-out image, which pdf.js does not tie to a page, is noticed for its document: the notice stays on the next page, and a document opened again starts without it.
+  const leftOut = "Some images in this PDF are too large to show. Each page's text is below it.";
+  assert.deepEqual(refused, { before: "", page2: leftOut, page1: leftOut, reopened: "" });
   // A worker that fails after its document opened fails the document in the same order, and Retry opens it again.
   assert.match(crashed.alert, /The PDF reader stopped: .*worker crashed/);
   assert.equal(crashed.failures.length, 1);
@@ -261,7 +264,7 @@ test("with real pdf.js, a page whose image is too large to decode says so and ke
   const { plain, large, plainFonts, largeFonts, afterPlainClosed, afterBothClosed } = outcome.result;
   // A page drawn whole has no notice; one whose image pdf.js left out says so, and its text is still read.
   assert.deepEqual(plain, { text: "Plain page", notice: "", canvas: true });
-  assert.deepEqual(large, { text: "Large image", notice: "Part of this page is too large to show. Its text is below.", canvas: true });
+  assert.deepEqual(large, { text: "Large image", notice: "Some images in this PDF are too large to show. Each page's text is below it.", canvas: true });
   // Each document added fonts of its own; closing one removes its fonts and leaves the other's.
   assert.ok(plainFonts.length > 0 && largeFonts.length > 0, JSON.stringify({ plainFonts, largeFonts }));
   assert.deepEqual(afterPlainClosed.sort(), [...largeFonts].sort());

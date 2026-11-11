@@ -233,6 +233,30 @@ async function run() {
   result.late.closed = { page1: snapshot(1), ended: teardown(lateClosed) };
   PDF_DEADLINES.stallMs = 30_000;
 
+  // The worker reports a left-out image while page 2 is on show; page 1 then
+  // keeps the notice, and the document opened anew starts without it.
+  const notice = () => document.querySelector(".pdf-frame p[role=status]")?.textContent ?? "";
+  const refusedRoot = createRoot(host);
+  flushSync(() => refusedRoot.render(<PdfPreview url="/refused.pdf" name="refused.pdf" refreshKey={0} />));
+  await until(() => status() === "Page 1 of 5" && pages[1]?.settledRenders === 1, "refused.pdf drawn");
+  result.refused = { before: notice() };
+  next();
+  await until(() => alertText().includes("could not be drawn"), "refused.pdf page 2 failure");
+  retry();
+  await until(() => pages[2].settledRenders === 2 && !alertText(), "refused.pdf page 2 drawn");
+  ports.at(-1).port.postMessage("refuse");
+  await until(() => notice(), "the left-out image notice");
+  result.refused.page2 = notice();
+  previous();
+  await until(() => status() === "Page 1 of 5" && pages[1].settledRenders === 2 && !document.querySelector("canvas").hidden, "refused.pdf page 1 again");
+  result.refused.page1 = notice();
+  refusedRoot.unmount();
+  const reopenedRoot = createRoot(host);
+  flushSync(() => reopenedRoot.render(<PdfPreview url="/refused.pdf" name="refused.pdf" refreshKey={0} />));
+  await until(() => status() === "Page 1 of 5" && pages[1]?.settledRenders === 1, "refused.pdf opened anew");
+  result.refused.reopened = notice();
+  reopenedRoot.unmount();
+
   // A worker that fails after its document opened fails the document: the
   // page is released before the document ends, and Retry opens it again.
   const crashFailures = [];
