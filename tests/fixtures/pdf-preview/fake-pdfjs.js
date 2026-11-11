@@ -94,6 +94,7 @@ export function getDocument({ data, url: address, worker }) {
   const pdf = {
     numPages: 5,
     getPage(number) {
+      if (record.destroyed) events.push(`${record.id} getPage-after-destroy`);
       if (!promises.has(number)) {
         record.pages[number] ??= new FakePage(record, number);
         if (number === 4) releasePage3();

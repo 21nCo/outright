@@ -4,6 +4,7 @@ import { useLayoutEffect } from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import PdfPreview from "@/components/PdfPreview";
+import { PDF_DEADLINES } from "@/lib/pdf-document";
 import { control, documents, events, ports } from "./fake-pdfjs.js";
 
 // The pages of the document opened last.
@@ -32,6 +33,7 @@ const alertText = () => document.querySelector(".pdf-frame [role=alert]")?.textC
 // Buttons are pressed as from the keyboard: focused, then activated.
 const press = (button) => { button.focus(); button.click(); };
 const next = () => press(document.querySelector("button[aria-label='Next page']"));
+const previous = () => press(document.querySelector("button[aria-label='Previous page']"));
 const retry = () => press(document.querySelector(".pdf-frame [role=alert] button"));
 // Focus stays inside the viewer instead of falling back to the page.
 const focusKept = () => document.activeElement !== document.body && document.getElementById("host").contains(document.activeElement);
@@ -81,6 +83,19 @@ async function run() {
   await until(() => pages[3], "page 3 asked for");
   // While page 3 is on its way, page 2's drawing is not shown as page 3.
   const pending = { canvasHidden: document.querySelector("canvas").hidden, canvasLabel: document.querySelector("canvas").getAttribute("aria-label"), loading: document.querySelector(".pdf-frame [role=status]")?.textContent ?? "" };
+  // Back to page 2 before page 3 arrives: page 2's earlier, ended visit is
+  // not shown as this one, so the viewer says page 2 is on its way until it is.
+  const shownTexts = [];
+  const observer = new MutationObserver((records) => records.forEach((record) => {
+    if (record.type === "characterData") shownTexts.push(record.target.parentNode?.textContent);
+    record.addedNodes.forEach((node) => shownTexts.push(node.textContent));
+  }));
+  observer.observe(host, { childList: true, characterData: true, subtree: true });
+  previous();
+  await until(() => pages[2].renders === 3, "page 2 drawn again");
+  observer.disconnect();
+  pending.returned = { loadingShown: shownTexts.includes("Reading page 2…") };
+  next();
   next();
   await until(() => status() === "Page 4 of 5" && pageText()?.length > 1000, "page 4 text");
   await wait(300);
@@ -150,13 +165,34 @@ async function run() {
   const replaced = documents.at(-1);
   orderRoot.render(<Probe url="/b.pdf" />);
   await until(() => documents.at(-1).url === "/b.pdf" && pages[1]?.renders === 1 && pages[1]?.textReads === 1, "b.pdf drawing and reading");
+  const returned = documents.at(-1);
+  // Back to b.pdf while another document downloads: the ended b.pdf is not shown again or asked for a page.
+  orderRoot.render(<Probe url="/held-elsewhere.pdf" />);
+  await until(() => teardown(returned).includes("terminate"), "the first b.pdf ended");
+  orderRoot.render(<Probe url="/b.pdf" />);
+  await until(() => documents.at(-1) !== returned && documents.at(-1).url === "/b.pdf" && pages[1]?.renders === 1 && pages[1]?.textReads === 1, "b.pdf opened again");
   const closedRecord = documents.at(-1);
   orderRoot.unmount();
   await until(() => teardown(closedRecord).includes("terminate"), "b.pdf ended");
   await until(() => teardown(replaced).includes("terminate"), "a.pdf ended");
   control.holdDrawing = false;
   control.holdText = false;
-  result.order = { firstCommit: commits.find((commit) => commit.url === "/b.pdf"), replaced: teardown(replaced), closed: teardown(closedRecord) };
+  result.order = { firstCommit: commits.find((commit) => commit.url === "/b.pdf"), returnCommit: commits.filter((commit) => commit.url === "/b.pdf")[1], replaced: teardown(replaced), returned: teardown(returned), closed: teardown(closedRecord) };
+
+  // A drawing that does not finish in time is stopped, and its Retry opens the document again.
+  PDF_DEADLINES.stallMs = 300;
+  control.holdDrawing = true;
+  const slowRoot = createRoot(host);
+  flushSync(() => slowRoot.render(<PdfPreview url="/slow.pdf" name="slow.pdf" refreshKey={0} />));
+  await until(() => alertText().includes("did not finish in time"), "the late drawing");
+  const slow = documents.at(-1);
+  result.slow = { alert: alertText(), page1: snapshot(1), text: pageText() };
+  control.holdDrawing = false;
+  retry();
+  await until(() => documents.at(-1) !== slow && pages[1]?.settledRenders === 1 && !alertText(), "slow.pdf opened again");
+  result.slow.reopened = { slowEnded: teardown(slow), focusKept: focusKept() };
+  slowRoot.unmount();
+  PDF_DEADLINES.stallMs = 30_000;
 
   // A worker that fails after its document opened fails the document: the
   // page is released before the document ends, and Retry opens it again.
@@ -176,7 +212,7 @@ async function run() {
   // Closing a document whose download is still arriving stops the download.
   const heldRoot = createRoot(host);
   flushSync(() => heldRoot.render(<PdfPreview url="/held.pdf" name="held.pdf" refreshKey={0} />));
-  const held = async () => (await fetch("/held-state")).json();
+  const held = async () => (await (await fetch("/held-state")).json())["/held.pdf"] ?? { requested: false, closed: false };
   const heldEnd = performance.now() + 5000;
   while (!(await held()).requested && performance.now() < heldEnd) await wait(20);
   result.held = { requested: (await held()).requested };

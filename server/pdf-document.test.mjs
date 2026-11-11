@@ -62,7 +62,7 @@ test("a probe stops when its caller's signal aborts", async () => {
 });
 
 test("a deadline rejects a promise that does not settle in time and leaves one that does alone", async () => {
-  await assert.rejects(withDeadline(new Promise(() => {}), 20, "too late"), /too late/);
+  await assert.rejects(withDeadline(new Promise(() => {}), 20, "too late"), { name: "TimeoutError", message: "too late" });
   assert.equal(await withDeadline(Promise.resolve(7), 1000, "too late"), 7);
 });
 

@@ -57,15 +57,15 @@ async function bundle() {
 function fixtureServer(html, holdMs) {
   let release;
   let retired = false;
-  const heldPdf = { requested: false, closed: false };
+  const heldPdfs = {};
   const done = new Promise((resolve) => { release = resolve; });
   const held = setTimeout(() => release(null), holdMs);
   const server = createServer((request, response) => {
     if (request.url === "/") { response.setHeader("Content-Type", "text/html; charset=utf-8"); response.end(html); return; }
     if (request.url === WORKER_PATH && !retired) { response.setHeader("Content-Type", "text/javascript"); response.end("postMessage({ sourceName: 'worker', action: 'ready' }); onmessage = ({ data }) => { if (data === 'crash') throw new Error('worker crashed'); };"); return; }
     // A PDF's bytes are its own address (see fake-pdfjs.js); /held.pdf sends a part and then nothing.
-    if (request.url === "/held.pdf") { heldPdf.requested = true; response.on("close", () => { heldPdf.closed = true; }); response.writeHead(200, { "Content-Type": "application/pdf" }); response.write("%PDF"); return; }
-    if (request.url === "/held-state") { response.setHeader("Content-Type", "application/json"); response.end(JSON.stringify(heldPdf)); return; }
+    if (request.url.startsWith("/held") && request.url.endsWith(".pdf")) { const held = { requested: true, closed: false }; heldPdfs[request.url] = held; response.on("close", () => { held.closed = true; }); response.writeHead(200, { "Content-Type": "application/pdf" }); response.write("%PDF"); return; }
+    if (request.url === "/held-state") { response.setHeader("Content-Type", "application/json"); response.end(JSON.stringify(heldPdfs)); return; }
     if (request.url.endsWith(".pdf")) { response.setHeader("Content-Type", "application/pdf"); response.end(request.url); return; }
     if (request.url === "/retire-worker" && request.method === "POST") { retired = true; response.end(); return; }
     if (request.url === "/hold") { void done.then(() => { response.statusCode = 204; response.end(); }); return; }
@@ -111,7 +111,7 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
   assert.ok(posted, `the fixture did not finish: exit ${run.code ?? run.signal}; ${run.stderr}`);
   const outcome = JSON.parse(posted);
   assert.ok(outcome.ok, outcome.error);
-  const { opened, dragged, failedDraw, retried, skipped, unreadable, reopened, refreshed, closed, broken, brokenRefreshed, brokenRetried, order, crashed, crashRetried, held, retired } = outcome.result;
+  const { opened, dragged, failedDraw, retried, skipped, unreadable, reopened, refreshed, closed, broken, brokenRefreshed, brokenRetried, order, slow, crashed, crashRetried, held, retired } = outcome.result;
 
   // Opening draws page 1 once and reads its text once.
   assert.equal(opened.renders, 1);
@@ -134,8 +134,8 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
   assert.equal(retried.canvasHidden, false);
   // The Retry that went away handed focus to the viewer, not to the page.
   assert.ok(retried.focusKept);
-  // A page left before it arrived is released and never drawn or read.
-  assert.equal(skipped.page2.cleanups.length, 1);
+  // A page left before it arrived is released and never drawn or read; page 2 was left twice.
+  assert.equal(skipped.page2.cleanups.length, 2);
   assert.equal(skipped.page3.renders, 0);
   assert.equal(skipped.page3.textReads, 0);
   assert.equal(skipped.page3.cleanups.length, 1);
@@ -143,6 +143,8 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
   assert.equal(skipped.pending.canvasHidden, true);
   assert.match(skipped.pending.canvasLabel, /^Page 3 of 5/);
   assert.equal(skipped.pending.loading, "Reading page 3…");
+  // Returning to page 2 before page 3 arrives shows page 2 as on its way, not its ended visit's blank canvas.
+  assert.deepEqual(skipped.pending.returned, { loadingShown: true });
   // Endless page text stops at the limit and pdf.js's stream is cancelled.
   assert.equal(skipped.textLength, 100_000);
   assert.ok(skipped.page4.textCancelled);
@@ -182,7 +184,19 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
   // A new address shows nothing of the old document, not even for one commit.
   assert.deepEqual(order.firstCommit, { url: "/b.pdf", canvas: null, pages: null });
   // Replacing or closing a document stops its page's drawing and text, then releases the page, then ends the document, its port and its worker.
-  for (const ended of [order.replaced, order.closed]) assert.deepEqual(ended, ["render-cancel", "text-cancel", "cleanup", "destroy", "port-destroy", "terminate"]);
+  // Returning to an address opens it anew: the ended document is neither shown nor asked for a page.
+  assert.deepEqual(order.returnCommit, { url: "/b.pdf", canvas: null, pages: null });
+  // (The drawing and the text are cancelled together, in either order.)
+  for (const ended of [order.replaced, order.returned, order.closed]) {
+    assert.deepEqual(ended.slice(0, 2).sort(), ["render-cancel", "text-cancel"], JSON.stringify(ended));
+    assert.deepEqual(ended.slice(2), ["cleanup", "destroy", "port-destroy", "terminate"], JSON.stringify(ended));
+  }
+  // A late drawing is cancelled at its deadline, keeps its text, and its Retry opens the document again.
+  assert.match(slow.alert, /could not be drawn: it did not finish in time/);
+  assert.equal(slow.page1.cancelledRenders, 1);
+  assert.equal(slow.text, "Page one text");
+  assert.deepEqual(slow.reopened.slowEnded, ["render-cancel", "cleanup", "destroy", "port-destroy", "terminate"]);
+  assert.ok(slow.reopened.focusKept);
   // A worker that fails after its document opened fails the document in the same order, and Retry opens it again.
   assert.match(crashed.alert, /The PDF reader stopped: .*worker crashed/);
   assert.equal(crashed.failures.length, 1);

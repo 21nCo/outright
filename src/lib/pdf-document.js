@@ -1,23 +1,16 @@
-// The viewer downloads a PDF itself and hands pdf.js the bytes, so closing
-// a document stops its download at once, with no wait on a worker that may
-// no longer answer. A download without progress, or a document that does
-// not open, within LOAD_STALL_MS fails, and the viewer offers Retry.
-export const LOAD_STALL_MS = 30_000;
-
-// pdf.js options for every document. Nothing in it runs, and no embedded
-// image is decoded past maxImageSize pixels (pdf.js leaves it out of the
-// drawing; the page's text is still offered) or kept larger than
-// canvasMaxAreaInBytes, whatever the page canvas's own budget.
+// The viewer downloads each PDF itself, so closing it stops the download at
+// once. A download, document or page with no progress for stallMs fails.
+export const PDF_DEADLINES = { stallMs: 30_000 };
+// Nothing in a document runs; no image over maxImageSize pixels is decoded.
 export const PDF_DOCUMENT_OPTIONS = Object.freeze({ isEvalSupported: false, enableXfa: false, maxImageSize: 2 ** 24, canvasMaxAreaInBytes: 2 ** 24 });
 
 export function withDeadline(promise, ms, message) {
   let timer;
-  const late = new Promise((resolve, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); });
-  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+  return Promise.race([promise, new Promise((resolve, reject) => { timer = setTimeout(() => reject(Object.assign(new Error(message), { name: "TimeoutError" })), ms); })]).finally(() => clearTimeout(timer));
 }
 
 // The bytes at url. However it ends, its request is aborted.
-export async function fetchPdf(url, { signal, stallMs = LOAD_STALL_MS, fetchImpl = globalThis.fetch } = {}) {
+export async function fetchPdf(url, { signal, stallMs = PDF_DEADLINES.stallMs, fetchImpl = globalThis.fetch } = {}) {
   const request = new AbortController();
   const stop = () => request.abort();
   signal?.addEventListener("abort", stop, { once: true });
