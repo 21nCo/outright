@@ -93,7 +93,12 @@ async function run() {
   await until(() => document.querySelector("[role=alert]")?.textContent.includes("This PDF could not be read"), "the broken document");
   await wait(50);
   const broken = documents.at(-1);
-  result.broken = { url: broken.url, destroyed: broken.destroyed, portDestroyed: broken.port.destroyed, failures: brokenFailures };
+  result.broken = { url: broken.url, destroyed: broken.destroyed, portDestroyed: broken.port.destroyed, failures: [...brokenFailures] };
+  // A refresh opens it again, and the error clears once it opens.
+  flushSync(() => brokenRoot.render(<PdfPreview url="/broken.pdf" name="broken.pdf" refreshKey={1} onFailed={(message) => brokenFailures.push(message)} />));
+  await until(() => status() === "Page 1 of 5", "the broken document opened again");
+  const brokenDocuments = documents.filter((record) => record.url === "/broken.pdf");
+  result.brokenRefreshed = { opened: brokenDocuments.length, firstEnded: broken.destroyed && broken.port.destroyed, alert: document.querySelector("[role=alert]")?.textContent ?? "", failures: brokenFailures };
   brokenRoot.unmount();
 
   await fetch("/retire-worker", { method: "POST" });

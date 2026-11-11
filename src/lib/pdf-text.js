@@ -19,12 +19,17 @@ export async function readPageText(stream, { max = PAGE_TEXT_LIMIT, maxInput = 4
   let text = "";
   let input = 0;
   let items = 0;
+  // Checked after every chunk and item, so a spent budget never waits on
+  // another read.
+  const spent = () => signal?.aborted || items >= maxItems || input >= maxInput;
   try {
-    while (!signal?.aborted) {
+    while (!spent()) {
       const { value, done } = await reader.read();
-      if (done || ++items > maxItems) break;
+      if (done) break;
+      items += 1;
       for (const item of value?.items ?? []) {
-        if (++items > maxItems || input >= maxInput) return text;
+        if (spent()) return text;
+        items += 1;
         const str = typeof item?.str === "string" ? item.str.slice(0, maxInput - input) : "";
         input += str.length;
         const words = /\S+/g;

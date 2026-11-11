@@ -92,7 +92,7 @@ function runChrome(executable, profile, url, timeoutMs) {
   });
 }
 
-test("the PDF viewer reads each page once, stops a page's work before releasing it, retries only what failed, ends documents that fail, redraws a dragged pane once and asks for a reload when its worker is gone", { timeout: 180_000 }, async (t) => {
+test("the PDF viewer reads each page once, stops a page's work before releasing it, retries only what failed, ends documents that fail and opens them again on refresh, redraws a dragged pane once and asks for a reload when its worker is gone", { timeout: 180_000 }, async (t) => {
   const executable = chromeExecutable();
   assert.ok(executable, "Chrome or Chromium is required to run the PDF viewer fixture");
   const directory = mkdtempSync(path.join(os.tmpdir(), "outright-pdf-preview-"));
@@ -106,7 +106,7 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
   assert.ok(posted, `the fixture did not finish: exit ${run.code ?? run.signal}; ${run.stderr}`);
   const outcome = JSON.parse(posted);
   assert.ok(outcome.ok, outcome.error);
-  const { opened, dragged, failedDraw, retried, skipped, unreadable, reopened, refreshed, closed, broken, retired } = outcome.result;
+  const { opened, dragged, failedDraw, retried, skipped, unreadable, reopened, refreshed, closed, broken, brokenRefreshed, retired } = outcome.result;
 
   // Opening draws page 1 once and reads its text once.
   assert.equal(opened.renders, 1);
@@ -153,6 +153,11 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
   assert.equal(broken.url, "/broken.pdf");
   assert.deepEqual(broken.failures, ["Invalid PDF structure"]);
   assert.ok(broken.destroyed && broken.portDestroyed);
+  // A refresh opens it again after the old one has ended, and the error clears.
+  assert.equal(brokenRefreshed.opened, 2);
+  assert.ok(brokenRefreshed.firstEnded);
+  assert.equal(brokenRefreshed.alert, "");
+  assert.deepEqual(brokenRefreshed.failures, ["Invalid PDF structure"]);
   // A worker script gone after an update asks for a reload the user starts, not a Retry that cannot work.
   assert.match(retired.alert, /needs a page reload/);
   assert.equal(retired.button, "Reload page");

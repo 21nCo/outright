@@ -4,7 +4,7 @@
 // failures included. Page 2's first drawing fails, page 3 arrives only after
 // page 4 is asked for, page 4 has endless text, page 5 cannot be read the
 // first time /doc.pdf is opened and its first text read fails. /broken.pdf
-// cannot be opened. While control.holdDrawing is set, a drawing runs until
+// cannot be opened the first time. While control.holdDrawing is set, a drawing runs until
 // it is cancelled.
 export const pages = {};
 export const documents = [];
@@ -91,6 +91,6 @@ export function getDocument({ url, worker }) {
       return promises.get(number);
     },
   };
-  const promise = url === "/broken.pdf" ? Promise.reject(new Error("Invalid PDF structure")) : Promise.resolve(pdf);
+  const promise = url === "/broken.pdf" && opened === 1 ? Promise.reject(new Error("Invalid PDF structure")) : Promise.resolve(pdf);
   return { promise, destroy: async () => { record.destroyed = true; } };
 }

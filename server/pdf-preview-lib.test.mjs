@@ -260,6 +260,37 @@ test("page text stops at its input budget for endless whitespace, empty items an
   assert.ok(none.cancelled && none.pulls <= 51, `pulled ${none.pulls} chunks`);
 });
 
+// Sends the given chunks, then never answers another pull, like a pdf.js
+// worker that has stalled.
+function stallingStream(chunks, counters) {
+  let index = 0;
+  Object.assign(counters, { pulls: 0, cancelled: false });
+  return new ReadableStream({
+    pull(controller) {
+      counters.pulls += 1;
+      if (index < chunks.length) { controller.enqueue({ items: chunks[index++] }); return undefined; }
+      return new Promise(() => {});
+    },
+    cancel() { counters.cancelled = true; },
+  }, { highWaterMark: 0 });
+}
+
+test("page text that spends a budget on the last item of a chunk settles and cancels without waiting on another read", async () => {
+  const settles = (promise) => Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve("PENDING"), 200))]);
+  const cases = [
+    ["whitespace", [[{ str: " ".repeat(40) }]], { max: 10 }, ""],
+    ["text then whitespace", [[{ str: "abc" }, { str: " ".repeat(37) }]], { max: 10 }, "abc"],
+    ["empty items", [Array.from({ length: 39 }, () => ({}))], { max: 10 }, ""],
+    ["empty chunks", Array.from({ length: 5 }, () => []), { max: 10, maxItems: 5 }, ""],
+  ];
+  for (const [label, chunks, options, expected] of cases) {
+    const counters = {};
+    assert.equal(await settles(readPageText(stallingStream(chunks, counters), options)), expected, label);
+    assert.ok(counters.cancelled, `${label}: stream cancelled`);
+    assert.equal(counters.pulls, chunks.length, `${label}: no read after the budget was spent`);
+  }
+});
+
 test("page text scans no item past the input budget and keeps no more of a huge word than fits", async () => {
   assert.equal(await readPageText(textStream([[{ str: `${" ".repeat(15)}abcdefghijklmnop` }]]), { max: 10, maxInput: 20 }), "abcde");
   assert.equal(await readPageText(textStream([[{ str: "a b" }, { str: "cdefghij" }]]), { max: 10, maxInput: 5 }), "a b cd");

@@ -104,13 +104,15 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     return () => { widths.cancel(); observer.disconnect(); };
   }, [pdfState.status]);
 
-  // A refresh retries only what failed: a page that cannot be read opens
-  // the document again, a failed drawing draws again and failed text is read
+  // A refresh retries only what failed: a document that failed to open (or
+  // a retryable reload state), or a page that cannot be read, opens the
+  // document again; a failed drawing draws again and failed text is read
   // again. A page that drew, and text that was read, are left as they are.
   useEffect(() => {
-    if (pageError?.retry === "reopen") setReopen((value) => value + 1);
+    const reopenDocument = pdfState.status === "error" || pdfState.retryable || pageError?.retry === "reopen";
+    if (reopenDocument) setReopen((value) => value + 1);
     if (pageError?.retry === "draw") setDrawAttempt((value) => value + 1);
-    if (pageText.status === "failed" && pageError?.retry !== "reopen") setTextAttempt((value) => value + 1);
+    if (pageText.status === "failed" && !reopenDocument) setTextAttempt((value) => value + 1);
   }, [refreshKey]);
 
   // The page session. Leaving a page, or its document, first stops its
