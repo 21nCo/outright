@@ -35,7 +35,7 @@ export async function readPageText(stream, { max = PAGE_TEXT_LIMIT, maxInput = 4
         const words = /\S+/g;
         for (let word = words.exec(str); word; word = words.exec(str)) {
           text += (text ? " " : "") + word[0].slice(0, max - text.length);
-          if (text.length >= max) return text.slice(0, max);
+          if (text.length >= max) return text.slice(0, max).trimEnd();
         }
       }
     }

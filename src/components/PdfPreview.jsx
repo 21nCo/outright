@@ -3,6 +3,7 @@ import { ArrowsClockwise, CaretLeft, CaretRight, SpinnerGap, WarningCircle } fro
 import { Button } from "@/components/ui/button";
 import { retryingImport } from "@/lib/module-retry";
 import { pdfCanvasSize, settledWidth } from "@/lib/pdf-canvas";
+import { fetchPdf, LOAD_STALL_MS, PDF_DOCUMENT_OPTIONS, withDeadline } from "@/lib/pdf-document";
 import { readPageText } from "@/lib/pdf-text";
 import { pdfWorkerStarter } from "@/lib/pdf-worker";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
@@ -33,66 +34,86 @@ const startWorker = pdfWorkerStarter();
 export default function PdfPreview({ url, name, refreshKey, onFailed }) {
   const [pdfState, setPdfState] = useState({ status: "loading" });
   const [reopen, setReopen] = useState(0);
-  const [pageError, setPageError] = useState(null);
+  const [pageFailure, setPageError] = useState(null);
   const [drawAttempt, setDrawAttempt] = useState(0);
   const [textAttempt, setTextAttempt] = useState(0);
   const onFailedRef = useRef(onFailed);
   useEffect(() => { onFailedRef.current = onFailed; });
   const [page, setPage] = useState(1);
   // The page on show, fetched once per page and document: { proxy, signal,
-  // page }. The signal aborts when the page is left, which stops its drawing
+  // key }. The signal aborts when the page is left, which stops its drawing
   // and text reading before the page is released. Until the asked-for page
   // arrives, the canvas (still holding the last page) is hidden and cleared.
   const [pageSession, setPageSession] = useState(null);
   const [width, setWidth] = useState(0);
-  const [pageText, setPageText] = useState({ status: "loading" });
+  const [textState, setPageText] = useState({ status: "loading" });
   const frameRef = useRef(null);
   const canvasRef = useRef(null);
+  // Each opening of a document, and each page of it, has a key. State left
+  // by another document or page (until its effects catch up) is not shown.
+  const docKey = `${reopen}:${url}`;
+  const shown = pdfState.key === docKey ? pdfState : { status: "loading" };
+  const pageKey = `${docKey}#${page}`;
+  const pageError = pageFailure?.key === pageKey ? pageFailure : null;
+  const pageText = textState.key === pageKey ? textState : { status: "loading" };
+  // Retry and Try again remove the control that had focus, so focus first
+  // moves to the viewer's own element, which every state keeps.
+  const rootRef = useRef(null);
+  const reopenDocument = () => { rootRef.current?.focus(); setReopen((value) => value + 1); };
 
   useEffect(() => { setPage(1); }, [url]);
 
   useEffect(() => {
+    const doc = { release: null }; // The page on show puts its release here.
+    const download = new AbortController();
     let cancelled = false;
     let ended = false;
     let task;
     let started;
     let port;
-    // Closing, replacing or failing ends the document, then its worker,
-    // which pdf.js does not end for a port it was given. A worker that does
-    // not answer within a few seconds is ended anyway; one still starting
-    // is stopped without counting as a failed start.
+    // Closing, replacing or failing ends the document once, in order: the
+    // page on show stops its work and is released, the download stops,
+    // then pdf.js ends the document and the viewer its worker, which pdf.js
+    // does not end for a port it was given. A worker that does not answer
+    // within a few seconds is ended anyway; one still starting is stopped
+    // without counting as a failed start.
     const end = () => {
       if (ended) return;
       ended = true;
+      doc.release?.();
+      download.abort();
       started?.cancel();
       let timer;
       const destroyed = task ? Promise.race([task.destroy().catch(() => {}), new Promise((resolve) => { timer = setTimeout(resolve, 3000); })]) : Promise.resolve();
       void destroyed.then(() => { clearTimeout(timer); port?.destroy(); started?.worker.terminate(); });
     };
-    setPdfState({ status: "loading" });
+    const fail = (error) => {
+      if (cancelled || ended) return;
+      end();
+      if (error?.reloadRequired) { setPdfState({ key: docKey, status: "reload", retryable: Boolean(error.retryable) }); return; }
+      const message = error?.message || "The PDF could not be read";
+      setPdfState({ key: docKey, status: "error", message });
+      onFailedRef.current?.(message);
+    };
     (async () => {
-      const pdfjs = await loadPdfjs();
+      const [pdfjs, data] = await Promise.all([loadPdfjs(), fetchPdf(url, { signal: download.signal })]);
       // Unmounted or reopened while the viewer loaded: start nothing.
       if (cancelled) return;
       started = startWorker(workerUrl);
       await started.ready;
       if (cancelled) return;
+      // A worker that fails once started fails its document, open or not.
+      const stopped = (event) => fail(new Error(`The PDF reader stopped${event?.message ? `: ${event.message}` : ""}`));
+      for (const type of ["error", "messageerror"]) started.worker.addEventListener(type, stopped);
       port = new pdfjs.PDFWorker({ port: started.worker });
-      task = pdfjs.getDocument({ url, worker: port, isEvalSupported: false, enableXfa: false, withCredentials: false, disableAutoFetch: true,
+      task = pdfjs.getDocument({ data, worker: port, ...PDF_DOCUMENT_OPTIONS,
         cMapUrl: assetUrl("cmaps"), cMapPacked: true, standardFontDataUrl: assetUrl("standard_fonts"), wasmUrl: assetUrl("wasm"), iccUrl: assetUrl("iccs") });
-      const pdf = await task.promise;
-      if (cancelled) return;
+      const pdf = await withDeadline(task.promise, LOAD_STALL_MS, "The PDF did not open in time");
+      if (cancelled || ended) return;
       // A document opened again may have fewer pages than the one before.
       setPage((value) => Math.min(value, pdf.numPages));
-      setPdfState({ status: "ready", pdf, pages: pdf.numPages });
-    })().catch((error) => {
-      if (cancelled) return;
-      end();
-      if (error?.reloadRequired) { setPdfState({ status: "reload", retryable: Boolean(error.retryable) }); return; }
-      const message = error?.message || "The PDF could not be read";
-      setPdfState({ status: "error", message });
-      onFailedRef.current?.(message);
-    });
+      setPdfState({ key: docKey, status: "ready", pdf, pages: pdf.numPages, doc });
+    })().catch(fail);
     return () => { cancelled = true; end(); };
   }, [url, reopen]);
 
@@ -103,47 +124,47 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     const observer = new ResizeObserver(([entry]) => widths.update(Math.floor(entry.contentRect.width)));
     observer.observe(frame);
     return () => { widths.cancel(); observer.disconnect(); };
-  }, [pdfState.status]);
+  }, [shown.status]);
 
   // A refresh retries only what failed: a document that failed to open (or
   // a retryable reload state), or a page that cannot be read, opens the
   // document again; a failed drawing draws again and failed text is read
   // again. A page that drew, and text that was read, are left as they are.
   useEffect(() => {
-    const reopenDocument = pdfState.status === "error" || pdfState.retryable || pageError?.retry === "reopen";
-    if (reopenDocument) setReopen((value) => value + 1);
+    const again = shown.status === "error" || shown.retryable || pageError?.retry === "reopen";
+    if (again) setReopen((value) => value + 1);
     if (pageError?.retry === "draw") setDrawAttempt((value) => value + 1);
-    if (pageText.status === "failed" && !reopenDocument) setTextAttempt((value) => value + 1);
+    if (pageText.status === "failed" && !again) setTextAttempt((value) => value + 1);
   }, [refreshKey]);
 
   // The page session. Leaving a page, or its document, first stops its
   // drawing and text reading, then releases the page's decoded images and
   // drawing operations, so visiting many pages keeps only the shown one's.
-  const pdf = pdfState.pdf;
+  // The document's end() releases it first, before the document ends.
+  const { pdf, doc } = shown;
   useEffect(() => {
-    setPageSession(null);
-    setPageError(null);
-    setPageText({ status: "loading" });
     if (canvasRef.current) canvasRef.current.width = 0;
     if (!pdf) return undefined;
     const session = new AbortController();
     let proxy;
+    const release = () => { if (!session.signal.aborted) { session.abort(); proxy?.cleanup(); } };
+    doc.release = release;
     pdf.getPage(page).then((value) => {
       proxy = value;
-      if (session.signal.aborted) value.cleanup(); else setPageSession({ proxy: value, signal: session.signal, page });
+      if (session.signal.aborted) value.cleanup(); else setPageSession({ proxy: value, signal: session.signal, key: pageKey });
     }, (error) => {
       if (session.signal.aborted) return;
-      setPageError({ message: `This page could not be read: ${error?.message || "unknown error"}`, retry: "reopen" });
-      setPageText({ status: "failed" });
+      setPageError({ key: pageKey, message: `This page could not be read: ${error?.message || "unknown error"}`, retry: "reopen" });
+      setPageText({ key: pageKey, status: "failed" });
     });
-    return () => { session.abort(); proxy?.cleanup(); };
+    return release;
   }, [pdf, page]);
 
   // Drawing follows the page, the pane's width and Retry. A cancelled
   // drawing is not an error: a newer one replaces it.
   useEffect(() => {
     if (!pageSession || pageSession.signal.aborted || !width || !canvasRef.current) return undefined;
-    const { proxy, signal } = pageSession;
+    const { proxy, signal, key } = pageSession;
     let cancelled = false;
     setPageError(null);
     // The canvas is sized within a pixel budget before it is allocated.
@@ -152,7 +173,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     if (size.tooLarge) {
       canvas.width = 0;
       canvas.height = 0;
-      setPageError({ message: "This page is too large to draw. Its text is below.", retry: null });
+      setPageError({ key, message: "This page is too large to draw. Its text is below.", retry: null });
       return undefined;
     }
     canvas.width = size.canvasWidth;
@@ -163,7 +184,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     const stop = () => { if (!cancelled) { cancelled = true; render.cancel(); } };
     signal.addEventListener("abort", stop, { once: true });
     render.promise.catch((error) => {
-      if (!cancelled && error?.name !== "RenderingCancelledException") setPageError({ message: `This page could not be drawn: ${error?.message || "unknown error"}`, retry: "draw" });
+      if (!cancelled && error?.name !== "RenderingCancelledException") setPageError({ key, message: `This page could not be drawn: ${error?.message || "unknown error"}`, retry: "draw" });
     });
     return () => { signal.removeEventListener("abort", stop); stop(); };
   }, [pageSession, width, drawAttempt]);
@@ -176,28 +197,29 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     const controller = new AbortController();
     const stop = () => controller.abort();
     pageSession.signal.addEventListener("abort", stop, { once: true });
-    setPageText({ status: "loading" });
+    const { key } = pageSession;
+    setPageText({ key, status: "loading" });
     readPageText(pageSession.proxy.streamTextContent(), { signal: controller.signal }).then(
-      (text) => { if (!controller.signal.aborted) setPageText({ status: "ready", text }); },
-      () => { if (!controller.signal.aborted) setPageText({ status: "failed" }); });
+      (text) => { if (!controller.signal.aborted) setPageText({ key, status: "ready", text }); },
+      () => { if (!controller.signal.aborted) setPageText({ key, status: "failed" }); });
     return () => { pageSession.signal.removeEventListener("abort", stop); stop(); };
   }, [pageSession, textAttempt]);
 
-  const retryPage = () => (pageError?.retry === "reopen" ? setReopen : setDrawAttempt)((value) => value + 1);
-  if (pdfState.status === "loading") return <div className="preview-state" role="status"><SpinnerGap className="spin" />Reading PDF…</div>;
-  if (pdfState.status === "reload") return <div className="preview-state" role="alert"><WarningCircle /><p>Outright was updated, or part of it did not load, so the PDF viewer needs a page reload. Reloading clears unsent messages.</p>
+  const retryPage = () => { rootRef.current?.focus(); (pageError?.retry === "reopen" ? setReopen : setDrawAttempt)((value) => value + 1); };
+  if (shown.status === "loading") return <div ref={rootRef} tabIndex={-1} className="preview-state" role="status"><SpinnerGap className="spin" />Reading PDF…</div>;
+  if (shown.status === "reload") return <div ref={rootRef} tabIndex={-1} className="preview-state" role="alert"><WarningCircle /><p>Outright was updated, or part of it did not load, so the PDF viewer needs a page reload. Reloading clears unsent messages.</p>
     <Button variant="outline" size="xs" onClick={() => window.location.reload()}><ArrowsClockwise />Reload page</Button>
-    {pdfState.retryable && <Button variant="ghost" size="xs" onClick={() => setReopen((value) => value + 1)}>Try again</Button>}</div>;
-  if (pdfState.status === "error") return <div className="preview-state" role="alert"><WarningCircle /><p>This PDF could not be read: {pdfState.message}</p><Button variant="outline" size="xs" onClick={() => setReopen((value) => value + 1)}><ArrowsClockwise />Retry</Button></div>;
-  const pageShown = pageSession?.page === page;
-  return <div className="pdf-preview">
+    {shown.retryable && <Button variant="ghost" size="xs" onClick={reopenDocument}>Try again</Button>}</div>;
+  if (shown.status === "error") return <div ref={rootRef} tabIndex={-1} className="preview-state" role="alert"><WarningCircle /><p>This PDF could not be read: {shown.message}</p><Button variant="outline" size="xs" onClick={reopenDocument}><ArrowsClockwise />Retry</Button></div>;
+  const pageShown = pageSession?.key === pageKey;
+  return <div ref={rootRef} tabIndex={-1} className="pdf-preview">
     <div className="pdf-toolbar" role="group" aria-label="PDF pages">
-      <Button variant="ghost" size="icon-xs" aria-label="Previous page" disabled={page <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}><CaretLeft /></Button>
-      <span role="status" aria-live="polite">Page {page} of {pdfState.pages}</span>
-      <Button variant="ghost" size="icon-xs" aria-label="Next page" disabled={page >= pdfState.pages} onClick={() => setPage((value) => Math.min(pdfState.pages, value + 1))}><CaretRight /></Button>
+      <Button variant="ghost" size="icon-xs" aria-label="Previous page" disabled={page <= 1} focusableWhenDisabled onClick={() => setPage((value) => Math.max(1, value - 1))}><CaretLeft /></Button>
+      <span role="status" aria-live="polite">Page {page} of {shown.pages}</span>
+      <Button variant="ghost" size="icon-xs" aria-label="Next page" disabled={page >= shown.pages} focusableWhenDisabled onClick={() => setPage((value) => Math.min(shown.pages, value + 1))}><CaretRight /></Button>
     </div>
     <div className="pdf-frame" ref={frameRef}>
-      <canvas ref={canvasRef} role="img" hidden={Boolean(pageError) || !pageShown} aria-label={`Page ${page} of ${pdfState.pages} of ${name}`} />
+      <canvas ref={canvasRef} role="img" hidden={Boolean(pageError) || !pageShown} aria-label={`Page ${page} of ${shown.pages} of ${name}`} />
       {!pageError && !pageShown && <div className="preview-state" role="status"><SpinnerGap className="spin" />Reading page {page}…</div>}
       {pageError && <div className="preview-state" role="alert"><p>{pageError.message}</p>{pageError.retry && <Button variant="outline" size="xs" onClick={retryPage}><ArrowsClockwise />Retry</Button>}</div>}
     </div>

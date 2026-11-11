@@ -28,14 +28,16 @@ export function pdfjsAssetsPlugin() {
   return {
     name: "outright-pdfjs-assets",
     configureServer(server) {
-      server.middlewares.use("/pdfjs", (request, response, next) => {
+      server.middlewares.use("/pdfjs", (request, response) => {
         // The mount strips "/pdfjs" but keeps an absolute-form request's
         // "scheme://host", which the URL drops along with the query.
         const pathname = `/pdfjs${new URL(request.url, "file:///").pathname}`;
+        // Any other /pdfjs/ address is a 404, never the app's page.
+        const missing = () => { response.statusCode = 404; response.end(); };
         const headers = pdfjsAssetHeaders(pathname);
-        if (!headers) { next(); return; }
+        if (!headers) { missing(); return; }
         let body;
-        try { body = readFileSync(path.join(base, ...pathname.split("/").slice(2))); } catch { next(); return; }
+        try { body = readFileSync(path.join(base, ...pathname.split("/").slice(2))); } catch { missing(); return; }
         for (const [header, value] of Object.entries(headers)) response.setHeader(header, value);
         response.end(body);
       });

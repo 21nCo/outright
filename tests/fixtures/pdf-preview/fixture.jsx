@@ -1,9 +1,22 @@
 // Drives the real PdfPreview over the fake pdf.js and posts what it
 // observed to /done, which server/pdf-preview-browser.test.mjs reads.
+import { useLayoutEffect } from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import PdfPreview from "@/components/PdfPreview";
-import { control, documents, pages } from "./fake-pdfjs.js";
+import { control, documents, events, ports } from "./fake-pdfjs.js";
+
+// The pages of the document opened last.
+const pages = new Proxy({}, { get: (target, number) => documents.at(-1)?.pages[number], ownKeys: () => Reflect.ownKeys(documents.at(-1)?.pages ?? {}), getOwnPropertyDescriptor: (target, number) => ({ value: documents.at(-1)?.pages[number], enumerable: true, configurable: true }) });
+// The worker the viewer ends is logged with its document's number.
+const terminate = Worker.prototype.terminate;
+Worker.prototype.terminate = function end() {
+  events.push(`${documents.find((record) => record.port?.port === this)?.id} terminate`);
+  return terminate.call(this);
+};
+// Each document's ending, in order: its page work is stopped and released
+// before the document ends, and the document before its port and worker.
+const teardown = (record) => events.filter((event) => event.startsWith(`${record.id} `)).map((event) => event.split(" ")[1]);
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function until(check, label, ms = 5000) {
@@ -16,8 +29,12 @@ async function until(check, label, ms = 5000) {
 const pageText = () => document.querySelector(".pdf-text p")?.textContent;
 const status = () => document.querySelector(".pdf-toolbar [role=status]")?.textContent;
 const alertText = () => document.querySelector(".pdf-frame [role=alert]")?.textContent ?? "";
-const next = () => document.querySelector("button[aria-label='Next page']").click();
-const retry = () => document.querySelector(".pdf-frame [role=alert] button").click();
+// Buttons are pressed as from the keyboard: focused, then activated.
+const press = (button) => { button.focus(); button.click(); };
+const next = () => press(document.querySelector("button[aria-label='Next page']"));
+const retry = () => press(document.querySelector(".pdf-frame [role=alert] button"));
+// Focus stays inside the viewer instead of falling back to the page.
+const focusKept = () => document.activeElement !== document.body && document.getElementById("host").contains(document.activeElement);
 const snapshot = (number) => {
   const page = pages[number];
   return page ? { renders: page.renders, cancelledRenders: page.cancelledRenders, cleanups: [...page.cleanups], textReads: page.textReads, textCancelled: page.textCancelled } : null;
@@ -57,7 +74,7 @@ async function run() {
   // Retry draws the page again although pdf.js answers with the same page at once.
   retry();
   await until(() => pages[2].settledRenders === 2 && !alertText(), "page 2 drawn again");
-  result.retried = { page2: snapshot(2), text: pageText(), canvasHidden: document.querySelector("canvas").hidden };
+  result.retried = { page2: snapshot(2), text: pageText(), canvasHidden: document.querySelector("canvas").hidden, focusKept: focusKept() };
 
   // Page 3 arrives after page 4 was asked for.
   next();
@@ -72,12 +89,13 @@ async function run() {
   // A page pdf.js cannot read settles its text, and Retry opens the document again.
   next();
   await until(() => alertText().includes("could not be read"), "page 5 failure");
-  result.unreadable = { alert: alertText(), text: pageText(), page5: snapshot(5) };
+  // Next, now disabled on the last page, keeps focus.
+  result.unreadable = { alert: alertText(), text: pageText(), page5: snapshot(5), focus: document.activeElement?.getAttribute("aria-label") };
   retry();
   await until(() => status() === "Page 5 of 5" && pages[5].settledRenders === 1 && pageText() !== "Reading page text…", "page 5 reopened");
   await wait(50);
   const first = documents[0];
-  result.reopened = { text: pageText(), opened: documents.length, firstEnded: first.destroyed && first.port.destroyed, page5: snapshot(5) };
+  result.reopened = { text: pageText(), opened: documents.length, firstEnded: first.destroyed && first.port.destroyed, page5: snapshot(5), focusKept: focusKept() };
 
   // A refresh reads the failed text again without drawing the page again.
   flushSync(() => root.render(<PdfPreview url="/doc.pdf" name="doc.pdf" refreshKey={1} />));
@@ -110,11 +128,61 @@ async function run() {
   await until(() => document.querySelector("[role=alert]")?.textContent.includes("This PDF could not be read"), "the second broken document");
   const retryButton = document.querySelector("[role=alert] button");
   const button = retryButton?.textContent ?? "";
-  retryButton?.click();
+  press(retryButton);
   await until(() => status() === "Page 1 of 5", "the second broken document retried");
   const again = documents.filter((record) => record.url === "/broken-again.pdf");
-  result.brokenRetried = { button, alert: document.querySelector("[role=alert]")?.textContent ?? "", opened: again.length, firstEnded: again[0].destroyed && again[0].port.destroyed, failures: retriedFailures };
+  result.brokenRetried = { button, alert: document.querySelector("[role=alert]")?.textContent ?? "", opened: again.length, firstEnded: again[0].destroyed && again[0].port.destroyed, failures: retriedFailures, focusKept: focusKept() };
   retryRoot.unmount();
+
+  // Replacing a document while its page is drawn and its text read: the
+  // first commit with the new address shows nothing of the old document,
+  // and the old one's page work stops and is released before it ends.
+  control.holdDrawing = true;
+  control.holdText = true;
+  const commits = [];
+  function Probe({ url }) {
+    useLayoutEffect(() => { commits.push({ url, canvas: host.querySelector("canvas")?.getAttribute("aria-label") ?? null, pages: status() ?? null }); }, [url]);
+    return <PdfPreview url={url} name={url.slice(1)} refreshKey={0} />;
+  }
+  const orderRoot = createRoot(host);
+  orderRoot.render(<Probe url="/a.pdf" />);
+  await until(() => documents.at(-1).url === "/a.pdf" && pages[1]?.renders === 1 && pages[1]?.textReads === 1, "a.pdf drawing and reading");
+  const replaced = documents.at(-1);
+  orderRoot.render(<Probe url="/b.pdf" />);
+  await until(() => documents.at(-1).url === "/b.pdf" && pages[1]?.renders === 1 && pages[1]?.textReads === 1, "b.pdf drawing and reading");
+  const closedRecord = documents.at(-1);
+  orderRoot.unmount();
+  await until(() => teardown(closedRecord).includes("terminate"), "b.pdf ended");
+  await until(() => teardown(replaced).includes("terminate"), "a.pdf ended");
+  control.holdDrawing = false;
+  control.holdText = false;
+  result.order = { firstCommit: commits.find((commit) => commit.url === "/b.pdf"), replaced: teardown(replaced), closed: teardown(closedRecord) };
+
+  // A worker that fails after its document opened fails the document: the
+  // page is released before the document ends, and Retry opens it again.
+  const crashFailures = [];
+  const crashRoot = createRoot(host);
+  flushSync(() => crashRoot.render(<PdfPreview url="/crash.pdf" name="crash.pdf" refreshKey={0} onFailed={(message) => crashFailures.push(message)} />));
+  await until(() => status() === "Page 1 of 5" && pages[1]?.settledRenders === 1, "crash.pdf drawn");
+  const crashed = documents.at(-1);
+  ports.at(-1).port.postMessage("crash");
+  await until(() => document.querySelector("[role=alert]")?.textContent.includes("stopped") && teardown(crashed).includes("terminate"), "the worker failure");
+  result.crashed = { alert: document.querySelector("[role=alert]").textContent, failures: [...crashFailures], teardown: teardown(crashed) };
+  press(document.querySelector("[role=alert] button"));
+  await until(() => status() === "Page 1 of 5", "crash.pdf opened again");
+  result.crashRetried = { opened: documents.filter((record) => record.url === "/crash.pdf").length, focusKept: focusKept() };
+  crashRoot.unmount();
+
+  // Closing a document whose download is still arriving stops the download.
+  const heldRoot = createRoot(host);
+  flushSync(() => heldRoot.render(<PdfPreview url="/held.pdf" name="held.pdf" refreshKey={0} />));
+  const held = async () => (await fetch("/held-state")).json();
+  const heldEnd = performance.now() + 5000;
+  while (!(await held()).requested && performance.now() < heldEnd) await wait(20);
+  result.held = { requested: (await held()).requested };
+  heldRoot.unmount();
+  while (!(await held()).closed && performance.now() < heldEnd + 5000) await wait(20);
+  result.held.closed = (await held()).closed;
 
   await fetch("/retire-worker", { method: "POST" });
   const failures = [];
@@ -127,4 +195,6 @@ async function run() {
 }
 
 run().then((result) => ({ ok: true, result }), (error) => ({ ok: false, error: String(error?.stack ?? error) }))
-  .then((outcome) => fetch("/done", { method: "POST", body: JSON.stringify(outcome) }));
+  .then((outcome) => fetch("/done", { method: "POST", body: JSON.stringify(outcome) }))
+  // Nothing is left to report to: the test sees the missing outcome.
+  .catch((error) => console.error(error));

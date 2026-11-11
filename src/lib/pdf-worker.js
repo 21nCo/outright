@@ -9,8 +9,11 @@
 // preview reading forever. A failure whose script the server no longer has
 // (an update replaced its hashed name) carries reloadRequired, since no
 // retry of that address can start it. A start its caller abandons is
-// cancelled: the worker ends, and nothing is probed or counted as failed.
+// cancelled: the worker ends, any probe of its script stops, and nothing is
+// counted as failed. After ready, the viewer listens for the worker failing.
 import { probeScript } from "./module-retry.js";
+
+const abandoned = () => Object.assign(new Error("The PDF reader was no longer needed"), { name: "AbortError" });
 
 export function pdfWorkerStarter({ createWorker = (url) => new Worker(url, { type: "module" }), base = () => globalThis.location?.href, startupMs = 20_000, probe = probeScript } = {}) {
   let failed = false;
@@ -20,6 +23,7 @@ export function pdfWorkerStarter({ createWorker = (url) => new Worker(url, { typ
     if (failed) address.searchParams.set("retry", String(++retries));
     const worker = createWorker(address.href);
     let cancel;
+    const probing = new AbortController();
     const ready = new Promise((resolve, reject) => {
       let pending = true;
       // Ends the start once: true only for the first caller.
@@ -30,21 +34,27 @@ export function pdfWorkerStarter({ createWorker = (url) => new Worker(url, { typ
         failed = false;
         resolve();
       };
+      // The failure counts, and the next start asks for the script afresh,
+      // only if no cancel came while the script was probed.
       const fail = (reason) => {
         if (!settle()) return;
-        failed = true;
         worker.terminate();
         const error = new Error(`The PDF reader did not start${reason}`);
-        void probe(address.href).catch(() => "unreachable").then((state) => reject(Object.assign(error, { reloadRequired: state === "gone" })));
+        void probe(address.href, { signal: probing.signal }).catch(() => "unreachable").then((state) => {
+          if (probing.signal.aborted) { reject(abandoned()); return; }
+          failed = true;
+          reject(Object.assign(error, { reloadRequired: state === "gone" }));
+        });
       };
       const onError = (event) => fail(event?.message ? `: ${event.message}` : "");
       const timer = setTimeout(() => fail(" in time"), startupMs);
       worker.addEventListener("message", onMessage);
       worker.addEventListener("error", onError);
       cancel = () => {
+        probing.abort();
         if (!settle()) return;
         worker.terminate();
-        reject(Object.assign(new Error("The PDF reader was no longer needed"), { name: "AbortError" }));
+        reject(abandoned());
       };
     });
     return { worker, ready, cancel };

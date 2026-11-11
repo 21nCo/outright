@@ -57,11 +57,16 @@ async function bundle() {
 function fixtureServer(html, holdMs) {
   let release;
   let retired = false;
+  const heldPdf = { requested: false, closed: false };
   const done = new Promise((resolve) => { release = resolve; });
   const held = setTimeout(() => release(null), holdMs);
   const server = createServer((request, response) => {
     if (request.url === "/") { response.setHeader("Content-Type", "text/html; charset=utf-8"); response.end(html); return; }
-    if (request.url === WORKER_PATH && !retired) { response.setHeader("Content-Type", "text/javascript"); response.end("postMessage({ sourceName: 'worker', action: 'ready' });"); return; }
+    if (request.url === WORKER_PATH && !retired) { response.setHeader("Content-Type", "text/javascript"); response.end("postMessage({ sourceName: 'worker', action: 'ready' }); onmessage = ({ data }) => { if (data === 'crash') throw new Error('worker crashed'); };"); return; }
+    // A PDF's bytes are its own address (see fake-pdfjs.js); /held.pdf sends a part and then nothing.
+    if (request.url === "/held.pdf") { heldPdf.requested = true; response.on("close", () => { heldPdf.closed = true; }); response.writeHead(200, { "Content-Type": "application/pdf" }); response.write("%PDF"); return; }
+    if (request.url === "/held-state") { response.setHeader("Content-Type", "application/json"); response.end(JSON.stringify(heldPdf)); return; }
+    if (request.url.endsWith(".pdf")) { response.setHeader("Content-Type", "application/pdf"); response.end(request.url); return; }
     if (request.url === "/retire-worker" && request.method === "POST") { retired = true; response.end(); return; }
     if (request.url === "/hold") { void done.then(() => { response.statusCode = 204; response.end(); }); return; }
     if (request.url === "/done" && request.method === "POST") {
@@ -106,7 +111,7 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
   assert.ok(posted, `the fixture did not finish: exit ${run.code ?? run.signal}; ${run.stderr}`);
   const outcome = JSON.parse(posted);
   assert.ok(outcome.ok, outcome.error);
-  const { opened, dragged, failedDraw, retried, skipped, unreadable, reopened, refreshed, closed, broken, brokenRefreshed, brokenRetried, retired } = outcome.result;
+  const { opened, dragged, failedDraw, retried, skipped, unreadable, reopened, refreshed, closed, broken, brokenRefreshed, brokenRetried, order, crashed, crashRetried, held, retired } = outcome.result;
 
   // Opening draws page 1 once and reads its text once.
   assert.equal(opened.renders, 1);
@@ -127,6 +132,8 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
   assert.equal(retried.page2.textReads, 1);
   assert.equal(retried.text, "Page two text");
   assert.equal(retried.canvasHidden, false);
+  // The Retry that went away handed focus to the viewer, not to the page.
+  assert.ok(retried.focusKept);
   // A page left before it arrived is released and never drawn or read.
   assert.equal(skipped.page2.cleanups.length, 1);
   assert.equal(skipped.page3.renders, 0);
@@ -142,11 +149,14 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
   // A page pdf.js cannot read says its text cannot be read, not that it is being read.
   assert.match(unreadable.alert, /page could not be read: bad page object/);
   assert.equal(unreadable.text, "This page's text could not be read.");
+  // Next, disabled on the last page, keeps the focus it had.
+  assert.equal(unreadable.focus, "Next page");
   // Its Retry opens the document again on the same page and ends the old one.
   assert.equal(reopened.opened, 2);
   assert.ok(reopened.firstEnded);
   assert.equal(reopened.page5.renders, 1);
   assert.equal(reopened.text, "This page's text could not be read.");
+  assert.ok(reopened.focusKept);
   // A refresh reads failed text again and leaves the drawn page as it is.
   assert.equal(refreshed.page5.textReads, 2);
   assert.equal(refreshed.page5.renders, 1);
@@ -168,6 +178,19 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
   assert.ok(brokenRetried.firstEnded);
   assert.equal(brokenRetried.alert, "");
   assert.deepEqual(brokenRetried.failures, ["Invalid PDF structure"]);
+  assert.ok(brokenRetried.focusKept);
+  // A new address shows nothing of the old document, not even for one commit.
+  assert.deepEqual(order.firstCommit, { url: "/b.pdf", canvas: null, pages: null });
+  // Replacing or closing a document stops its page's drawing and text, then releases the page, then ends the document, its port and its worker.
+  for (const ended of [order.replaced, order.closed]) assert.deepEqual(ended, ["render-cancel", "text-cancel", "cleanup", "destroy", "port-destroy", "terminate"]);
+  // A worker that fails after its document opened fails the document in the same order, and Retry opens it again.
+  assert.match(crashed.alert, /The PDF reader stopped: .*worker crashed/);
+  assert.equal(crashed.failures.length, 1);
+  assert.deepEqual(crashed.teardown, ["cleanup", "destroy", "port-destroy", "terminate"]);
+  assert.equal(crashRetried.opened, 2);
+  assert.ok(crashRetried.focusKept);
+  // Closing a document still downloading closes its request.
+  assert.deepEqual(held, { requested: true, closed: true });
   // A worker script gone after an update asks for a reload the user starts, not a Retry that cannot work.
   assert.match(retired.alert, /needs a page reload/);
   assert.equal(retired.button, "Reload page");

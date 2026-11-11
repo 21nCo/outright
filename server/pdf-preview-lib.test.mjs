@@ -233,14 +233,16 @@ test("page text reads like the whole-page normalisation, across chunks and odd w
   assert.equal(await readPageText(textStream(chunks)), wholePageText(chunks.flat().map((item) => ({ str: typeof item.str === "string" ? item.str : "" }))));
   assert.equal(await readPageText(textStream([])), "");
   const small = [[{ str: "abc def" }, { str: "ghi" }]];
-  for (let max = 1; max <= 11; max += 1) assert.equal(await readPageText(textStream(small), { max }), wholePageText(small[0]).slice(0, max), `max ${max}`);
+  // A limit that falls just after a space keeps no trailing space.
+  for (let max = 1; max <= 11; max += 1) assert.equal(await readPageText(textStream(small), { max }), wholePageText(small[0]).slice(0, max).trimEnd(), `max ${max}`);
 });
 
 test("a page with endless text is read only up to the limit, and pdf.js's stream is cancelled", async () => {
   const counters = {};
   const words = Array.from({ length: 100 }, () => ({ str: "word ".repeat(50) }));
   const text = await readPageText(textStream(() => words, counters));
-  assert.equal(text.length, PAGE_TEXT_LIMIT);
+  // The limit falls after a space here, which is dropped.
+  assert.equal(text, "word ".repeat(PAGE_TEXT_LIMIT / 5).trimEnd());
   assert.ok(counters.cancelled);
   // 100 items of 250 characters each cover the limit in four chunks.
   assert.ok(counters.pulls <= 6, `pulled ${counters.pulls} chunks`);

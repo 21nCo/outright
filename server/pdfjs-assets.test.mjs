@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -31,12 +32,12 @@ test("the built client serves pdf.js assets with the development server's header
   // Each body is read to its end, so no response holds its file open.
   const get = async (pathname) => {
     const response = await fetch(new URL(pathname, `http://127.0.0.1:${server.address().port}`));
-    await response.arrayBuffer();
-    return response;
+    return Object.assign(response, { bytes: Buffer.from(await response.arrayBuffer()) });
   };
   for (const pathname of ["/pdfjs/cmaps/Adobe-Japan1-UCS2.bcmap", "/pdfjs/standard_fonts/FoxitSans.pfb"]) {
     const response = await get(pathname);
     assert.equal(response.status, 200, pathname);
+    assert.deepEqual(response.bytes, readFileSync(path.join(directory, pathname)), pathname);
     assert.equal(response.headers.get("x-content-type-options"), "nosniff", pathname);
     assert.equal(response.headers.get("content-type"), pdfjsAssetHeaders(pathname)["Content-Type"], pathname);
     assert.equal(response.headers.get("content-type"), "application/octet-stream", pathname);
@@ -54,17 +55,21 @@ test("only a /pdfjs/<folder>/<name> address gets pdf.js asset headers", () => {
   for (const pathname of ["/index.html", "/pdfjs/other/x.bcmap", "/pdfjs/cmaps/../x", "/pdfjs/cmaps/a/b", "/assets/pdfjs/cmaps/x.bcmap"]) assert.equal(pdfjsAssetHeaders(pathname), null, pathname);
 });
 
-test("the development server serves a pdf.js asset whether its request target is a path or an absolute URL", () => {
+test("the development server serves a pdf.js asset whether its request target is a path or an absolute URL, and answers any other /pdfjs/ address with a 404", () => {
   let middleware;
   pdfjsAssetsPlugin().configureServer({ middlewares: { use: (mount, handler) => { assert.equal(mount, "/pdfjs"); middleware = handler; } } });
+  const asset = readFileSync(path.join(path.dirname(createRequire(import.meta.url).resolve("pdfjs-dist/package.json")), "cmaps", "78-EUC-H.bcmap"));
   // Connect strips the mount from the path but keeps an absolute-form request's scheme and host.
-  for (const url of ["/cmaps/78-EUC-H.bcmap?v=1", "http://localhost:5173/cmaps/78-EUC-H.bcmap?v=1", "/cmaps/../package.json"]) {
+  for (const url of ["/cmaps/78-EUC-H.bcmap?v=1", "http://localhost:5173/cmaps/78-EUC-H.bcmap?v=1", "/cmaps/../package.json", "/cmaps/missing.bcmap", "/other/x.bcmap", "/"]) {
     const headers = {};
-    let body = null;
+    const response = { statusCode: 200, setHeader: (name, value) => { headers[name] = value; }, end: (data) => { response.body = data ?? null; } };
     let passed = false;
-    middleware({ url }, { setHeader: (name, value) => { headers[name] = value; }, end: (data) => { body = data; } }, () => { passed = true; });
-    if (url.includes("..")) { assert.ok(passed && body === null, url); continue; }
-    assert.ok(!passed && body?.length > 0, url);
+    // Nothing reaches the next middleware, so Vite's page fallback never answers for a pdf.js asset.
+    middleware({ url }, response, () => { passed = true; });
+    assert.ok(!passed, url);
+    if (!url.includes("78-EUC-H")) { assert.deepEqual([response.statusCode, response.body, headers], [404, null, {}], url); continue; }
+    assert.equal(response.statusCode, 200, url);
+    assert.deepEqual(response.body, asset, url);
     assert.deepEqual(headers, pdfjsAssetHeaders("/pdfjs/cmaps/78-EUC-H.bcmap"), url);
   }
 });

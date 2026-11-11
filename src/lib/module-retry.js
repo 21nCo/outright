@@ -16,8 +16,11 @@
 // its hashed name), a retry of a file the server still has failed again (a
 // file it imports failed, and the browser keeps that failure), or a retry
 // gave a module without the names asked for (the error named one of its
-// imports, not the module). A network that is still down is not one: the
-// next attempt retries.
+// imports, not the module), or the first import gave such a module (the
+// browser keeps it). A network that is still down is not one: the next
+// attempt retries. An import that has not settled within timeoutMs fails
+// like one whose error names no address, so a stalled chunk cannot keep the
+// viewer loading or trap a Retry behind it.
 //
 // An error that names no address cannot be probed, so a chunk that is gone
 // would fail every retry. After failing twice in a row that way, the error
@@ -37,9 +40,10 @@ export function failedModuleUrl(error, origin) {
 // Asks the server for a script: "gone" when it answers 404 or 410, or
 // anything but JavaScript (a single-page fallback), "present" when it serves
 // the script, "unreachable" when it cannot be asked within timeoutMs.
-export async function probeScript(href, { fetchImpl = globalThis.fetch, timeoutMs = 5000 } = {}) {
+export async function probeScript(href, { fetchImpl = globalThis.fetch, timeoutMs = 5000, signal } = {}) {
   try {
-    const response = await fetchImpl(href, { cache: "no-store", credentials: "same-origin", signal: AbortSignal.timeout(timeoutMs) });
+    const timeout = AbortSignal.timeout(timeoutMs);
+    const response = await fetchImpl(href, { cache: "no-store", credentials: "same-origin", signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
     void response.body?.cancel().catch(() => {});
     if (response.status === 404 || response.status === 410) return "gone";
     if (!response.ok) return "unreachable";
@@ -47,7 +51,7 @@ export async function probeScript(href, { fetchImpl = globalThis.fetch, timeoutM
   } catch { return "unreachable"; }
 }
 
-export function retryingImport(load, { exports = [], importUrl = (href) => import(/* @vite-ignore */ href), origin, probe = probeScript } = {}) {
+export function retryingImport(load, { exports = [], importUrl = (href) => import(/* @vite-ignore */ href), origin, probe = probeScript, timeoutMs = 30_000 } = {}) {
   let loaded = null;
   let failedUrl = null;
   let unnamed = 0;
@@ -60,9 +64,11 @@ export function retryingImport(load, { exports = [], importUrl = (href) => impor
       retried.searchParams.set("retry", String(++attempts));
       attempt = importUrl(retried.href);
     } else attempt = load();
-    loaded = attempt.then((module) => {
+    let timer;
+    const late = new Promise((resolve, reject) => { timer = setTimeout(() => reject(new Error("The PDF viewer did not load in time")), timeoutMs); });
+    loaded = Promise.race([attempt, late]).finally(() => clearTimeout(timer)).then((module) => {
       const missing = exports.filter((name) => module?.[name] === undefined);
-      if (missing.length) throw Object.assign(new Error(`The loaded module has no ${missing.join(", ")}`), { reloadRequired: Boolean(retried) });
+      if (missing.length) throw Object.assign(new Error(`The loaded module has no ${missing.join(", ")}`), { reloadRequired: true });
       return module;
     }, async (error) => {
       const named = failedModuleUrl(error, origin ?? globalThis.location?.origin);
