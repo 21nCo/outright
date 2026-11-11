@@ -107,7 +107,7 @@ async function run() {
   // Next, now disabled on the last page, keeps focus.
   result.unreadable = { alert: alertText(), text: pageText(), page5: snapshot(5), focus: document.activeElement?.getAttribute("aria-label") };
   retry();
-  await until(() => status() === "Page 5 of 5" && pages[5].settledRenders === 1 && pageText() !== "Reading page text…", "page 5 reopened");
+  await until(() => status() === "Page 5 of 5" && pages[5]?.settledRenders === 1 && pageText() !== "Reading page text…", "page 5 reopened");
   await wait(50);
   const first = documents[0];
   result.reopened = { text: pageText(), opened: documents.length, firstEnded: first.destroyed && first.port.destroyed, page5: snapshot(5), focusKept: focusKept() };
@@ -179,19 +179,58 @@ async function run() {
   control.holdText = false;
   result.order = { firstCommit: commits.find((commit) => commit.url === "/b.pdf"), returnCommit: commits.filter((commit) => commit.url === "/b.pdf")[1], replaced: teardown(replaced), returned: teardown(returned), closed: teardown(closedRecord) };
 
-  // A drawing that does not finish in time is stopped, and its Retry opens the document again.
+  // A drawing with no progress in time fails its document, which stays failed
+  // when the pane is resized, and its Retry opens the document again.
   PDF_DEADLINES.stallMs = 300;
   control.holdDrawing = true;
+  const slowFailures = [];
   const slowRoot = createRoot(host);
-  flushSync(() => slowRoot.render(<PdfPreview url="/slow.pdf" name="slow.pdf" refreshKey={0} />));
-  await until(() => alertText().includes("did not finish in time"), "the late drawing");
+  flushSync(() => slowRoot.render(<PdfPreview url="/slow.pdf" name="slow.pdf" refreshKey={0} onFailed={(message) => slowFailures.push(message)} />));
+  const docAlert = () => document.querySelector("[role=alert]")?.textContent ?? "";
+  await until(() => docAlert().includes("stopped drawing") && teardown(documents.at(-1)).includes("terminate"), "the stalled drawing");
   const slow = documents.at(-1);
-  result.slow = { alert: alertText(), page1: snapshot(1), text: pageText() };
+  result.slow = { alert: docAlert(), page1: snapshot(1), failures: [...slowFailures], ended: teardown(slow) };
+  host.style.width = "450px";
+  await wait(400);
+  result.slow.resized = { alert: docAlert(), renders: pages[1].renders };
   control.holdDrawing = false;
-  retry();
-  await until(() => documents.at(-1) !== slow && pages[1]?.settledRenders === 1 && !alertText(), "slow.pdf opened again");
-  result.slow.reopened = { slowEnded: teardown(slow), focusKept: focusKept() };
+  press(document.querySelector("[role=alert] button"));
+  await until(() => documents.at(-1) !== slow && pages[1]?.settledRenders === 1 && !docAlert(), "slow.pdf opened again");
+  result.slow.reopened = { focusKept: focusKept() };
   slowRoot.unmount();
+
+  // A drawing that keeps making progress for longer than the deadline is not stopped.
+  control.progressDrawing = 6;
+  const progressRoot = createRoot(host);
+  flushSync(() => progressRoot.render(<PdfPreview url="/progress.pdf" name="progress.pdf" refreshKey={0} />));
+  await until(() => documents.at(-1).url === "/progress.pdf" && pages[1]?.settledRenders === 1, "the long drawing");
+  result.progressing = { page1: snapshot(1), alert: docAlert(), canvasHidden: document.querySelector("canvas")?.hidden };
+  progressRoot.unmount();
+  control.progressDrawing = 0;
+
+  // A page that arrives after its deadline, once another page is on show, is
+  // released on arrival and never shown; so is one arriving after its viewer closed.
+  const lateRoot = createRoot(host);
+  flushSync(() => lateRoot.render(<PdfPreview url="/late.pdf" name="late.pdf" refreshKey={0} />));
+  await until(() => documents.at(-1).url === "/late.pdf" && pages[1]?.settledRenders === 1, "late.pdf page 1");
+  control.holdPage = 2;
+  next();
+  await until(() => alertText().includes("did not arrive in time"), "page 2 late");
+  previous();
+  await until(() => status() === "Page 1 of 5" && !alertText() && pages[1].settledRenders === 2, "page 1 again");
+  control.releasePage();
+  await wait(100);
+  result.late = { page2: snapshot(2), status: status(), canvasHidden: document.querySelector("canvas").hidden };
+  lateRoot.unmount();
+  control.holdPage = 1;
+  const closedLateRoot = createRoot(host);
+  flushSync(() => closedLateRoot.render(<PdfPreview url="/late-closed.pdf" name="late-closed.pdf" refreshKey={0} />));
+  await until(() => alertText().includes("did not arrive in time"), "late-closed.pdf page 1 late");
+  const lateClosed = documents.at(-1);
+  closedLateRoot.unmount();
+  control.releasePage();
+  await wait(100);
+  result.late.closed = { page1: snapshot(1), ended: teardown(lateClosed) };
   PDF_DEADLINES.stallMs = 30_000;
 
   // A worker that fails after its document opened fails the document: the

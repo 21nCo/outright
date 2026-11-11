@@ -18,9 +18,9 @@
 // gave a module without the names asked for (the error named one of its
 // imports, not the module), or the first import gave such a module (the
 // browser keeps it). A network that is still down is not one: the next
-// attempt retries. An import that has not settled within timeoutMs fails
-// like one whose error names no address, so a stalled chunk cannot keep the
-// viewer loading or trap a Retry behind it.
+// attempt retries. An import that has not settled within timeoutMs offers
+// the reload at once, and a retry: the browser keeps waiting on the stalled
+// request, so only a reload is sure to ask again.
 //
 // An error that names no address cannot be probed, so a chunk that is gone
 // would fail every retry. After failing twice in a row that way, the error
@@ -65,7 +65,7 @@ export function retryingImport(load, { exports = [], importUrl = (href) => impor
       attempt = importUrl(retried.href);
     } else attempt = load();
     let timer;
-    const late = new Promise((resolve, reject) => { timer = setTimeout(() => reject(new Error("The PDF viewer did not load in time")), timeoutMs); });
+    const late = new Promise((resolve, reject) => { timer = setTimeout(() => reject(Object.assign(new Error("The PDF viewer did not load in time"), { reloadRequired: true, retryable: true })), timeoutMs); });
     loaded = Promise.race([attempt, late]).finally(() => clearTimeout(timer)).then((module) => {
       const missing = exports.filter((name) => module?.[name] === undefined);
       if (missing.length) throw Object.assign(new Error(`The loaded module has no ${missing.join(", ")}`), { reloadRequired: true });

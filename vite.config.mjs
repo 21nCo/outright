@@ -18,6 +18,7 @@ export default defineConfig({
       output: { manualChunks },
     },
   },
+  worker: { format: "es" },
   optimizeDeps: {
     include: ["react", "react-dom/client"],
   },

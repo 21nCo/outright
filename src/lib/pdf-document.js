@@ -1,8 +1,10 @@
 // The viewer downloads each PDF itself, so closing it stops the download at
-// once. A download, document or page with no progress for stallMs fails.
+// once. A download or drawing fails after stallMs without progress; opening
+// a document, fetching a page or reading its text, after stallMs in all.
 export const PDF_DEADLINES = { stallMs: 30_000 };
-// Nothing in a document runs; no image over maxImageSize pixels is decoded.
-export const PDF_DOCUMENT_OPTIONS = Object.freeze({ isEvalSupported: false, enableXfa: false, maxImageSize: 2 ** 24, canvasMaxAreaInBytes: 2 ** 24 });
+// Nothing in a document runs; no image over maxImageSize pixels is decoded,
+// and pdf.js warns of one it leaves out (pdf-worker-entry.js).
+export const PDF_DOCUMENT_OPTIONS = Object.freeze({ isEvalSupported: false, enableXfa: false, maxImageSize: 2 ** 24, canvasMaxAreaInBytes: 2 ** 24, verbosity: 1 });
 
 export function withDeadline(promise, ms, message) {
   let timer;

@@ -9,12 +9,15 @@
 // /doc.pdf is opened and its first text read fails. Each /broken*.pdf cannot
 // be opened the first time. While control.holdDrawing is set, a drawing runs
 // until it is cancelled; while control.holdText is set, text never arrives.
+// control.progressDrawing steps of 100 ms each report progress (onContinue)
+// before a drawing finishes. The next page asked for whose number is
+// control.holdPage arrives only when control.releasePage() is called.
 // `events` logs, in order, every cancel, page release and document, port
 // and worker ending, each tagged with its document's number.
 export const documents = [];
 export const ports = [];
 export const events = [];
-export const control = { holdDrawing: false, holdText: false };
+export const control = { holdDrawing: false, holdText: false, progressDrawing: 0, holdPage: null, releasePage: null };
 const WORDS = ["", "one", "two", "three", "four", "five"];
 
 class FakePage {
@@ -29,13 +32,16 @@ class FakePage {
   render() {
     this.renders += 1;
     const attempt = this.renders;
-    let cancel;
     let settled = false;
-    const promise = new Promise((resolve, reject) => {
+    let steps = control.progressDrawing;
+    let timer = null;
+    const task = { onContinue: null };
+    task.promise = new Promise((resolve, reject) => {
       const finish = () => { settled = true; this.settledRenders += 1; if (this.number === 2 && attempt === 1) reject(new Error("broken drawing")); else resolve(); };
-      const timer = control.holdDrawing ? null : setTimeout(finish, 30);
+      const step = () => { if (steps-- <= 0) finish(); else { task.onContinue?.(() => {}); timer = setTimeout(step, 100); } };
+      if (!control.holdDrawing) timer = setTimeout(step, 30);
       // Like pdf.js, cancelling a finished drawing does nothing.
-      cancel = () => {
+      task.cancel = () => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
@@ -45,8 +51,8 @@ class FakePage {
         reject(Object.assign(new Error("Rendering cancelled"), { name: "RenderingCancelledException" }));
       };
     });
-    promise.catch(() => {});
-    return { promise, cancel };
+    task.promise.catch(() => {});
+    return task;
   }
 
   streamTextContent() {
@@ -98,7 +104,8 @@ export function getDocument({ data, url: address, worker }) {
       if (!promises.has(number)) {
         record.pages[number] ??= new FakePage(record, number);
         if (number === 4) releasePage3();
-        const ready = number === 3 ? page3Released : Promise.resolve();
+        let ready = number === 3 ? page3Released : Promise.resolve();
+        if (control.holdPage === number) { control.holdPage = null; ready = new Promise((resolve) => { control.releasePage = resolve; }); }
         promises.set(number, ready.then(() => new Promise((resolve, reject) => setTimeout(() => {
           if (number === 5 && opened === 1 && url === "/doc.pdf") reject(new Error("bad page object")); else resolve(record.pages[number]);
         }, 5))));

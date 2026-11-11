@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import { pdfFile } from "../tests/fixtures/pdf-preview/make-pdf.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const fixture = path.join(root, "tests", "fixtures", "pdf-preview");
@@ -40,7 +41,7 @@ async function bundle() {
     plugins: [{
       name: "fake-pdfjs",
       setup(builder) {
-        builder.onResolve({ filter: /^pdfjs-dist\/build\/pdf\.worker\.min\.mjs\?url$/ }, () => ({ path: "worker-url", namespace: "fake" }));
+        builder.onResolve({ filter: /pdf-worker-entry\.js\?worker&url$/ }, () => ({ path: "worker-url", namespace: "fake" }));
         builder.onLoad({ filter: /^worker-url$/, namespace: "fake" }, () => ({ contents: `export default ${JSON.stringify(WORKER_PATH)};`, loader: "js" }));
         builder.onResolve({ filter: /^pdfjs-dist$/ }, () => ({ path: path.join(fixture, "fake-pdfjs.js") }));
       },
@@ -53,14 +54,16 @@ async function bundle() {
 // the fixture posts its outcome to /done, so Chrome's --dump-dom run ends by
 // itself when the fixture is finished, in real time (a virtual-time run
 // delivers no ResizeObserver callbacks until its budget is spent). A POST to
-// /retire-worker removes the worker script, as a deployment would.
-function fixtureServer(html, holdMs) {
+// /retire-worker removes the worker script, as a deployment would. `serve`
+// answers any other address it knows, first.
+function fixtureServer(html, holdMs, serve = () => false) {
   let release;
   let retired = false;
   const heldPdfs = {};
   const done = new Promise((resolve) => { release = resolve; });
   const held = setTimeout(() => release(null), holdMs);
   const server = createServer((request, response) => {
+    if (serve(request, response)) return;
     if (request.url === "/") { response.setHeader("Content-Type", "text/html; charset=utf-8"); response.end(html); return; }
     if (request.url === WORKER_PATH && !retired) { response.setHeader("Content-Type", "text/javascript"); response.end("postMessage({ sourceName: 'worker', action: 'ready' }); onmessage = ({ data }) => { if (data === 'crash') throw new Error('worker crashed'); };"); return; }
     // A PDF's bytes are its own address (see fake-pdfjs.js); /held.pdf sends a part and then nothing.
@@ -111,7 +114,7 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
   assert.ok(posted, `the fixture did not finish: exit ${run.code ?? run.signal}; ${run.stderr}`);
   const outcome = JSON.parse(posted);
   assert.ok(outcome.ok, outcome.error);
-  const { opened, dragged, failedDraw, retried, skipped, unreadable, reopened, refreshed, closed, broken, brokenRefreshed, brokenRetried, order, slow, crashed, crashRetried, held, retired } = outcome.result;
+  const { opened, dragged, failedDraw, retried, skipped, unreadable, reopened, refreshed, closed, broken, brokenRefreshed, brokenRetried, order, slow, progressing, late, crashed, crashRetried, held, retired } = outcome.result;
 
   // Opening draws page 1 once and reads its text once.
   assert.equal(opened.renders, 1);
@@ -191,12 +194,24 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
     assert.deepEqual(ended.slice(0, 2).sort(), ["render-cancel", "text-cancel"], JSON.stringify(ended));
     assert.deepEqual(ended.slice(2), ["cleanup", "destroy", "port-destroy", "terminate"], JSON.stringify(ended));
   }
-  // A late drawing is cancelled at its deadline, keeps its text, and its Retry opens the document again.
-  assert.match(slow.alert, /could not be drawn: it did not finish in time/);
+  // A drawing with no progress in time is cancelled and fails its document, which then ends in order.
+  assert.match(slow.alert, /could not be read: A page stopped drawing/);
   assert.equal(slow.page1.cancelledRenders, 1);
-  assert.equal(slow.text, "Page one text");
-  assert.deepEqual(slow.reopened.slowEnded, ["render-cancel", "cleanup", "destroy", "port-destroy", "terminate"]);
+  assert.deepEqual(slow.failures, ["A page stopped drawing"]);
+  assert.deepEqual(slow.ended, ["render-cancel", "cleanup", "destroy", "port-destroy", "terminate"]);
+  // A resize neither clears that failure nor draws on the ended document; Retry opens it again.
+  assert.equal(slow.resized.alert, slow.alert);
+  assert.equal(slow.resized.renders, slow.page1.renders);
   assert.ok(slow.reopened.focusKept);
+  // A drawing that keeps making progress past the deadline finishes.
+  assert.deepEqual([progressing.page1.renders, progressing.page1.cancelledRenders, progressing.alert, progressing.canvasHidden], [1, 0, "", false]);
+  // A page that arrives after its deadline is released once on arrival and never drawn or read, whether another page is on show or the viewer has closed.
+  assert.deepEqual(late.page2.cleanups, [0]);
+  assert.equal(late.page2.renders + late.page2.textReads, 0);
+  assert.deepEqual([late.status, late.canvasHidden], ["Page 1 of 5", false]);
+  assert.deepEqual(late.closed.page1.cleanups, [0]);
+  assert.equal(late.closed.page1.renders + late.closed.page1.textReads, 0);
+  assert.deepEqual(late.closed.ended, ["destroy", "port-destroy", "terminate", "cleanup"]);
   // A worker that fails after its document opened fails the document in the same order, and Retry opens it again.
   assert.match(crashed.alert, /The PDF reader stopped: .*worker crashed/);
   assert.equal(crashed.failures.length, 1);
@@ -209,4 +224,46 @@ test("the PDF viewer reads each page once, stops a page's work before releasing 
   assert.match(retired.alert, /needs a page reload/);
   assert.equal(retired.button, "Reload page");
   assert.deepEqual(retired.failures, []);
+});
+
+test("with real pdf.js, a page whose image is too large to decode says so and keeps its text, and a document whose worker never answers Terminate has its fonts, and only its own, removed when it closes", { timeout: 120_000 }, async (t) => {
+  const executable = chromeExecutable();
+  assert.ok(executable, "Chrome or Chromium is required to run the PDF viewer fixture");
+  const directory = mkdtempSync(path.join(os.tmpdir(), "outright-pdf-real-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
+  const bundled = async (entry, options) => (await build({ entryPoints: [entry], bundle: true, write: false, logLevel: "silent", alias: { "@": path.join(root, "src") }, ...options })).outputFiles[0].text;
+  const script = (await bundled(path.join(fixture, "real-fixture.jsx"), {
+    format: "iife", jsx: "automatic", define: { "import.meta.env.BASE_URL": JSON.stringify("/"), "process.env.NODE_ENV": JSON.stringify("development") },
+    plugins: [{ name: "worker-url", setup(builder) {
+      builder.onResolve({ filter: /pdf-worker-entry\.js\?worker&url$/ }, () => ({ path: "worker-url", namespace: "real" }));
+      builder.onLoad({ filter: /^worker-url$/, namespace: "real" }, () => ({ contents: "export default '/worker.js';", loader: "js" }));
+    } }],
+  })).replaceAll("</script", "<\\/script");
+  // The viewer's own worker entry, made deaf to Terminate, as a hung worker would be.
+  const worker = await bundled(path.join(root, "src", "lib", "pdf-worker-entry.js"), { format: "esm", banner: { js: "addEventListener('message', (event) => { if (event.data?.action === 'Terminate') event.stopImmediatePropagation(); });" } });
+  const files = { "/worker.js": ["text/javascript", worker], "/text.pdf": ["application/pdf", pdfFile({ text: "Plain page" })], "/image.pdf": ["application/pdf", pdfFile({ text: "Large image", image: { width: 6000, height: 3000 } })] };
+  const serve = (request, response) => {
+    const asset = /^\/pdfjs\/(cmaps|standard_fonts|wasm|iccs)\/([\w.-]+)$/.exec(request.url);
+    const file = files[request.url] ?? (asset && existsSync(path.join(root, "node_modules", "pdfjs-dist", asset[1], asset[2])) && ["application/octet-stream", readFileSync(path.join(root, "node_modules", "pdfjs-dist", asset[1], asset[2]))]);
+    if (!file) return false;
+    response.setHeader("Content-Type", file[0]);
+    response.end(file[1]);
+    return true;
+  };
+  const { server, done } = fixtureServer(`<!doctype html><meta charset="utf-8"><body><script>${script}</script><img src="/hold" alt=""></body>`, 90_000, serve);
+  t.after(() => new Promise((resolve) => { server.closeAllConnections(); server.close(resolve); }));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const run = await runChrome(executable, path.join(directory, "profile"), `http://127.0.0.1:${server.address().port}/`, 100_000);
+  const posted = await Promise.race([done, null]);
+  assert.ok(posted, `the fixture did not finish: exit ${run.code ?? run.signal}; ${run.stderr}`);
+  const outcome = JSON.parse(posted);
+  assert.ok(outcome.ok, outcome.error);
+  const { plain, large, plainFonts, largeFonts, afterPlainClosed, afterBothClosed } = outcome.result;
+  // A page drawn whole has no notice; one whose image pdf.js left out says so, and its text is still read.
+  assert.deepEqual(plain, { text: "Plain page", notice: "", canvas: true });
+  assert.deepEqual(large, { text: "Large image", notice: "Part of this page is too large to show. Its text is below.", canvas: true });
+  // Each document added fonts of its own; closing one removes its fonts and leaves the other's.
+  assert.ok(plainFonts.length > 0 && largeFonts.length > 0, JSON.stringify({ plainFonts, largeFonts }));
+  assert.deepEqual(afterPlainClosed.sort(), [...largeFonts].sort());
+  assert.deepEqual(afterBothClosed, []);
 });

@@ -6,7 +6,7 @@ import { pdfCanvasSize, settledWidth } from "@/lib/pdf-canvas";
 import { fetchPdf, PDF_DEADLINES, PDF_DOCUMENT_OPTIONS, withDeadline } from "@/lib/pdf-document";
 import { readPageText } from "@/lib/pdf-text";
 import { pdfWorkerStarter } from "@/lib/pdf-worker";
-import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import workerUrl from "@/lib/pdf-worker-entry.js?worker&url";
 
 // pdf.js draws one page at a time to a canvas. Nothing in the document runs:
 // eval and XFA forms are off, and no annotation or scripting layer exists,
@@ -27,10 +27,10 @@ const startWorker = pdfWorkerStarter();
 // preview offers Retry and a refresh opens it afresh, unless only a page
 // reload can load the viewer again (see module-retry.js): then this offers
 // the reload, which the user starts. A page that fails to draw offers its
-// own Retry, and is drawn again on the next refresh; text that fails to read
-// is read again on the next refresh. A page that cannot be read at all
-// (pdf.js keeps that failure for the open document) is retried by opening
-// the document again.
+// own Retry (a stalled one fails the document), and is drawn again on the
+// next refresh; text that fails to read is read again on the next refresh.
+// A page that cannot be read at all (pdf.js keeps that failure for the open
+// document) is retried by opening the document again.
 export default function PdfPreview({ url, name, refreshKey, onFailed }) {
   const [pdfState, setPdfState] = useState({ status: "loading" });
   const [reopen, setReopen] = useState(0);
@@ -47,6 +47,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
   const [pageSession, setPageSession] = useState(null);
   const [width, setWidth] = useState(0);
   const [textState, setPageText] = useState({ status: "loading" });
+  const [refusedImage, setRefusedImage] = useState(null);
   const frameRef = useRef(null);
   const canvasRef = useRef(null);
   // A new address opens anew, and each opening and page visit has its own
@@ -63,7 +64,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
   const reopenDocument = () => { rootRef.current?.focus(); setReopen((value) => value + 1); };
 
   useEffect(() => {
-    const doc = { release: null }; // The page on show puts its release here.
+    const doc = { release: null, worker: null, fail: null }; // Used by the page on show.
     const key = reopen;
     const download = new AbortController();
     let cancelled = false;
@@ -75,15 +76,19 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     // page on show is released, the download stops, then pdf.js ends the
     // document and the viewer its worker (anyway after 3 s without answer);
     // one still starting is stopped without counting as a failed start.
+    // Without that answer, the document's fonts, images and filters, which
+    // pdf.js frees only once its worker answers, are freed here.
     const end = () => {
       if (ended) return;
       ended = true;
       doc.release?.();
       download.abort();
       started?.cancel();
+      const transport = task?._transport;
       let timer;
-      const destroyed = task ? Promise.race([task.destroy().catch(() => {}), new Promise((resolve) => { timer = setTimeout(resolve, 3000); })]) : Promise.resolve();
-      void destroyed.then(() => { clearTimeout(timer); port?.destroy(); started?.worker.terminate(); });
+      const answered = task ? Promise.race([task.destroy().then(() => true, () => false), new Promise((resolve) => { timer = setTimeout(resolve, 3000, false); })]) : Promise.resolve(true);
+      void answered.then((clean) => { clearTimeout(timer); port?.destroy(); started?.worker.terminate();
+        if (!clean) { transport?.fontLoader.clear(); transport?.commonObjs.clear(); transport?.filterFactory.destroy(); } });
     };
     const fail = (error) => {
       if (cancelled || ended) return;
@@ -93,6 +98,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
       setPdfState({ key, status: "error", message });
       onFailedRef.current?.(message);
     };
+    doc.fail = fail;
     (async () => {
       const [pdfjs, data] = await Promise.all([loadPdfjs(), fetchPdf(url, { signal: download.signal })]);
       // Unmounted or reopened while the viewer loaded: start nothing.
@@ -103,6 +109,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
       // A worker that fails once started fails its document, open or not.
       const stopped = (event) => fail(new Error(`The PDF reader stopped${event?.message ? `: ${event.message}` : ""}`));
       for (const type of ["error", "messageerror"]) started.worker.addEventListener(type, stopped);
+      doc.worker = started.worker;
       port = new pdfjs.PDFWorker({ port: started.worker });
       task = pdfjs.getDocument({ data, worker: port, ...PDF_DOCUMENT_OPTIONS,
         cMapUrl: assetUrl("cmaps"), cMapPacked: true, standardFontDataUrl: assetUrl("standard_fonts"), wasmUrl: assetUrl("wasm"), iccUrl: assetUrl("iccs") });
@@ -147,11 +154,16 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     let proxy;
     const release = () => { if (!session.signal.aborted) { session.abort(); proxy?.cleanup(); } };
     doc.release = release;
-    withDeadline(pdf.getPage(page), PDF_DEADLINES.stallMs, "it did not arrive in time").then((value) => {
+    // The page itself is awaited, not its deadline, so one that arrives after
+    // its session ended (left, closed or too late) is released on arrival.
+    const arriving = pdf.getPage(page);
+    arriving.then((value) => {
       proxy = value;
-      if (session.signal.aborted) value.cleanup(); else setPageSession({ proxy: value, signal: session.signal, key: pageKey });
-    }, (error) => {
+      if (session.signal.aborted) value.cleanup(); else setPageSession({ proxy: value, signal: session.signal, key: pageKey, doc });
+    }, () => {});
+    withDeadline(arriving, PDF_DEADLINES.stallMs, "it did not arrive in time").catch((error) => {
       if (session.signal.aborted) return;
+      session.abort();
       setPageError({ key: pageKey, message: `This page could not be read: ${error?.message || "unknown error"}`, retry: "reopen" });
       setPageText({ key: pageKey, status: "failed" });
     });
@@ -162,7 +174,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
   // drawing is not an error: a newer one replaces it.
   useEffect(() => {
     if (!pageSession || pageSession.signal.aborted || !width || !canvasRef.current) return undefined;
-    const { proxy, signal, key } = pageSession;
+    const { proxy, signal, key, doc: owner } = pageSession;
     let cancelled = false;
     setPageError(null);
     // The canvas is sized within a pixel budget before it is allocated.
@@ -181,14 +193,20 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     const render = proxy.render({ canvas, canvasContext: canvas.getContext("2d"), viewport: proxy.getViewport({ scale: size.scale }) });
     const stop = () => { if (!cancelled) { cancelled = true; render.cancel(); } };
     signal.addEventListener("abort", stop, { once: true });
-    // A drawing that does not finish in time is stopped; its Retry opens the
-    // document again, as the worker may no longer answer.
-    withDeadline(render.promise, PDF_DEADLINES.stallMs, "it did not finish in time").catch((error) => {
-      if (cancelled || error?.name === "RenderingCancelledException") return;
-      render.cancel();
-      setPageError({ key, message: `This page could not be drawn: ${error?.message || "unknown error"}`, retry: error?.name === "TimeoutError" ? "reopen" : "draw" });
+    // The page says so when pdf.js leaves out a too large image (pdf-worker-entry.js).
+    const refused = ({ data }) => { if (data?.action === "imageRefused") setRefusedImage(key); };
+    owner.worker.addEventListener("message", refused);
+    // A drawing with no progress for stallMs fails its document, as the worker
+    // may no longer answer: only opening it again can retry it. A hidden page
+    // pauses drawing (pdf.js draws in animation frames), so it never stalls.
+    let timer;
+    const progress = () => { clearTimeout(timer); timer = setTimeout(() => { if (document.hidden) { progress(); return; } stop(); owner.fail(new Error("A page stopped drawing")); }, PDF_DEADLINES.stallMs); };
+    render.onContinue = (next) => { progress(); next(); };
+    progress();
+    render.promise.finally(() => clearTimeout(timer)).catch((error) => {
+      if (!cancelled && error?.name !== "RenderingCancelledException") setPageError({ key, message: `This page could not be drawn: ${error?.message || "unknown error"}`, retry: "draw" });
     });
-    return () => { signal.removeEventListener("abort", stop); stop(); };
+    return () => { clearTimeout(timer); owner.worker.removeEventListener("message", refused); signal.removeEventListener("abort", stop); stop(); };
   }, [pageSession, width, drawAttempt]);
 
   // The page's text is read once per page, apart from drawing, so a resize
@@ -224,6 +242,7 @@ export default function PdfPreview({ url, name, refreshKey, onFailed }) {
     <div className="pdf-frame" ref={frameRef}>
       <canvas ref={canvasRef} role="img" hidden={Boolean(pageError) || !pageShown} aria-label={`Page ${page} of ${shown.pages} of ${name}`} />
       {!pageError && !pageShown && <div className="preview-state" role="status"><SpinnerGap className="spin" />Reading page {page}…</div>}
+      {!pageError && pageShown && refusedImage === pageKey && <p className="preview-state" role="status">Part of this page is too large to show. Its text is below.</p>}
       {pageError && <div className="preview-state" role="alert"><p>{pageError.message}</p>{pageError.retry && <Button variant="outline" size="xs" onClick={retryPage}><ArrowsClockwise />Retry</Button>}</div>}
     </div>
     <details className="pdf-text"><summary>Page text</summary><p>{{ loading: "Reading page text…", failed: "This page's text could not be read." }[pageText.status] ?? (pageText.text || "No text found on this page.")}</p></details>
