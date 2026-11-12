@@ -2,7 +2,7 @@ import { Component, lazy, Suspense, useEffect, useRef, useState } from "react";
 import { ArrowSquareOut, ArrowsClockwise, FileX, LinkBreak, Prohibit, SpinnerGap, WarningCircle } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { MarkdownView } from "@/components/MarkdownView";
-import { failedPreview, formatBytes, loadingPreview, openedPath, samePreview, sameTarget, shownPreview, viewerFailure } from "@/lib/file-tree";
+import { failedPreview, formatBytes, loadingPreview, openedPath, rendersAfresh, samePreview, sameTarget, shownPreview, viewerFailure } from "@/lib/file-tree";
 import { retryingImport } from "@/lib/module-retry";
 import { api, query } from "@/lib/runtime-api";
 
@@ -32,9 +32,9 @@ let PdfPreview = pdfViewer();
 // A viewer only a page reload repairs (a chunk gone after an update) offers
 // the reload, as PdfPreview does for its own imports.
 class PreviewBoundary extends Component {
-  state = { error: null, resetKey: this.props.resetKey };
+  state = { error: null, shown: this.props };
   static getDerivedStateFromError(error) { return { error }; }
-  static getDerivedStateFromProps(props, state) { return props.resetKey === state.resetKey ? null : { error: null, resetKey: props.resetKey }; }
+  static getDerivedStateFromProps(props, state) { return rendersAfresh(state.shown, props) ? { error: null, shown: props } : null; }
   render() {
     if (!this.state.error) return this.props.children;
     const { reload, retry } = viewerFailure(this.state.error);
@@ -138,6 +138,6 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
       </div>}
       <Button variant="ghost" size="icon-xs" aria-label={`Open ${name} in ${settings?.editor ?? "editor"}`} onClick={openInEditor}><ArrowSquareOut /></Button>
     </header>
-    <div className="file-preview-body"><PreviewBoundary key={retry} resetKey={refreshKey} name={name} onRetry={reload}>{body}</PreviewBoundary></div>
+    <div className="file-preview-body"><PreviewBoundary key={retry} resetKey={refreshKey} preview={preview} name={name} onRetry={reload}>{body}</PreviewBoundary></div>
   </section>;
 }

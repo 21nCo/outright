@@ -357,9 +357,17 @@ function inline(text, start, end, context, depth) {
     if ((character === "[" || (character === "!" && text[index + 1] === "[")) && depth < MAX_DEPTH) {
       const image = character === "!";
       const labelStart = index + (image ? 2 : 1);
-      const labelEnd = find("](", labelStart);
-      // The label is the text up to the first "]", which must open the destination.
-      if (labelEnd >= 0 && labelEnd < end && find("]", labelStart) === labelEnd) {
+      // An image's label is the text up to its first "]". A link's may hold whole images ("[![CI](b.svg)](run)") and
+      // ends at the first "]" after them; any other "[" leaves it text. Scanning stops there, so it stays linear.
+      let labelEnd = find("]", labelStart);
+      for (let from = labelStart, bracket; !image && labelEnd >= 0 && labelEnd < end && (bracket = find("[", from)) >= 0 && bracket < labelEnd;) {
+        if (text[bracket - 1] === "\\") { from = bracket + 1; continue; } // an escaped "[" is text
+        const inner = bracket > from && text[bracket - 1] === "!" ? destinationAt(labelEnd) : null;
+        if (!inner) { labelEnd = -1; break; }
+        from = labelEnd + 1 + inner.length;
+        labelEnd = find("]", from);
+      }
+      if (labelEnd >= 0 && labelEnd < end) {
         const destination = destinationAt(labelEnd);
         if (destination && labelEnd + 1 + destination.length <= end) {
           const label = { url: destination.url, title: destination.title ?? "" };

@@ -91,6 +91,8 @@ export function visibleRows(folders, expanded) {
 // The row a key moves to from `index`, or -1 when the key is not a move.
 export function treeKeyTarget(rows, index, key) {
   if (!rows.length) return -1;
+  // An index that names no row is no row (-1): every key then moves as from -1.
+  if (!(Number.isInteger(index) && index >= 0 && index < rows.length)) index = -1;
   if (key === "ArrowDown") return Math.min(rows.length - 1, index + 1);
   if (key === "ArrowUp") return Math.max(0, index - 1);
   if (key === "Home") return 0;
@@ -102,11 +104,9 @@ export function treeKeyTarget(rows, index, key) {
   if (key === "ArrowRight") return rows[index]?.open ? Math.min(rows.length - 1, index + 1) : -1;
   if (key.length === 1 && key.trim()) {
     const lower = key.toLowerCase();
-    // An index that names no row searches from the top.
-    const from = Number.isInteger(index) && index >= -1 && index < rows.length ? index : -1;
     for (let step = 1; step <= rows.length; step += 1) {
-      const row = rows[(from + step) % rows.length];
-      if (row.type === "entry" && row.entry.name.toLowerCase().startsWith(lower)) return (from + step) % rows.length;
+      const row = rows[(index + step) % rows.length];
+      if (row.type === "entry" && row.entry.name.toLowerCase().startsWith(lower)) return (index + step) % rows.length;
     }
   }
   return -1;
@@ -160,6 +160,9 @@ export const loadingPreview = (prior, target) => ({ status: "loading", target, p
 export const failedPreview = (prior, target, error) => ({ status: "error", target, path: keptPath(prior, target), code: error?.payload?.code ?? "", message: error?.message });
 export const shownPreview = (state, target, mediaFailed) => (state.status === "ready" && sameTarget(state.target, target) && !mediaFailed ? state : null);
 export const openedPath = (state, target) => (sameTarget(state.target, target) && state.path) || target.file;
+
+// A refresh, or an answer that changes the preview (samePreview keeps an unchanged one), clears a renderer error.
+export const rendersAfresh = (prior, next) => prior.resetKey !== next.resetKey || prior.preview !== next.preview;
 
 // What a viewer that did not load offers (module-retry.js): one only a page
 // reload repairs offers the reload, and an in-place retry only when retryable;

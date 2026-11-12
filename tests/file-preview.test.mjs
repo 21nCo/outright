@@ -4,7 +4,7 @@ import { MARKDOWN_NODE_BUDGET, linkTarget, parseInline, parseMarkdown, parseMark
 import { failedModuleUrl, retryingImport } from "../src/lib/module-retry.js";
 import { PDF_CANVAS_LIMITS, pdfCanvasSize } from "../src/lib/pdf-canvas.js";
 import { pdfWorkerStarter } from "../src/lib/pdf-worker.js";
-import { HIDDEN_FILES_KEY, MAX_REVEAL_ENTRIES, ancestorsOf, entryRowId, failedPreview, isExpandable, loadingPreview, needsPage, normalizeTypedPath, openedPath, readHiddenPreference, revealable, revealPath, revealReads, samePreview, saveHiddenPreference, shownPreview, treeKeyTarget, viewerFailure, visibleRows, worktreeOwnsChat } from "../src/lib/file-tree.js";
+import { HIDDEN_FILES_KEY, MAX_REVEAL_ENTRIES, ancestorsOf, entryRowId, failedPreview, isExpandable, loadingPreview, needsPage, normalizeTypedPath, openedPath, readHiddenPreference, rendersAfresh, revealable, revealPath, revealReads, samePreview, saveHiddenPreference, shownPreview, treeKeyTarget, viewerFailure, visibleRows, worktreeOwnsChat } from "../src/lib/file-tree.js";
 
 const types = (nodes) => nodes.map((node) => node.type);
 function collect(blocks, found = []) {
@@ -60,6 +60,9 @@ test("adversarial Markdown near the preview size limit parses with linear work a
     "brackets before a rejected link": `${fill("[", "]x](t)")}`,
     "brackets before an unclosed destination": `${fill("[", `](${"a".repeat(2000)} x`)}`,
     "rejected closers": fill("[a]x](t) "),
+    // A link label may hold images, so each "[![" scans past the image it opens and no further.
+    "image openers in link labels": fill("[!["), "badges without a link target": fill("[![a](b)"), "badges before a rejected link": fill("[![a](b) x", "](t"),
+    "escaped brackets in labels": fill("[\\[ ![a](b) ", "](t)"),
     // Link destinations are scanned once per label: a long space or tab run
     // after "(" was quadratic in the old pattern's overlapping quantifiers.
     "empty labels before spaces": fill(`[](${" ".repeat(2000)}`),
@@ -573,6 +576,58 @@ test("type-ahead from an index outside the rows searches from the top", () => {
   assert.equal(treeKeyTarget(rows, -3, "a"), 0);
   assert.equal(treeKeyTarget(rows, -1, "a"), 0);
   assert.equal(treeKeyTarget(rows, 0, "a"), 0);
+});
+
+test("every key from any index moves to a row or nowhere, and an index outside the rows is no row", () => {
+  const rows = [
+    { id: "entry:d", type: "entry", entry: { path: "d", name: "d" }, directory: "", open: true },
+    { id: "entry:d/b", type: "entry", entry: { path: "d/b", name: "b" }, directory: "d" },
+    { id: "entry:c", type: "entry", entry: { path: "c", name: "c" }, directory: "" },
+  ];
+  const last = rows.length - 1;
+  for (const key of ["ArrowDown", "ArrowUp", "Home", "End", "ArrowLeft", "ArrowRight", "b"]) {
+    for (const index of [-3, -1, 0, last, rows.length, rows.length + 2, Number.NaN, 1.5]) {
+      const target = treeKeyTarget(rows, index, key);
+      assert.ok(target === -1 || (Number.isInteger(target) && target >= 0 && target <= last), `${key} from ${index} gave ${target}`);
+      // An index that names no row moves as no row (-1) does.
+      if (!(Number.isInteger(index) && index >= 0 && index <= last)) assert.equal(target, treeKeyTarget(rows, -1, key), `${key} from ${index}`);
+    }
+  }
+  assert.deepEqual(["ArrowDown", "ArrowUp", "Home", "End", "ArrowLeft", "ArrowRight", "b"].map((key) => treeKeyTarget(rows, -1, key)), [0, 0, 0, last, -1, -1, 1]);
+  assert.deepEqual([treeKeyTarget(rows, last, "ArrowDown"), treeKeyTarget(rows, 0, "ArrowUp"), treeKeyTarget(rows, 1, "ArrowLeft"), treeKeyTarget(rows, 0, "ArrowRight")], [last, 0, 0, 1]);
+});
+
+test("a viewer error is cleared when the preview it rendered is replaced, not when an unchanged one is kept", () => {
+  const shown = { previewType: "pdf", version: "v1", size: 10 };
+  const props = { resetKey: 1, preview: shown };
+  // A background answer samePreview accepts keeps the shown preview object.
+  assert.equal(samePreview(shown, { ...shown }), true);
+  assert.equal(rendersAfresh(props, { resetKey: 1, preview: shown }), false);
+  // A changed answer (unsupported, oversized or a new version) replaces it, as does a refresh.
+  for (const next of [{ previewType: "unsupported", reason: "x" }, { previewType: "oversized", size: 10, limit: 5 }, { ...shown, version: "v2" }]) {
+    assert.equal(samePreview(shown, next), false);
+    assert.equal(rendersAfresh(props, { resetKey: 1, preview: next }), true);
+  }
+  assert.equal(rendersAfresh(props, { resetKey: 2, preview: shown }), true);
+});
+
+test("a link whose label holds an image links to its own target, and unresolved brackets stay text", () => {
+  const show = (text) => parseInline(text).map((node) => node.type === "link" ? `<a ${node.url}>${show.children(node.children)}</a>` : node.type === "image" ? `<img ${node.url} ${node.alt}>` : node.value).join("");
+  show.children = (nodes) => nodes.map((node) => node.type === "image" ? `<img ${node.url} ${node.alt}>` : node.value).join("");
+  assert.equal(show("[![CI](badge.svg)](https://ci.example/run)"), "<a https://ci.example/run><img badge.svg CI></a>");
+  assert.equal(show("[Build ![CI](badge.svg) status](run.md) after"), "<a run.md>Build <img badge.svg CI> status</a> after");
+  assert.equal(show("[![a](x) ![b](y)](t)"), "<a t><img x a> <img y b></a>");
+  assert.equal(show("[a [b] c](x)"), "[a [b] c](x)");
+  // An unclosed label is text before the image, with no link to the image.
+  assert.equal(show("[![a](b)"), "[<img b a>");
+  assert.equal(show("[![a](b)](c"), "[<img b a>](c");
+  assert.equal(show("[[x](y)"), "[<a y>x</a>");
+  // An escaped "[" in a label is text, as before.
+  assert.equal(show("[a \\[ ![b](c) d](x)"), "<a x>a [ <img c b> d</a>");
+  const links = (text) => parseInline(text).filter((node) => node.type === "link").map((node) => node.url);
+  for (const text of ["[![CI](badge.svg)](https://ci.example/run)", "[![a](b)", "[![a](b)](c", "[x [![a](b)](c)"]) assert.ok(!links(text).includes("badge.svg") && !links(text).includes("b"), text);
+  // The link, its image (a note and Retry once failed) and the paragraph are charged as before.
+  assert.deepEqual([3, 4].map((budget) => parseMarkdownPreview("[![CI](badge.svg)](run)", budget).overBudget), [true, false]);
 });
 
 test("a viewer that did not load offers a page reload when only a reload repairs it, and a retry only when one can help", async () => {
