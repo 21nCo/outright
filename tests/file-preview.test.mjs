@@ -4,7 +4,7 @@ import { MARKDOWN_NODE_BUDGET, linkTarget, parseInline, parseMarkdown, parseMark
 import { failedModuleUrl, retryingImport } from "../src/lib/module-retry.js";
 import { PDF_CANVAS_LIMITS, pdfCanvasSize } from "../src/lib/pdf-canvas.js";
 import { pdfWorkerStarter } from "../src/lib/pdf-worker.js";
-import { HIDDEN_FILES_KEY, MAX_REVEAL_ENTRIES, ancestorsOf, entryRowId, isExpandable, needsPage, normalizeTypedPath, readHiddenPreference, revealPath, revealReads, samePreview, saveHiddenPreference, treeKeyTarget, visibleRows, worktreeOwnsChat } from "../src/lib/file-tree.js";
+import { HIDDEN_FILES_KEY, MAX_REVEAL_ENTRIES, ancestorsOf, entryRowId, isExpandable, needsPage, normalizeTypedPath, readHiddenPreference, revealable, revealPath, revealReads, samePreview, saveHiddenPreference, treeKeyTarget, visibleRows, worktreeOwnsChat } from "../src/lib/file-tree.js";
 
 const types = (nodes) => nodes.map((node) => node.type);
 function collect(blocks, found = []) {
@@ -183,6 +183,8 @@ test("tree rows follow open folders lazily and keyboard moves stay within them",
   // it never opens a different sibling ("a\\b.md" is not "a/b.md").
   assert.deepEqual([" notes.md", "report.md ", "a\\b.md", "docs/ x .md"].map(normalizeTypedPath), [" notes.md", "report.md ", "a\\b.md", "docs/ x .md"]);
   assert.deepEqual(["", "   ", null].map(normalizeTypedPath), ["", "", ""]);
+  // "." segments name nothing, as the runtime drops them, so the tree finds the file the preview opens.
+  assert.deepEqual(["docs/./guide.md", "./docs/././guide.md", "docs/.hidden/./a.md"].map(normalizeTypedPath), ["docs/guide.md", "docs/guide.md", "docs/.hidden/a.md"]);
   // Long runs of "/" are linear: 40,000 inside a path normalize at once.
   const slashes = "/".repeat(40_000);
   const started = performance.now();
@@ -380,13 +382,13 @@ test("Go to file reads every folder on its way until the next step is listed, in
   const folders = new Map([["", listed("", ["src", ...page], { nextCursor: "c1" })], ["src", listed("src", page, { nextCursor: "c2" })]]);
   // src is listed at the root, so only src itself, whose first page lacks
   // the file, is read again, from its shown entries on until the file appears.
-  assert.deepEqual(revealReads(folders, "src/z.txt"), [{ directory: "src", find: "src/z.txt", keep: 200 }]);
+  assert.deepEqual(revealReads(folders, "src/z.txt"), [{ directory: "src", find: "src/z.txt", keep: 200, depth: 1 }]);
   assert.deepEqual(revealReads(folders, "src/f001.txt"), []);
   // A folder not loaded yet, or one that failed, is read with the step to find.
-  assert.deepEqual(revealReads(folders, "lib/deep/a.md"), [{ directory: "", find: "lib", keep: 201 },
-    { directory: "lib", find: "lib/deep", keep: 0 }, { directory: "lib/deep", find: "lib/deep/a.md", keep: 0 }]);
+  assert.deepEqual(revealReads(folders, "lib/deep/a.md"), [{ directory: "", find: "lib", keep: 201, depth: 0 },
+    { directory: "lib", find: "lib/deep", keep: 0, depth: 1 }, { directory: "lib/deep", find: "lib/deep/a.md", keep: 0, depth: 2 }]);
   folders.set("src", { status: "error", error: { message: "gone" } });
-  assert.deepEqual(revealReads(folders, "src/f001.txt"), [{ directory: "src", find: "src/f001.txt", keep: 0 }]);
+  assert.deepEqual(revealReads(folders, "src/f001.txt"), [{ directory: "src", find: "src/f001.txt", keep: 0, depth: 1 }]);
 });
 
 test("Go to file reads one folder at a time and stops at the first folder that does not list its next step", async () => {
@@ -422,6 +424,26 @@ test("Go to file reads one folder at a time and stops at the first folder that d
   const superseding = (step) => { const result = read(step); current = false; return result; };
   assert.equal(await revealPath(new Map(), "a/b/c.md", superseding, () => current), false);
   assert.deepEqual(reads, [""]);
+});
+
+test("a path the runtime refuses is never planned or read, and one within its limit is planned in linear time", async () => {
+  let reads = 0;
+  const read = async () => { reads += 1; return []; };
+  const huge = "a/".repeat(500_000);
+  let started = performance.now();
+  for (const path of [huge, `${"a".repeat(4096)}/x`, "a/\0/b.md"]) {
+    assert.equal(revealable(path), false);
+    assert.equal(await revealPath(new Map(), path, read, () => true), false);
+  }
+  assert.equal(reads, 0);
+  assert.ok(performance.now() - started < 100, `refusing took ${Math.round(performance.now() - started)} ms`);
+  // The deepest path the runtime accepts: 2,047 folders, each prefix sliced once.
+  const deepest = `${"a/".repeat(2047)}b`;
+  started = performance.now();
+  const chain = ancestorsOf(deepest);
+  const steps = revealReads(new Map(), deepest, chain);
+  assert.deepEqual([revealable(deepest), chain.length, chain.at(-1).length, steps.length, steps.at(-1).depth], [true, 2047, 4093, 2048, 2047]);
+  assert.ok(performance.now() - started < 200, `planning took ${Math.round(performance.now() - started)} ms`);
 });
 
 test("a folder read pages on to keep its shown entries or reach the target, and stops at the reveal bound", () => {

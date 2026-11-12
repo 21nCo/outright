@@ -106,22 +106,21 @@ export function formatBytes(bytes) {
   return `${value >= 10 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
 }
 
-// A typed path, as the runtime names it. Only separators are tidied: leading
-// "./" and "/", trailing and repeated slashes. Spaces and backslashes are part
-// of a POSIX name, so they are kept and never select a different file. The
-// runtime still refuses anything outside the root.
+// A typed path, as the runtime names it: empty and "." segments are dropped as it drops them. Spaces
+// and backslashes are part of a POSIX name, so they are kept (on Windows, see FilePreview onResolved).
 export function normalizeTypedPath(value) {
   const typed = String(value ?? "");
   if (!typed.trim()) return "";
-  // Runs of "/" are collapsed before one trailing "/" is dropped, so no
-  // pattern backtracks across a long run (linear in the typed length).
-  const collapsed = typed.replace(/^(?:\.\/|\/)+/, "").replace(/\/{2,}/g, "/");
-  return collapsed.endsWith("/") ? collapsed.slice(0, -1) : collapsed;
+  return typed.split("/").filter((segment) => segment && segment !== ".").join("/");
 }
 
+// The runtime refuses a path over 4096 characters, or with NUL, so none is planned or read.
+export const revealable = (path) => typeof path === "string" && path !== "" && path.length <= 4096 && !path.includes("\0");
+
 export function ancestorsOf(file) {
-  const parts = file.split("/");
-  return parts.slice(0, -1).map((_, index) => parts.slice(0, index + 1).join("/"));
+  const found = [];
+  for (let at = file.indexOf("/"); at > 0; at = file.indexOf("/", at + 1)) found.push(file.slice(0, at));
+  return found;
 }
 
 // Text is compared as text (and size), so a write the file's version cannot see (a
@@ -145,22 +144,22 @@ export function needsPage(entries, { keep = 0, find = "" } = {}) {
 }
 
 // The reads that show `path` in the tree: each folder on its way whose
-// listing does not name the next step yet, read again until it does.
-export function revealReads(folders, path) {
-  const chain = ancestorsOf(path);
-  return ["", ...chain].flatMap((directory, index) => {
-    const find = chain[index] ?? path;
+// listing does not name the next step yet, read again until it does (depth: folders of `chain` it opens).
+export function revealReads(folders, path, chain = ancestorsOf(path)) {
+  return ["", ...chain].flatMap((directory, depth) => {
+    const find = chain[depth] ?? path;
     const folder = folders.get(directory);
     if (folder?.status !== "error" && folder?.entries?.some((entry) => entry.path === find)) return [];
-    return [{ directory, find, keep: folder?.entries?.length ?? 0 }];
+    return [{ directory, find, keep: folder?.entries?.length ?? 0, depth }];
   });
 }
 
 // Makes those reads one at a time, in order, and stops at a folder that does
 // not list its next step (missing, refused or past the bound) or once
-// `active()` is false, so a path deeper than what exists costs one read.
-export async function revealPath(folders, path, read, active) {
-  for (const step of revealReads(folders, path)) {
+// `active()` is false, so a path deeper than what exists costs one read; a refused path costs none.
+export async function revealPath(folders, path, read, active, chain) {
+  if (!revealable(path)) return false;
+  for (const step of revealReads(folders, path, chain ?? ancestorsOf(path))) {
     const entries = await read(step);
     if (!active() || !entries?.some((entry) => entry.path === step.find)) return false;
   }

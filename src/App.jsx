@@ -156,6 +156,7 @@ export function App() {
   // Counts runs that ended in a chat of the shown worktree, archived chats
   // too; Files refreshes on each new count.
   const [filesCompletions, setFilesCompletions] = useState(0);
+  const filesShownRef = useRef(false); // A Files pane not in the layout loads afresh when opened.
   // Setup state and output events, and checkpoint changes, reach an open
   // setup or checkpoints dialog through this.
   const [lifecycleEvents] = useState(() => new EventTarget());
@@ -736,6 +737,7 @@ export function App() {
   const selectedRecoveryRunId = recoveryGate(conversation)?.id ?? null;
 
   const noteRunEnded = useCallback(async (conversationId) => {
+    if (!filesShownRef.current) return;
     const [projectId, worktreeId] = [selectedProjectRef.current, selectedWorktreeRef.current];
     const listChats = (archived) => api(query("/api/conversations", { projectId, worktreeId, archived: archived ? "true" : undefined })).then((result) => result.conversations);
     const owned = await worktreeOwnsChat(conversationId, conversationsRef.current.filter((chat) => chat.worktreeId === worktreeId), listChats);
@@ -972,7 +974,7 @@ export function App() {
       if (quickOpenKey && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "p") {
         event.preventDefault();
         // The open drawer or a dialog owns the keyboard; the workspace is inert.
-        if ((isNarrow && sidebarOpen) || document.querySelector('[role="dialog"][data-open]:not(#project-sidebar)')) return;
+        if (!paneLayoutRef.current || (isNarrow && sidebarOpen) || document.querySelector('[role="dialog"][data-open]:not(#project-sidebar)')) return;
         paneLayoutRef.current?.open("files");
         setQuickOpenRequest((value) => value + 1);
       }
@@ -2086,6 +2088,7 @@ export function App() {
   if (activeRun) composerAction = <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop active agent run"><Stop weight="fill" /></Button>;
 
   const paneViews = layoutViews(paneState.layout.root);
+  filesShownRef.current = paneViews.includes("files");
   // Pane toggles in the toolbar; at 520px or less they move into the Panes
   // menu, so every toolbar action stays within a 320px window.
   const PANE_TOGGLES = [["changes", "Changes", GitDiff, "Changes"], ["terminal", "Terminal", TerminalWindow, "Terminal ⌘⇧T"], ["context", "Project context", Info, "Project context"], ["files", "Files", FolderOpen, "Files ⌘P"]];

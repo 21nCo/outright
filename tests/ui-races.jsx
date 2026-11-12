@@ -9973,14 +9973,17 @@ async function filesFocusRegression() {
   const previews = { "notes.md": { previewType: "markdown", text: markdown }, "docs/guide.md": { previewType: "markdown", text: "# Guide\n" },
     "picture.png": { previewType: "image" }, "flaky.md": { previewType: "markdown", text: "# Flaky\n" } };
   const listings = [];
+  const previewed = [];
   let flaky = 0;
+  let slowListing = null;
   route = async (url) => {
     const parameters = Object.fromEntries(url.searchParams);
     if (url.pathname === "/api/files") {
       listings.push(parameters.dir);
       const page = (entries) => response({ entries, nextCursor: null, total: entries.length, remaining: 0, hiddenCount: 0, truncated: false });
-      if (!parameters.dir) return page([folder("docs"), folder("many"), file("notes.md"), ...filler]);
+      if (!parameters.dir) return page([folder("docs"), folder("many"), folder("slow"), file("notes.md"), ...filler]);
       if (parameters.dir === "docs") return page([file("docs/guide.md")]);
+      if (parameters.dir === "slow") { await new Promise((resolve) => { slowListing = resolve; }); return page([folder("slow/deep")]); }
       if (parameters.dir === "many") {
         const start = parameters.cursor ? Number(parameters.cursor) : 0;
         const end = start + Number(parameters.limit ?? 200);
@@ -9989,7 +9992,9 @@ async function filesFocusRegression() {
       return response({ error: "missing", code: "MISSING" }, 404);
     }
     if (url.pathname === "/api/files/preview") {
-      const path = parameters.file;
+      previewed.push(parameters.file);
+      // As a runtime on Windows does, a backslash separates folders.
+      const path = parameters.file === "docs\\guide.md" ? "docs/guide.md" : parameters.file;
       if (path === "docs") return response({ error: "docs is a folder", code: "IS_DIRECTORY" }, 400);
       if (path === "flaky.md" && (flaky += 1) === 1) return response({ error: "busy" }, 500);
       if (!previews[path]) return response({ error: `${path} no longer exists`, code: "MISSING" }, 404);
@@ -10071,6 +10076,33 @@ async function filesFocusRegression() {
   await until(() => /is not in docs/.test(host.querySelector(".files-pane [role=status]")?.textContent ?? "") || listings.length >= 2, "a deep missing path was not settled");
   await settle();
   assert(listings.length <= 2, `a deep missing path read ${listings.length} folders`);
+
+  // Go to file selects and reveals the file the runtime opens: "." segments
+  // are dropped, and a path the runtime names differently is revealed by that name.
+  const selectedRow = (path) => row(`entry:${path}`)?.getAttribute("aria-selected") === "true";
+  for (const typed of ["docs/./guide.md", "docs\\guide.md"]) {
+    await go("notes.md");
+    await until(() => selectedRow("notes.md"), "notes.md was not selected");
+    await go(typed);
+    await until(() => selectedRow("docs/guide.md") && /Guide/.test(host.querySelector(".file-preview")?.textContent) && shown(row("entry:docs/guide.md")), `${typed} did not select its revealed row`);
+    assert(document.activeElement === jump, `${typed} moved focus out of Go to file`);
+  }
+  // A path longer than the runtime accepts is refused at once, with no read.
+  listings.length = 0;
+  previewed.length = 0;
+  const started = performance.now();
+  await go(`${"a/".repeat(500_000)}x.md`);
+  await until(() => /too long/.test(host.querySelector(".files-pane [role=status]")?.textContent ?? ""), "an over-limit path was not refused");
+  assert(performance.now() - started < 2000 && !listings.length && !previewed.length, `an over-limit path took ${Math.round(performance.now() - started)} ms, read ${JSON.stringify(listings)}, previewed ${previewed.length}`);
+  // A tree activation stops a reveal still descending: no deeper folder is read and focus stays on the activated row.
+  listings.length = 0;
+  await go("slow/deep/x.md");
+  await until(() => slowListing, "the reveal did not read slow");
+  await activate(row("entry:notes.md"));
+  slowListing();
+  await until(() => row("entry:slow/deep"), "slow was not listed");
+  await settle();
+  assert(!listings.includes("slow/deep") && document.activeElement === row("entry:notes.md"), `a tree activation left the reveal running: ${JSON.stringify(listings)}, focus ${document.activeElement?.outerHTML.slice(0, 80)}`);
 }
 
 const MOTION_STEPS = ["diff Find ownership", "diff scrollbar feedback", "diff Find resize", "split pane layout", "pane notices at minimum", "responsive focus"];

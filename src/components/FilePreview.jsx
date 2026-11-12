@@ -44,7 +44,7 @@ class PreviewBoundary extends Component {
 // asked for, so a slow answer for an earlier selection is never shown. A
 // refresh keeps the shown preview until its answer arrives, and keeps it
 // as it is (scroll, PDF page) only when the answer shows the same thing.
-export function FilePreview({ project, worktree, file, refreshKey, settings, onNavigate, onFolder, onRefreshFolder, onError }) {
+export function FilePreview({ project, worktree, file, refreshKey, settings, onNavigate, onResolved, onFolder, onRefreshFolder, onError }) {
   const [state, setState] = useState({ status: "loading", file });
   const [mode, setMode] = useState("rendered");
   const [mediaFailed, setMediaFailed] = useState(false);
@@ -66,6 +66,7 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
       .then((preview) => {
         if (!current) return;
         if (background && samePreview(shown.preview, preview)) return;
+        if (!background && typeof preview.path === "string") onResolved?.(file, preview.path); // The file the runtime opened.
         setMediaFailed(false);
         setState({ status: "ready", file, preview });
       })
