@@ -9995,7 +9995,7 @@ async function filesFocusRegression() {
     if (url.pathname === "/api/files/preview") {
       previewed.push(parameters.file);
       // As a runtime on Windows does, a backslash separates folders.
-      if (holdPreview && parameters.file === "docs\\other.md") await holdPreview;
+      if (holdPreview && parameters.file === holdPreview.file) await holdPreview.promise;
       const path = parameters.file.replaceAll("\\", "/");
       if (path === "docs") return response({ error: "docs is a folder", code: "IS_DIRECTORY" }, 400);
       if (path === "flaky.md" && (flaky += 1) === 1) return response({ error: "busy" }, 500);
@@ -10097,7 +10097,7 @@ async function filesFocusRegression() {
   assert(previewed.includes("docs/other.md"), `a relative link in docs\\guide.md previewed ${JSON.stringify(previewed)}`);
   // A late answer for a path the runtime names differently selects that path but leaves focus on the row the user moved to.
   let release;
-  holdPreview = new Promise((resolve) => { release = resolve; });
+  holdPreview = { file: "docs\\other.md", promise: new Promise((resolve) => { release = resolve; }) };
   await go("docs\\other.md");
   await until(() => previewed.includes("docs\\other.md"), "docs\\other.md was not asked for");
   row("entry:notes.md").focus();
@@ -10116,6 +10116,20 @@ async function filesFocusRegression() {
   await until(refreshFolder, "docs\\gone.md did not offer Refresh folder");
   await activate(refreshFolder());
   await until(() => listings.includes("docs") && document.activeElement === row("entry:docs"), `Refresh folder for docs\\gone.md read ${JSON.stringify(listings)}`);
+  // A late folder answer to an open the user superseded in the tree neither reveals the folder nor takes focus.
+  holdPreview = { file: "docs", promise: new Promise((resolve) => { release = resolve; }) };
+  await go("docs");
+  await until(() => previewed.at(-1) === "docs", "docs was not asked for");
+  row("entry:notes.md").focus();
+  pressKey(row("entry:notes.md"), "ArrowDown");
+  await settle();
+  const folderUserRow = document.activeElement;
+  assert(folderUserRow !== row("entry:notes.md") && tree().contains(folderUserRow), "ArrowDown did not move focus in the tree");
+  release();
+  holdPreview = null;
+  await until(() => /docs is a folder/.test(host.querySelector(".files-pane [role=status]")?.textContent ?? "") && !selectedRow("docs"), "the late folder answer was not announced");
+  await settle();
+  assert(document.activeElement === folderUserRow, `a late folder answer moved focus from the user's row to ${document.activeElement?.outerHTML.slice(0, 80)}`);
   // A path longer than the runtime accepts is refused at once, with no read.
   listings.length = 0;
   previewed.length = 0;

@@ -155,6 +155,8 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   // The file whose reveal waits for the runtime's answer (onResolved); the user's own tree action drops it.
   const pendingOpenRef = useRef("");
   const takeTree = (id) => { pendingOpenRef.current = ""; stopReveal(id); };
+  // Every runtime answer passes this gate: only the answer to an open nothing has superseded may reveal or move focus.
+  const claimOpen = (file) => { const owned = pendingOpenRef.current === file; pendingOpenRef.current = ""; return owned; };
   // The row that had focus at the last commit, and whether focus is in the
   // tree. A row removed while focused leaves focus on the page body, with no
   // focus event in some browsers, so the last commit's focus is the evidence.
@@ -288,17 +290,17 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   }, [reveal, keepFocus]);
   // The tree selects the runtime's path; it is revealed only for an open that nothing has superseded.
   const onResolved = useCallback((file, path) => {
-    const owned = pendingOpenRef.current === file;
-    pendingOpenRef.current = "";
+    const owned = claimOpen(file);
     if (path !== file) setResolved({ file, path });
     if (owned && (path !== file || file.includes("\\"))) void reveal(path, false);
   }, [reveal]);
 
   const revealFolder = useCallback((path) => {
+    const owned = claimOpen(path);
     setSelected((current) => (current === path ? "" : current));
-    setAnnouncement(`${path} is a folder; it is open in the tree`);
+    setAnnouncement(`${path} is a folder${owned ? "; it is open in the tree" : ""}`);
     keepFocus();
-    void reveal(path, true);
+    if (owned) void reveal(path, true);
   }, [reveal, keepFocus]);
 
   // A path the runtime never named may separate folders with "\\" (Windows): that folder is refreshed too when shown.
