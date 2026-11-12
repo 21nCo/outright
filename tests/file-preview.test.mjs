@@ -122,6 +122,11 @@ test("the Markdown budget counts every element the preview renders", () => {
   assert.deepEqual([4, 5].map((budget) => parseMarkdownPreview("- [x] a", budget).overBudget), [true, false]);
   // A one-cell table renders a wrapper, table, thead, tr, th, tbody, tr and td, plus two texts.
   assert.deepEqual([9, 10].map((budget) => parseMarkdownPreview("| h |\n| - |\n| d |", budget).overBudget), [true, false]);
+  // An autolink renders the link and its text inside the paragraph.
+  assert.deepEqual([2, 3].map((budget) => parseMarkdownPreview("<https://a.b>", budget).overBudget), [true, false]);
+  // An image is charged as it renders once it fails: a note and its Retry button.
+  assert.deepEqual([2, 3].map((budget) => parseMarkdownPreview("![](x)", budget).overBudget), [true, false]);
+  assert.equal(parseMarkdownPreview("![](x)".repeat(MARKDOWN_NODE_BUDGET / 2)).overBudget, true);
 });
 
 test("a code span closes only on a backtick run of the opener's exact length", () => {
@@ -559,6 +564,15 @@ test("ArrowLeft from an index outside the rows is not a move", () => {
   const rows = [{ id: "entry:a", type: "entry", entry: { path: "a", name: "a" }, directory: "" }];
   assert.equal(treeKeyTarget(rows, 5, "ArrowLeft"), -1);
   assert.equal(treeKeyTarget(rows, -1, "ArrowLeft"), -1);
+});
+
+test("type-ahead from an index outside the rows searches from the top", () => {
+  const entry = (name) => ({ id: `entry:${name}`, type: "entry", entry: { path: name, name }, directory: "" });
+  const rows = [entry("a"), entry("b")];
+  for (const index of [-3, rows.length + 2, Number.NaN]) assert.equal(treeKeyTarget(rows, index, "b"), 1);
+  assert.equal(treeKeyTarget(rows, -3, "a"), 0);
+  assert.equal(treeKeyTarget(rows, -1, "a"), 0);
+  assert.equal(treeKeyTarget(rows, 0, "a"), 0);
 });
 
 test("a viewer that did not load offers a page reload when only a reload repairs it, and a retry only when one can help", async () => {

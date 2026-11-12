@@ -102,9 +102,11 @@ export function treeKeyTarget(rows, index, key) {
   if (key === "ArrowRight") return rows[index]?.open ? Math.min(rows.length - 1, index + 1) : -1;
   if (key.length === 1 && key.trim()) {
     const lower = key.toLowerCase();
+    // An index that names no row searches from the top.
+    const from = Number.isInteger(index) && index >= -1 && index < rows.length ? index : -1;
     for (let step = 1; step <= rows.length; step += 1) {
-      const row = rows[(index + step) % rows.length];
-      if (row.type === "entry" && row.entry.name.toLowerCase().startsWith(lower)) return (index + step) % rows.length;
+      const row = rows[(from + step) % rows.length];
+      if (row.type === "entry" && row.entry.name.toLowerCase().startsWith(lower)) return (from + step) % rows.length;
     }
   }
   return -1;

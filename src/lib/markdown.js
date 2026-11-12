@@ -306,8 +306,8 @@ function inline(text, start, end, context, depth) {
     nodes.push({ type: "text", value: parts.length === 1 ? parts[0] : parts.join("") });
     parts.length = 0;
   };
-  // Emits a node in place of the text up to `next`.
-  const push = (node, next) => { flush(); spend(counter, 1); nodes.push(node); index = next; runStart = next; };
+  // Emits a node in place of the text up to `next`, charged for the elements it renders at most.
+  const push = (node, next, cost = 1) => { flush(); spend(counter, cost); nodes.push(node); index = next; runStart = next; };
   // Removes trailing spaces and tabs from the pending text; returns how many
   // trailing spaces there were (two or more make a hard line break).
   const trimPending = () => {
@@ -364,7 +364,7 @@ function inline(text, start, end, context, depth) {
         if (destination && labelEnd + 1 + destination.length <= end) {
           const label = { url: destination.url, title: destination.title ?? "" };
           const after = labelEnd + 1 + destination.length;
-          if (image) push({ type: "image", alt: text.slice(labelStart, labelEnd), ...label }, after);
+          if (image) push({ type: "image", alt: text.slice(labelStart, labelEnd), ...label }, after, 2); // a failed image is a note and its Retry button
           else push({ type: "link", ...label, children: inline(text, labelStart, labelEnd, context, depth + 1) }, after);
           continue;
         }
@@ -373,7 +373,7 @@ function inline(text, start, end, context, depth) {
     if (character === "<") {
       AUTOLINK.lastIndex = index;
       const auto = AUTOLINK.exec(text);
-      if (auto && index + auto[0].length <= end) { push({ type: "link", url: auto[1], title: "", children: [{ type: "text", value: auto[1] }] }, index + auto[0].length); continue; }
+      if (auto && index + auto[0].length <= end) { push({ type: "link", url: auto[1], title: "", children: [{ type: "text", value: auto[1] }] }, index + auto[0].length, 2); continue; } // the link and its text
     }
     if ((character === "*" || character === "_" || character === "~") && depth < MAX_DEPTH) {
       const delimiter = text[index + 1] === character ? DOUBLE[character] : character === "~" ? null : character;
