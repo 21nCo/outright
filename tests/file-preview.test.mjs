@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { MARKDOWN_NODE_BUDGET, linkTarget, parseInline, parseMarkdown, parseMarkdownPreview } from "../src/lib/markdown.js";
 import { failedModuleUrl, retryingImport } from "../src/lib/module-retry.js";
 import { PDF_CANVAS_LIMITS, pdfCanvasSize } from "../src/lib/pdf-canvas.js";
@@ -63,6 +66,7 @@ test("adversarial Markdown near the preview size limit parses with linear work a
     // A link label may hold images, so each "[![" scans past the image it opens and no further.
     "image openers in link labels": fill("[!["), "badges without a link target": fill("[![a](b)"), "badges before a rejected link": fill("[![a](b) x", "](t"),
     "escaped brackets in labels": fill("[\\[ ![a](b) ", "](t)"),
+    "escaped image openers in labels": fill("[\\![a](b)"), "backslash runs before image openers": fill(`[${"\\".repeat(999)}![a](b)`, "](t)"),
     // Link destinations are scanned once per label: a long space or tab run
     // after "(" was quadratic in the old pattern's overlapping quantifiers.
     "empty labels before spaces": fill(`[](${" ".repeat(2000)}`),
@@ -648,4 +652,58 @@ test("a viewer that did not load offers a page reload when only a reload repairs
   assert.equal(second.reloadRequired, true);
   assert.deepEqual(viewerFailure(second), { reload: true, retry: false });
   assert.deepEqual(probes, []);
+});
+
+// MarkdownView.jsx compiled as Vite would, its imports pointed at the files they name.
+async function markdownView() {
+  const { transformWithEsbuild } = await import("vite");
+  const file = new URL("../src/components/MarkdownView.jsx", import.meta.url);
+  const { code } = await transformWithEsbuild(await readFile(file, "utf8"), file.pathname, { loader: "jsx", jsx: "automatic" });
+  const imports = { "@/lib/markdown": new URL("../src/lib/markdown.js", import.meta.url).href };
+  const linked = code.replace(/from "([^"]+)"/g, (_, name) => `from ${JSON.stringify(imports[name] ?? import.meta.resolve(name))}`);
+  return import(`data:text/javascript,${encodeURIComponent(linked)}`);
+}
+
+test("a link holds nothing interactive: no link in its label, and an image in it that fails offers no button", async () => {
+  // Every link's descendants, through emphasis, strong and strikethrough.
+  const linkInLink = (nodes, inLink = false) => nodes.some((node) => (inLink && node.type === "link") || linkInLink(node.children ?? [], inLink || node.type === "link"));
+  const show = (nodes) => nodes.map((node) => node.type === "link" ? `<a ${node.url}>${show(node.children)}</a>` : node.type === "image" ? `<img ${node.url} ${node.alt}>` : node.children ? `<${node.type}>${show(node.children)}</${node.type}>` : node.value).join("");
+  const cases = {
+    // An escaped "!" opens no image, so its "[" leaves the outer label text.
+    "[\\![a](b)](t)": "[!<a b>a</a>](t)",
+    // An escaped backslash leaves the "!" unescaped: the image stays in the link.
+    "[\\\\![a](b)](t)": "<a t>\\<img b a></a>",
+    "[<https://a.example>](b.md)": "<a b.md><https://a.example></a>",
+    "[**<https://a.b>**](c)": "<a c><strong><https://a.b></strong></a>",
+    "[see <https://x.y> now](c)": "<a c>see <https://x.y> now</a>",
+    "[**![a](b)**](c)": "<a c><strong><img b a></strong></a>",
+    "[a \\\\[b](x)": "[a \\<a x>b</a>",
+    "[*[x](y)*](z)": "[<emphasis><a y>x</a></emphasis>](z)",
+    "[![CI](badge.svg)](https://ci.example/run)": "<a https://ci.example/run><img badge.svg CI></a>",
+  };
+  for (const [text, expected] of Object.entries(cases)) {
+    const nodes = parseInline(text);
+    assert.equal(linkInLink(nodes), false, text);
+    assert.equal(show(nodes), expected, text);
+  }
+  // Rendered, no link or button opens inside another, whatever the link's target.
+  const { ImageFailure, MarkdownView } = await markdownView();
+  const nested = (html) => {
+    let depth = 0;
+    for (const [, close] of html.matchAll(/<(\/?)(?:a|button)\b[^>]*>/g)) {
+      if (close) depth -= 1; else if (depth++ > 0) return true;
+    }
+    return false;
+  };
+  for (const text of [...Object.keys(cases), "[![s](docs/shot.png)](docs/shot.png)", "[![s](shot.png)](https://a.example)"]) {
+    const html = renderToStaticMarkup(createElement(MarkdownView, { source: text, file: "README.md", imageUrl: (path) => `/image/${path}`, onNavigate() {} }));
+    assert.equal(nested(html), false, `${text}: ${html}`);
+  }
+  // A worktree image that fails says so; in a link it offers no Retry, which would also activate the link.
+  const failed = (inLink) => renderToStaticMarkup(createElement(ImageFailure, { alt: "s", path: "docs/shot.png", inLink, onRetry() {} }));
+  assert.match(failed(false), /Image could not be loaded: s.*<button[^>]*aria-label="Retry image s"/);
+  assert.match(failed(true), /Image could not be loaded: s/);
+  assert.doesNotMatch(failed(true), /<button|<a /);
+  // The badge link is still charged for its image as a note and a Retry.
+  assert.deepEqual([3, 4].map((budget) => parseMarkdownPreview("[![CI](badge.svg)](run)", budget).overBudget), [true, false]);
 });

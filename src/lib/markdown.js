@@ -111,9 +111,8 @@ function parseBlocks(lines, depth, counter) {
     if (ITEM_OPEN.test(line) && depth < MAX_DEPTH) { index = parseList(lines, index, depth, blocks, counter); continue; }
     const align = line.includes("|") ? tableAlignment(lines[index + 1], cells(line).length) : null;
     if (align) {
-      // Every row renders one cell per column, whatever it was written with;
-      // the table also renders a wrapper, table, thead, its row and tbody.
-      spend(counter, align.length + 4);
+      // Every row renders one cell per column, whatever it was written with.
+      spend(counter, align.length + 4); // and a wrapper, table, thead, its row and tbody
       const head = cells(line).map((cell) => parseInline(cell, counter));
       const rows = [];
       index += 2;
@@ -287,8 +286,10 @@ function canClose(text, delimiter, at) {
   return !SPACE.test(text[at - 1]) && !(delimiter[0] === "_" && WORD.test(text[at + delimiter.length] ?? ""));
 }
 
+const escapedAt = (text, at) => { let slashes = 0; while (text[at - 1 - slashes] === "\\") slashes += 1; return slashes % 2 === 1; }; // by an odd run of backslashes
+
 function inline(text, start, end, context, depth) {
-  const { find, closerAt, codeCloserAt, destinationAt, counter, stats } = context;
+  const { find, closerAt, codeCloserAt, destinationAt, counter, stats, inLink } = context; // in a link label, links and autolinks stay text: a link holds nothing interactive
   const nodes = [];
   // Pending text: pieces already taken, then the run from `runStart` to
   // `index`, which is copied only when something else interrupts it.
@@ -306,8 +307,8 @@ function inline(text, start, end, context, depth) {
     nodes.push({ type: "text", value: parts.length === 1 ? parts[0] : parts.join("") });
     parts.length = 0;
   };
-  // Emits a node in place of the text up to `next`, charged for the elements it renders at most.
-  const push = (node, next, cost = 1) => { flush(); spend(counter, cost); nodes.push(node); index = next; runStart = next; };
+  // Emits a node in place of the text up to `next`.
+  const push = (node, next, cost = 1) => { flush(); spend(counter, cost); nodes.push(node); index = next; runStart = next; }; // cost: the elements it renders at most
   // Removes trailing spaces and tabs from the pending text; returns how many
   // trailing spaces there were (two or more make a hard line break).
   const trimPending = () => {
@@ -354,15 +355,15 @@ function inline(text, start, end, context, depth) {
       runStart = index;
       continue;
     }
-    if ((character === "[" || (character === "!" && text[index + 1] === "[")) && depth < MAX_DEPTH) {
+    if (((character === "[" && !inLink) || (character === "!" && text[index + 1] === "[")) && depth < MAX_DEPTH) {
       const image = character === "!";
       const labelStart = index + (image ? 2 : 1);
       // An image's label is the text up to its first "]". A link's may hold whole images ("[![CI](b.svg)](run)") and
       // ends at the first "]" after them; any other "[" leaves it text. Scanning stops there, so it stays linear.
       let labelEnd = find("]", labelStart);
       for (let from = labelStart, bracket; !image && labelEnd >= 0 && labelEnd < end && (bracket = find("[", from)) >= 0 && bracket < labelEnd;) {
-        if (text[bracket - 1] === "\\") { from = bracket + 1; continue; } // an escaped "[" is text
-        const inner = bracket > from && text[bracket - 1] === "!" ? destinationAt(labelEnd) : null;
+        if (escapedAt(text, bracket)) { from = bracket + 1; continue; } // an escaped "[" is text
+        const inner = bracket > from && text[bracket - 1] === "!" && !escapedAt(text, bracket - 1) ? destinationAt(labelEnd) : null;
         if (!inner) { labelEnd = -1; break; }
         from = labelEnd + 1 + inner.length;
         labelEnd = find("]", from);
@@ -373,12 +374,12 @@ function inline(text, start, end, context, depth) {
           const label = { url: destination.url, title: destination.title ?? "" };
           const after = labelEnd + 1 + destination.length;
           if (image) push({ type: "image", alt: text.slice(labelStart, labelEnd), ...label }, after, 2); // a failed image is a note and its Retry button
-          else push({ type: "link", ...label, children: inline(text, labelStart, labelEnd, context, depth + 1) }, after);
+          else push({ type: "link", ...label, children: inline(text, labelStart, labelEnd, { ...context, inLink: true }, depth + 1) }, after);
           continue;
         }
       }
     }
-    if (character === "<") {
+    if (character === "<" && !inLink) {
       AUTOLINK.lastIndex = index;
       const auto = AUTOLINK.exec(text);
       if (auto && index + auto[0].length <= end) { push({ type: "link", url: auto[1], title: "", children: [{ type: "text", value: auto[1] }] }, index + auto[0].length, 2); continue; } // the link and its text

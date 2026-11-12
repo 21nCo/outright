@@ -41,16 +41,13 @@ export function saveHiddenPreference(storage, value) {
 
 export function isFolderPath(path) { return typeof path === "string" && path !== ""; }
 
-// Folders are walked with an explicit stack, not recursion, so a chain of
-// open folders as deep as the deepest revealable path (2,047 levels) cannot
-// overflow the call stack. Rows come out in the same depth-first order.
+// Walks open folders depth-first with a stack, not recursion: a 2,047-level reveal cannot overflow the call stack.
 export function visibleRows(folders, expanded) {
   const rows = [];
   // A folder is shown once per tree, however its entries name it.
   const visited = new Set();
   const stack = [];
-  // Adds a folder's own state rows; a listed folder is pushed for its entries.
-  const enter = (directory, level) => {
+  const enter = (directory, level) => { // adds a folder's state rows, or pushes a listed folder for its entries
     visited.add(directory);
     const folder = folders.get(directory);
     if (!folder || (folder.status === "loading" && !folder.entries)) { rows.push({ id: `loading:${directory}`, type: "loading", directory, level }); return; }
@@ -67,11 +64,9 @@ export function visibleRows(folders, expanded) {
   };
   enter("", 1);
   while (stack.length) {
-    const frame = stack.at(-1);
-    const { directory, level, folder } = frame;
+    const frame = stack.at(-1), { directory, level, folder } = frame;
     if (frame.index < folder.entries.length) {
-      const entry = folder.entries[frame.index];
-      frame.index += 1;
+      const entry = folder.entries[frame.index++];
       const expandable = isExpandable(entry);
       const open = expandable && expanded.has(entry.path) && !visited.has(entry.path);
       rows.push({ id: entryRowId(directory, entry), type: "entry", entry, directory, level, expandable, open,
@@ -91,8 +86,7 @@ export function visibleRows(folders, expanded) {
 // The row a key moves to from `index`, or -1 when the key is not a move.
 export function treeKeyTarget(rows, index, key) {
   if (!rows.length) return -1;
-  // An index that names no row is no row (-1): every key then moves as from -1.
-  if (!(Number.isInteger(index) && index >= 0 && index < rows.length)) index = -1;
+  if (!(Number.isInteger(index) && index >= 0 && index < rows.length)) index = -1; // no row: every key moves as from -1
   if (key === "ArrowDown") return Math.min(rows.length - 1, index + 1);
   if (key === "ArrowUp") return Math.max(0, index - 1);
   if (key === "Home") return 0;
@@ -150,10 +144,8 @@ export function samePreview(shown, next) {
   return shown.version === next.version && shown.size === next.size && shown.limit === next.limit && shown.reason === next.reason;
 }
 
-// A preview's state names the target it was asked for: its project, worktree
-// and file. The runtime's resolved path, the label and Refresh folder target
-// it gives, and a preview a refresh may keep, carry over only within the same
-// target, never to another file or another worktree's file of the same name.
+// A preview's state names its target (project, worktree, file). Its resolved path (label, Refresh folder)
+// and a preview a refresh may keep carry over only within that target, never to another file or worktree.
 export const sameTarget = (a, b) => a?.projectId === b?.projectId && a?.worktreePath === b?.worktreePath && a?.file === b?.file;
 const keptPath = (prior, target) => (sameTarget(prior?.target, target) ? prior.path : undefined);
 export const loadingPreview = (prior, target) => ({ status: "loading", target, path: keptPath(prior, target) });
@@ -164,9 +156,7 @@ export const openedPath = (state, target) => (sameTarget(state.target, target) &
 // A refresh, or an answer that changes the preview (samePreview keeps an unchanged one), clears a renderer error.
 export const rendersAfresh = (prior, next) => prior.resetKey !== next.resetKey || prior.preview !== next.preview;
 
-// What a viewer that did not load offers (module-retry.js): one only a page
-// reload repairs offers the reload, and an in-place retry only when retryable;
-// any other failure offers the retry.
+// A viewer that did not load (module-retry.js) offers a page reload if only that repairs it, else a retry; both if retryable.
 export const viewerFailure = (error) => (error?.reloadRequired ? { reload: true, retry: Boolean(error.retryable) } : { reload: false, retry: true });
 
 // Go to file looks for each step of its path in up to this many entries of a folder.

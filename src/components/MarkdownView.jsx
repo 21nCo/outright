@@ -51,7 +51,7 @@ function Inline({ nodes, context }) {
       case "delete": return <del key={index}><Inline nodes={node.children} context={context} /></del>;
       case "link": {
         const target = linkTarget(node.url, context.file);
-        const label = <Inline nodes={node.children} context={context} />;
+        const label = <Inline nodes={node.children} context={{ ...context, inLink: true }} />;
         if (target.kind === "external") return <a key={index} href={target.href} title={node.title || target.href} target="_blank" rel="noopener noreferrer nofollow">{label}</a>;
         if (target.kind === "file") return <button key={index} type="button" className="markdown-link" title={`Open ${target.path}`} onClick={() => context.onNavigate?.(target.path)}>{label}</button>;
         return <span key={index} className="markdown-inert-link" title={target.kind === "unsafe" ? "This link's address is not opened from a preview" : undefined}>{label}</span>;
@@ -62,7 +62,7 @@ function Inline({ nodes, context }) {
           // Keyed by its address, so a new destination or a refresh starts
           // a fresh load instead of keeping an earlier failure.
           const src = context.imageUrl(target.path);
-          return <MarkdownImage key={`${index}:${src}`} src={src} alt={node.alt} title={node.title} path={target.path} />;
+          return <MarkdownImage key={`${index}:${src}`} src={src} alt={node.alt} title={node.title} path={target.path} inLink={context.inLink} />;
         }
         return <span key={index} className="markdown-image-placeholder" title="Images from other sites are not loaded in previews">[Image not loaded{node.alt ? `: ${node.alt}` : ""}]</span>;
       }
@@ -73,14 +73,16 @@ function Inline({ nodes, context }) {
 
 // A worktree image that cannot be loaded (missing, not an image, or refused
 // while the runtime is busy) says so and can be tried again.
-function MarkdownImage({ src, alt, title, path }) {
+function MarkdownImage({ src, alt, title, path, inLink }) {
   const [attempt, setAttempt] = useState(0);
   const [failed, setFailed] = useState(false);
-  if (failed) {
-    return <span className="markdown-image-failed" role="note">
-      [Image could not be loaded{alt ? `: ${alt}` : ""}]
-      <button type="button" className="markdown-link" aria-label={`Retry image ${alt || path}`} onClick={(event) => { event.currentTarget.closest(".file-preview")?.focus(); setFailed(false); setAttempt((value) => value + 1); }}>Retry</button>
-    </span>;
-  }
+  if (failed) return <ImageFailure alt={alt} path={path} inLink={inLink} onRetry={() => { setFailed(false); setAttempt((value) => value + 1); }} />;
   return <img key={attempt} src={src} alt={alt} title={title || undefined} loading="lazy" onError={() => setFailed(true)} />;
+}
+
+export function ImageFailure({ alt, path, inLink, onRetry }) { // in a link, where no button can go, a file Refresh retries it
+  return <span className="markdown-image-failed" role="note">
+    [Image could not be loaded{alt ? `: ${alt}` : ""}]
+    {!inLink && <button type="button" className="markdown-link" aria-label={`Retry image ${alt || path}`} onClick={(event) => { event.currentTarget.closest(".file-preview")?.focus(); onRetry(); }}>Retry</button>}
+  </span>;
 }

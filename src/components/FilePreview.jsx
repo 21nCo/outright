@@ -8,8 +8,7 @@ import { api, query } from "@/lib/runtime-api";
 
 // The PDF viewer loads on first use, through retryingImport, as does the
 // pdf.js library (PdfPreview.jsx). These are the only dynamic imports on
-// this page's side of the preview path; the production build keeps each one
-// retryable (its build check lands with the Files pane that mounts this).
+// this page's side of the preview path; each must stay retryable in the build.
 // The worker itself is started by PdfPreview for each document and given
 // to pdf.js, so pdf.js's own import of the worker script never runs; a
 // failed start is retried by the next attempt's new worker, and anything
@@ -29,8 +28,7 @@ let PdfPreview = pdfViewer();
 // Keeps a preview that cannot render (for example a viewer that did not
 // load) inside this pane: the tree, other panes and the conversation stay.
 // A refresh (resetKey) tries again, as it does for every failed preview.
-// A viewer only a page reload repairs (a chunk gone after an update) offers
-// the reload, as PdfPreview does for its own imports.
+// A viewer only a page reload repairs offers the reload, as PdfPreview does.
 class PreviewBoundary extends Component {
   state = { error: null, shown: this.props };
   static getDerivedStateFromError(error) { return { error }; }
