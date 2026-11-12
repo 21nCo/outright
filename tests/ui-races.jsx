@@ -10268,6 +10268,7 @@ async function filesInheritedRegression() {
   // Each request no longer wanted is aborted.
   root.render(null);
   await settle();
+  requests.length = 0;
   const project = { id: "A", name: "Review A", path: "/fixture/A" };
   const worktree = { id: "A", name: "A", path: "/fixture/A", branch: "main" };
   // A loaded image is needed to keep a top-level preview; every image URL the pane sets is recorded as the request it makes.
@@ -10285,30 +10286,37 @@ async function filesInheritedRegression() {
   try {
     root.render(<TooltipProvider><div style={{ width: 720, height: 360 }}><FilesPane project={project} worktree={worktree} settings={{ editor: "code" }} completions={0} quickOpen={0} onError={() => {}} /></div></TooltipProvider>);
     await until(() => row("entry:docs"), "the standalone root was not listed");
+    const asked = (kind, key) => requests.filter((request) => request.kind === kind && request.key === key).length;
+    // A row click selects its file before anything else is checked.
+    const choose = async (path) => {
+      row(`entry:${path}`).click();
+      await until(() => row(`entry:${path}`)?.getAttribute("aria-selected") === "true" && asked("preview", path), `${path} was not selected and asked for`);
+    };
     holds.add("list:docs");
     row("entry:docs").click();
-    await until(() => signalOf("list", "docs"), "docs was not read");
+    await until(() => asked("list", "docs") === 1, "docs was not read");
     const superseded = signalOf("list", "docs");
     refreshFiles();
-    await until(() => signalOf("list", "docs") !== superseded, "Refresh files did not read docs again");
+    await until(() => asked("list", "docs") === 2, "Refresh files did not read docs again");
     assert(superseded?.aborted === true, "a superseded folder listing was not aborted");
     const collapsed = signalOf("list", "docs");
     row("entry:docs").click();
     await until(() => row("entry:docs").getAttribute("aria-expanded") === "false", "docs did not collapse");
+    const roots = asked("list", "");
     refreshFiles();
-    await until(() => collapsed?.aborted === true, "the listing of a collapsed folder was not aborted on refresh");
+    await until(() => asked("list", "") > roots, "Refresh files did not read the root");
+    await settle();
+    assert(collapsed?.aborted === true, "the listing of a collapsed folder was not aborted on refresh");
 
     holds.add("preview:a.md");
-    row("entry:a.md").click();
-    await until(() => signalOf("preview", "a.md"), "a.md was not asked for");
+    await choose("a.md");
     const replaced = signalOf("preview", "a.md");
-    row("entry:b.md").click();
+    await choose("b.md");
     await until(() => /Note/.test(host.querySelector(".file-preview")?.textContent ?? ""), "b.md was not previewed");
     assert(replaced?.aborted === true, "the preview request of a file no longer selected was not aborted");
 
     // Refresh files keeps a shown top-level image and asks for its bytes again.
-    row("entry:picture.png").click();
-    await until(() => row("entry:picture.png")?.getAttribute("aria-selected") === "true", `picture.png was not selected ${JSON.stringify(requests.map((r) => r.kind + ":" + r.key))}`);
+    await choose("picture.png");
     await until(() => host.querySelector(".image-preview img")?.complete && rawRequests.length, `picture.png was not shown: ${host.querySelector(".file-preview-body")?.textContent} ${JSON.stringify(rawRequests.map((request) => request.url))}`);
     const image = host.querySelector(".image-preview img");
     const first = rawRequests.length;
@@ -10318,14 +10326,14 @@ async function filesInheritedRegression() {
     assert(image.isConnected && after.image === image && after.url !== before.url && /[?&]file=picture\.png/.test(after.url), `Refresh files replaced the image or asked for the same URL: ${before.url} then ${after.url}`);
 
     // An image over the pixel limit says why.
-    row("entry:huge.png").click();
+    await choose("huge.png");
     await until(() => /9000 × 9000 pixels/.test(host.querySelector(".file-preview")?.textContent ?? ""), `an image over the pixel limit did not give its reason: ${host.querySelector(".file-preview")?.textContent}`);
 
     holds.add("list:slow");
     holds.add("preview:b.md");
     row("entry:slow").click();
-    row("entry:b.md").click();
-    await until(() => signalOf("list", "slow") && requests.filter((request) => request.key === "b.md").length === 2, "slow and b.md were not asked for");
+    await until(() => asked("list", "slow"), "slow was not read");
+    await choose("b.md");
     const pending = [signalOf("list", "slow"), signalOf("preview", "b.md")];
     root.render(null);
     await settle();
