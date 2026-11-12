@@ -171,6 +171,6 @@ export async function revealPath(folders, path, read, active, chain) {
 // ones too, since a chat can be archived while its run finishes) name it.
 export async function worktreeOwnsChat(id, openChats, listChats) {
   if (openChats.some((chat) => chat.id === id)) return true;
-  const lists = await Promise.all([listChats(false), listChats(true)]).catch(() => []);
-  return lists.some((chats) => chats.some((chat) => chat.id === id));
+  const lists = await Promise.allSettled([listChats(false), listChats(true)]);
+  return lists.some((list) => list.status === "fulfilled" && list.value.some((chat) => chat.id === id));
 }

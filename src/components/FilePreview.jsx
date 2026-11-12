@@ -115,7 +115,7 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
   else if (mediaFailed) body = <div className="preview-state" role="alert"><WarningCircle /><p>{typeof mediaFailed === "string" ? `${name} could not be read: ${mediaFailed}` : `${name} could not be shown. It may have changed since it was opened.`}</p><Button variant="outline" size="xs" onClick={reload}><ArrowsClockwise />Retry</Button></div>;
   else if (preview.previewType === "image") body = <div className="image-preview"><img src={imageUrl(opened, preview.version)} alt={`Preview of ${name}`} onError={() => setMediaFailed(true)} /></div>;
   else if (preview.previewType === "pdf") body = <Suspense fallback={<div className="preview-state" role="status"><SpinnerGap className="spin" />Loading PDF viewer…</div>}><PdfPreview url={raw} name={name} refreshKey={refreshKey} onFailed={(message) => setMediaFailed(message || true)} /></Suspense>;
-  else if (preview.previewType === "oversized") body = <div className="preview-state" role="status"><Prohibit /><p>{name} is {formatBytes(preview.size)}, over the {formatBytes(preview.limit)} preview limit for this type.</p>{editorButton}</div>;
+  else if (preview.previewType === "oversized") body = <div className="preview-state" role="status"><Prohibit /><p>{preview.limit == null && preview.reason ? `${preview.reason}.` : `${name} is ${formatBytes(preview.size)}, over the ${formatBytes(preview.limit)} preview limit for this type.`}</p>{editorButton}</div>;
   else body = <div className="preview-state" role="status"><Prohibit /><p>{name} has no preview. {preview.reason ?? ""}</p>{editorButton}</div>;
 
   return <section ref={sectionRef} tabIndex={-1} className="file-preview" aria-label={`Preview of ${name}`}>

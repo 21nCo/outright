@@ -474,4 +474,6 @@ test("a run that ends in an open or archived chat of the shown worktree refreshe
   assert.equal(await worktreeOwnsChat("other-worktree", [{ id: "open-1" }], listChats), false);
   // A list that cannot be read is no evidence of ownership.
   assert.equal(await worktreeOwnsChat("archived-1", [], () => Promise.reject(new Error("offline"))), false);
+  // One list that cannot be read does not hide a match in the other.
+  assert.equal(await worktreeOwnsChat("archived-1", [], (archived) => archived ? Promise.resolve(lists.true) : Promise.reject(new Error("offline"))), true);
 });
