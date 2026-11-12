@@ -4,7 +4,7 @@ import { MARKDOWN_NODE_BUDGET, linkTarget, parseInline, parseMarkdown, parseMark
 import { failedModuleUrl, retryingImport } from "../src/lib/module-retry.js";
 import { PDF_CANVAS_LIMITS, pdfCanvasSize } from "../src/lib/pdf-canvas.js";
 import { pdfWorkerStarter } from "../src/lib/pdf-worker.js";
-import { HIDDEN_FILES_KEY, MAX_REVEAL_ENTRIES, ancestorsOf, entryRowId, failedPreview, isExpandable, loadingPreview, needsPage, normalizeTypedPath, openedPath, readHiddenPreference, revealable, revealPath, revealReads, samePreview, saveHiddenPreference, shownPreview, treeKeyTarget, visibleRows, worktreeOwnsChat } from "../src/lib/file-tree.js";
+import { HIDDEN_FILES_KEY, MAX_REVEAL_ENTRIES, ancestorsOf, entryRowId, failedPreview, isExpandable, loadingPreview, needsPage, normalizeTypedPath, openedPath, readHiddenPreference, revealable, revealPath, revealReads, samePreview, saveHiddenPreference, shownPreview, treeKeyTarget, viewerFailure, visibleRows, worktreeOwnsChat } from "../src/lib/file-tree.js";
 
 const types = (nodes) => nodes.map((node) => node.type);
 function collect(blocks, found = []) {
@@ -527,4 +527,24 @@ test("ArrowLeft from an index outside the rows is not a move", () => {
   const rows = [{ id: "entry:a", type: "entry", entry: { path: "a", name: "a" }, directory: "" }];
   assert.equal(treeKeyTarget(rows, 5, "ArrowLeft"), -1);
   assert.equal(treeKeyTarget(rows, -1, "ArrowLeft"), -1);
+});
+
+test("a viewer that did not load offers a page reload when only a reload repairs it, and a retry only when one can help", async () => {
+  assert.deepEqual(viewerFailure(Object.assign(new Error("gone"), { reloadRequired: true })), { reload: true, retry: false });
+  assert.deepEqual(viewerFailure(Object.assign(new Error("late"), { reloadRequired: true, retryable: true })), { reload: true, retry: true });
+  assert.deepEqual(viewerFailure(new Error("offline")), { reload: false, retry: true });
+  assert.deepEqual(viewerFailure(undefined), { reload: false, retry: true });
+  // A chunk gone after an update: the first failure only retries, the retried address probed gone asks for the reload.
+  const origin = "http://app.test";
+  const failure = (url) => new TypeError(`Failed to fetch dynamically imported module: ${url}`);
+  const probes = ["unreachable", "gone"];
+  const load = retryingImport(() => Promise.reject(failure(`${origin}/assets/PdfPreview-abc.js`)), {
+    origin, exports: ["default"], probe: async () => probes.shift(), importUrl: (href) => Promise.reject(failure(href)),
+  });
+  const first = await load().catch((error) => error);
+  assert.deepEqual(viewerFailure(first), { reload: false, retry: true });
+  const second = await load().catch((error) => error);
+  assert.equal(second.reloadRequired, true);
+  assert.deepEqual(viewerFailure(second), { reload: true, retry: false });
+  assert.deepEqual(probes, []);
 });

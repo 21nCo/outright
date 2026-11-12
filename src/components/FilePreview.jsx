@@ -2,7 +2,7 @@ import { Component, lazy, Suspense, useEffect, useRef, useState } from "react";
 import { ArrowSquareOut, ArrowsClockwise, FileX, LinkBreak, Prohibit, SpinnerGap, WarningCircle } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { MarkdownView } from "@/components/MarkdownView";
-import { failedPreview, formatBytes, loadingPreview, openedPath, samePreview, sameTarget, shownPreview } from "@/lib/file-tree";
+import { failedPreview, formatBytes, loadingPreview, openedPath, samePreview, sameTarget, shownPreview, viewerFailure } from "@/lib/file-tree";
 import { retryingImport } from "@/lib/module-retry";
 import { api, query } from "@/lib/runtime-api";
 
@@ -29,12 +29,18 @@ let PdfPreview = pdfViewer();
 // Keeps a preview that cannot render (for example a viewer that did not
 // load) inside this pane: the tree, other panes and the conversation stay.
 // A refresh (resetKey) tries again, as it does for every failed preview.
+// A viewer only a page reload repairs (a chunk gone after an update) offers
+// the reload, as PdfPreview does for its own imports.
 class PreviewBoundary extends Component {
   state = { error: null, resetKey: this.props.resetKey };
   static getDerivedStateFromError(error) { return { error }; }
   static getDerivedStateFromProps(props, state) { return props.resetKey === state.resetKey ? null : { error: null, resetKey: props.resetKey }; }
   render() {
     if (!this.state.error) return this.props.children;
+    const { reload, retry } = viewerFailure(this.state.error);
+    if (reload) return <div className="preview-state" role="alert"><WarningCircle /><p>Outright was updated, or part of it did not load, so the viewer for {this.props.name} needs a page reload. Reloading clears unsent messages.</p>
+      <Button variant="outline" size="xs" onClick={() => window.location.reload()}><ArrowsClockwise />Reload page</Button>
+      {retry && <Button variant="ghost" size="xs" onClick={this.props.onRetry}>Try again</Button>}</div>;
     return <div className="preview-state" role="alert"><WarningCircle /><p>{this.props.name} could not be shown: {this.state.error.message || "the viewer did not load"}</p>
       <Button variant="outline" size="xs" onClick={this.props.onRetry}><ArrowsClockwise />Retry</Button></div>;
   }

@@ -145,6 +145,11 @@ export const failedPreview = (prior, target, error) => ({ status: "error", targe
 export const shownPreview = (state, target, mediaFailed) => (state.status === "ready" && sameTarget(state.target, target) && !mediaFailed ? state : null);
 export const openedPath = (state, target) => (sameTarget(state.target, target) && state.path) || target.file;
 
+// What a viewer that did not load offers (module-retry.js): one only a page
+// reload repairs offers the reload, and an in-place retry only when retryable;
+// any other failure offers the retry.
+export const viewerFailure = (error) => (error?.reloadRequired ? { reload: true, retry: Boolean(error.retryable) } : { reload: false, retry: true });
+
 // Go to file looks for each step of its path in up to this many entries of a folder.
 export const MAX_REVEAL_ENTRIES = 2000;
 
