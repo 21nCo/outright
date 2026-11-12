@@ -2,14 +2,14 @@ import { Component, lazy, Suspense, useEffect, useRef, useState } from "react";
 import { ArrowSquareOut, ArrowsClockwise, FileX, LinkBreak, Prohibit, SpinnerGap, WarningCircle } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { MarkdownView } from "@/components/MarkdownView";
-import { formatBytes, samePreview } from "@/lib/file-tree";
+import { failedPreview, formatBytes, loadingPreview, openedPath, samePreview, sameTarget, shownPreview } from "@/lib/file-tree";
 import { retryingImport } from "@/lib/module-retry";
 import { api, query } from "@/lib/runtime-api";
 
 // The PDF viewer loads on first use, through retryingImport, as does the
 // pdf.js library (PdfPreview.jsx). These are the only dynamic imports on
-// this page's side of the preview path; tests/preview-build.test.mjs checks
-// that the production build keeps each one retryable.
+// this page's side of the preview path; the production build keeps each one
+// retryable (its build check lands with the Files pane that mounts this).
 // The worker itself is started by PdfPreview for each document and given
 // to pdf.js, so pdf.js's own import of the worker script never runs; a
 // failed start is retried by the next attempt's new worker, and anything
@@ -47,7 +47,8 @@ class PreviewBoundary extends Component {
 const FILE_STATES = new Set(["MISSING", "BROKEN_LINK", "OUTSIDE_WORKTREE", "PATH_OUTSIDE", "LINK_LOOP", "EXCLUDED", "UNREADABLE", "PREVIEW_UNAVAILABLE"]);
 
 export function FilePreview({ project, worktree, file, refreshKey, settings, onNavigate, onResolved, onFolder, onRefreshFolder, onError }) {
-  const [state, setState] = useState({ status: "loading", file });
+  const identity = { projectId: project.id, worktreePath: worktree.path, file };
+  const [state, setState] = useState({ status: "loading", target: identity });
   const [mode, setMode] = useState("rendered");
   const [mediaFailed, setMediaFailed] = useState(false);
   const [retry, setRetry] = useState(0);
@@ -55,7 +56,7 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
   // What the effect below may keep: the preview shown at the last render,
   // unless its image or PDF failed (mediaFailed) and needs a fresh start.
   const shownRef = useRef(null);
-  shownRef.current = state.status === "ready" && state.file === file && !mediaFailed ? state : null;
+  shownRef.current = shownPreview(state, identity, mediaFailed);
 
   useEffect(() => {
     let current = true;
@@ -63,28 +64,28 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
     const controller = new AbortController();
     const shown = shownRef.current;
     const background = Boolean(shown);
-    if (!background) { setState((prior) => ({ status: "loading", file, path: prior.path })); setMediaFailed(false); }
+    if (!background) { setState((prior) => loadingPreview(prior, identity)); setMediaFailed(false); }
     api(query("/api/files/preview", { ...target, file }), { signal: controller.signal })
       .then((preview) => {
         if (!current) return;
         if (background && samePreview(shown.preview, preview)) return;
         if (!background && typeof preview.path === "string") onResolved?.(file, preview.path); // The file the runtime opened.
         setMediaFailed(false);
-        setState({ status: "ready", file, path: typeof preview.path === "string" ? preview.path : file, preview });
+        setState({ status: "ready", target: identity, path: typeof preview.path === "string" ? preview.path : file, preview });
       })
       .catch((error) => {
         if (!current) return;
         if (error.payload?.code === "IS_DIRECTORY") { onFolder?.(file); return; }
         // A background refresh that fails for a passing reason (network, server) keeps the shown preview; one that names the file's state replaces it.
         if (background && !FILE_STATES.has(error.payload?.code)) { onError?.(error); return; }
-        setState((prior) => ({ status: "error", file, path: prior.path, code: error.payload?.code ?? "", message: error.message }));
+        setState((prior) => failedPreview(prior, identity, error));
       });
     return () => { current = false; controller.abort(); };
     // The target is identified by its project, worktree and file alone.
   }, [project.id, worktree.path, file, refreshKey, retry]);
 
   // Once the runtime answers, its path names the file: label, editor, link and image base, Refresh folder.
-  const opened = (state.file === file && state.path) || file;
+  const opened = openedPath(state, identity);
   const name = opened.split("/").at(-1);
   const openInEditor = () => api("/api/editor/open", { method: "POST", body: { path: worktree.path, file: opened, editor: settings?.editor } }).catch(onError);
   const editorButton = <Button variant="outline" size="xs" onClick={openInEditor}><ArrowSquareOut />Open in {settings?.editor ?? "editor"}</Button>;
@@ -92,7 +93,7 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
   const sectionRef = useRef(null);
   const reload = () => { sectionRef.current?.focus(); setRetry((value) => value + 1); };
 
-  if (state.status === "loading" || state.file !== file) return <section ref={sectionRef} tabIndex={-1} className="file-preview" aria-label={`Preview of ${name}`} aria-busy="true"><div className="preview-state" role="status"><SpinnerGap className="spin" />Opening {name}…</div></section>;
+  if (state.status === "loading" || !sameTarget(state.target, identity)) return <section ref={sectionRef} tabIndex={-1} className="file-preview" aria-label={`Preview of ${name}`} aria-busy="true"><div className="preview-state" role="status"><SpinnerGap className="spin" />Opening {name}…</div></section>;
   if (state.status === "error") {
     const [Icon, text, action] = {
       MISSING: [FileX, `${opened} no longer exists. It may have been moved or deleted.`, <Button key="refresh" variant="outline" size="xs" onClick={() => onRefreshFolder?.(opened)}><ArrowsClockwise />Refresh folder</Button>],

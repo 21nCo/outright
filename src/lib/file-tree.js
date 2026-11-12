@@ -82,7 +82,7 @@ export function treeKeyTarget(rows, index, key) {
   if (key === "Home") return 0;
   if (key === "End") return rows.length - 1;
   if (key === "ArrowLeft") {
-    const { directory } = rows[index];
+    const directory = rows[index]?.directory;
     return directory ? rows.findIndex((row) => row.type === "entry" && row.entry.path === directory) : -1;
   }
   if (key === "ArrowRight") return rows[index]?.open ? Math.min(rows.length - 1, index + 1) : -1;
@@ -133,6 +133,17 @@ export function samePreview(shown, next) {
   if (typeof shown.text === "string" || typeof next.text === "string") return shown.text === next.text && shown.size === next.size;
   return shown.version === next.version && shown.size === next.size && shown.limit === next.limit && shown.reason === next.reason;
 }
+
+// A preview's state names the target it was asked for: its project, worktree
+// and file. The runtime's resolved path, the label and Refresh folder target
+// it gives, and a preview a refresh may keep, carry over only within the same
+// target, never to another file or another worktree's file of the same name.
+export const sameTarget = (a, b) => a?.projectId === b?.projectId && a?.worktreePath === b?.worktreePath && a?.file === b?.file;
+const keptPath = (prior, target) => (sameTarget(prior?.target, target) ? prior.path : undefined);
+export const loadingPreview = (prior, target) => ({ status: "loading", target, path: keptPath(prior, target) });
+export const failedPreview = (prior, target, error) => ({ status: "error", target, path: keptPath(prior, target), code: error?.payload?.code ?? "", message: error?.message });
+export const shownPreview = (state, target, mediaFailed) => (state.status === "ready" && sameTarget(state.target, target) && !mediaFailed ? state : null);
+export const openedPath = (state, target) => (sameTarget(state.target, target) && state.path) || target.file;
 
 // Go to file looks for each step of its path in up to this many entries of a folder.
 export const MAX_REVEAL_ENTRIES = 2000;

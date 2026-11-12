@@ -4,7 +4,7 @@ import { MARKDOWN_NODE_BUDGET, linkTarget, parseInline, parseMarkdown, parseMark
 import { failedModuleUrl, retryingImport } from "../src/lib/module-retry.js";
 import { PDF_CANVAS_LIMITS, pdfCanvasSize } from "../src/lib/pdf-canvas.js";
 import { pdfWorkerStarter } from "../src/lib/pdf-worker.js";
-import { HIDDEN_FILES_KEY, MAX_REVEAL_ENTRIES, ancestorsOf, entryRowId, isExpandable, needsPage, normalizeTypedPath, readHiddenPreference, revealable, revealPath, revealReads, samePreview, saveHiddenPreference, treeKeyTarget, visibleRows, worktreeOwnsChat } from "../src/lib/file-tree.js";
+import { HIDDEN_FILES_KEY, MAX_REVEAL_ENTRIES, ancestorsOf, entryRowId, failedPreview, isExpandable, loadingPreview, needsPage, normalizeTypedPath, openedPath, readHiddenPreference, revealable, revealPath, revealReads, samePreview, saveHiddenPreference, shownPreview, treeKeyTarget, visibleRows, worktreeOwnsChat } from "../src/lib/file-tree.js";
 
 const types = (nodes) => nodes.map((node) => node.type);
 function collect(blocks, found = []) {
@@ -280,9 +280,11 @@ test("a module that failed to load is loaded again at a fresh address, and a loa
   assert.equal(failedModuleUrl(failure("https://cdn.test/pdf.js"), origin), null);
   assert.equal(failedModuleUrl(new TypeError("Importing a module script failed."), origin), null);
   const imported = [];
+  const probed = [];
   let loads = 0;
   const load = retryingImport(() => { loads += 1; return Promise.reject(failure(`${origin}/assets/pdf-abc.js`)); }, {
     origin,
+    probe: async (href) => { probed.push(href); return "unreachable"; },
     importUrl: (href) => { imported.push(href); return imported.length === 1 ? Promise.reject(failure(href)) : Promise.resolve({ default: href }); },
   });
   await assert.rejects(load(), /pdf-abc/);
@@ -295,9 +297,10 @@ test("a module that failed to load is loaded again at a fresh address, and a loa
   assert.deepEqual(imported.map((href) => new URL(href).pathname), ["/assets/pdf-abc.js", "/assets/pdf-abc.js"]);
   assert.equal(await load(), module);
   assert.equal(imported.length, 2);
+  assert.deepEqual(probed.map((href) => new URL(href).pathname), ["/assets/pdf-abc.js", "/assets/pdf-abc.js"]);
   // Without an address in the error (Safari), the original import is tried again.
   let plain = 0;
-  const unnamed = retryingImport(() => (plain += 1) === 1 ? Promise.reject(new TypeError("Importing a module script failed.")) : Promise.resolve({ ok: true }), { origin, importUrl: () => assert.fail("no address to retry") });
+  const unnamed = retryingImport(() => (plain += 1) === 1 ? Promise.reject(new TypeError("Importing a module script failed.")) : Promise.resolve({ ok: true }), { origin, importUrl: () => assert.fail("no address to retry"), probe: () => assert.fail("no address to probe") });
   await assert.rejects(unnamed());
   assert.deepEqual(await unnamed(), { ok: true });
 });
@@ -308,7 +311,7 @@ test("a pdf.js worker that fails before it is ready fails its document and is st
     constructor(url) { super(); this.url = url; this.terminated = false; created.push(this); }
     terminate() { this.terminated = true; }
   }
-  const start = pdfWorkerStarter({ createWorker: (url) => new FakeWorker(url), base: () => "http://app.test/files", startupMs: 1000 });
+  const start = pdfWorkerStarter({ createWorker: (url) => new FakeWorker(url), base: () => "http://app.test/files", startupMs: 1000, probe: async () => "unreachable" });
   const message = (data) => Object.assign(new Event("message"), { data });
   const first = start("/assets/pdf.worker.mjs");
   first.worker.dispatchEvent(new Event("error"));
@@ -344,7 +347,7 @@ test("a pdf.js worker that stays silent past its startup deadline is ended and f
     constructor(url) { super(); this.url = url; this.terminated = false; created.push(this); }
     terminate() { this.terminated = true; }
   }
-  const start = pdfWorkerStarter({ createWorker: (url) => new SilentWorker(url), base: () => "http://app.test/files", startupMs: 30 });
+  const start = pdfWorkerStarter({ createWorker: (url) => new SilentWorker(url), base: () => "http://app.test/files", startupMs: 30, probe: async () => "unreachable" });
   const silent = start("/assets/pdf.worker.mjs");
   await assert.rejects(silent.ready, /The PDF reader did not start in time/);
   assert.equal(silent.worker.terminated, true);
@@ -489,4 +492,39 @@ test("a run of three emphasis delimiters nests strong and emphasis either way ro
   // A run of two is unchanged: its closer takes the first two of a longer run.
   assert.deepEqual(parseInline("**a***"), [{ type: "strong", children: [{ type: "text", value: "a" }] }, { type: "text", value: "*" }]);
   assert.deepEqual(parseInline("a ***b*** c **d**").map((node) => node.type), ["text", "strong", "text", "strong"]);
+});
+
+// FilePreview names its file (loading text, aria-label, MISSING and
+// BROKEN_LINK text, Refresh folder and editor targets) by openedPath, and
+// keeps a shown preview on refresh only when shownPreview returns it.
+test("a preview's resolved path and kept state never carry over to another file or another worktree's file of the same name", () => {
+  const a = { projectId: "p1", worktreePath: "/w/main", file: "docs/link.md" };
+  const ready = { status: "ready", target: a, path: "docs/real.md", preview: { previewType: "text", text: "a", size: 1 } };
+  assert.equal(openedPath(ready, a), "docs/real.md");
+  assert.equal(shownPreview(ready, a, false), ready);
+  assert.equal(shownPreview(ready, a, true), null);
+  const missing = Object.assign(new Error("gone"), { payload: { code: "MISSING" } });
+  // A new selection that is missing names itself, not the file shown before.
+  const b = { ...a, file: "notes/b.md" };
+  const loadingB = loadingPreview(ready, b);
+  assert.equal(openedPath(loadingB, b), "notes/b.md");
+  const errorB = failedPreview(loadingB, b, missing);
+  assert.deepEqual([errorB.code, openedPath(errorB, b)], ["MISSING", "notes/b.md"]);
+  assert.equal(openedPath(failedPreview(ready, b, missing), b), "notes/b.md");
+  // Another worktree's file of the same name is a new target: nothing is kept.
+  const other = { ...a, worktreePath: "/w/feature" };
+  assert.equal(shownPreview(ready, other, false), null);
+  assert.equal(openedPath(ready, other), "docs/link.md");
+  assert.equal(openedPath(failedPreview(ready, other, missing), other), "docs/link.md");
+  assert.equal(shownPreview(ready, { ...a, projectId: "p2" }, false), null);
+  // Retrying the same target keeps the path the runtime resolved.
+  const errorA = failedPreview(loadingPreview(ready, a), a, missing);
+  assert.equal(openedPath(errorA, a), "docs/real.md");
+  assert.equal(openedPath(loadingPreview(errorA, a), a), "docs/real.md");
+});
+
+test("ArrowLeft from an index outside the rows is not a move", () => {
+  const rows = [{ id: "entry:a", type: "entry", entry: { path: "a", name: "a" }, directory: "" }];
+  assert.equal(treeKeyTarget(rows, 5, "ArrowLeft"), -1);
+  assert.equal(treeKeyTarget(rows, -1, "ArrowLeft"), -1);
 });
