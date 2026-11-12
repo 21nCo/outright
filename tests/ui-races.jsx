@@ -9970,19 +9970,20 @@ async function filesFocusRegression() {
   const filler = Array.from({ length: 80 }, (_, index) => file(`f-${String(index).padStart(3, "0")}.txt`));
   const many = Array.from({ length: 700 }, (_, index) => file(`many/m-${String(index).padStart(3, "0")}.txt`));
   const markdown = "# Notes\n\n[guide](docs/guide.md) [folder](docs) [gone](docs/gone.md) [flaky](flaky.md) [picture](picture.png)\n";
-  const previews = { "notes.md": { previewType: "markdown", text: markdown }, "docs/guide.md": { previewType: "markdown", text: "# Guide\n" },
+  const previews = { "notes.md": { previewType: "markdown", text: markdown }, "docs/guide.md": { previewType: "markdown", text: "# Guide\n\n[other](other.md)\n" }, "docs/other.md": { previewType: "markdown", text: "# Other\n" },
     "picture.png": { previewType: "image" }, "flaky.md": { previewType: "markdown", text: "# Flaky\n" } };
   const listings = [];
   const previewed = [];
   let flaky = 0;
   let slowListing = null;
+  let holdPreview = null;
   route = async (url) => {
     const parameters = Object.fromEntries(url.searchParams);
     if (url.pathname === "/api/files") {
       listings.push(parameters.dir);
       const page = (entries) => response({ entries, nextCursor: null, total: entries.length, remaining: 0, hiddenCount: 0, truncated: false });
       if (!parameters.dir) return page([folder("docs"), folder("many"), folder("slow"), file("notes.md"), ...filler]);
-      if (parameters.dir === "docs") return page([file("docs/guide.md")]);
+      if (parameters.dir === "docs") return page([file("docs/guide.md"), file("docs/other.md")]);
       if (parameters.dir === "slow") { await new Promise((resolve) => { slowListing = resolve; }); return page([folder("slow/deep")]); }
       if (parameters.dir === "many") {
         const start = parameters.cursor ? Number(parameters.cursor) : 0;
@@ -9994,7 +9995,8 @@ async function filesFocusRegression() {
     if (url.pathname === "/api/files/preview") {
       previewed.push(parameters.file);
       // As a runtime on Windows does, a backslash separates folders.
-      const path = parameters.file === "docs\\guide.md" ? "docs/guide.md" : parameters.file;
+      if (holdPreview && parameters.file === "docs\\other.md") await holdPreview;
+      const path = parameters.file.replaceAll("\\", "/");
       if (path === "docs") return response({ error: "docs is a folder", code: "IS_DIRECTORY" }, 400);
       if (path === "flaky.md" && (flaky += 1) === 1) return response({ error: "busy" }, 500);
       if (!previews[path]) return response({ error: `${path} no longer exists`, code: "MISSING" }, 404);
@@ -10087,6 +10089,33 @@ async function filesFocusRegression() {
     await until(() => selectedRow("docs/guide.md") && /Guide/.test(host.querySelector(".file-preview")?.textContent) && shown(row("entry:docs/guide.md")), `${typed} did not select its revealed row`);
     assert(document.activeElement === jump, `${typed} moved focus out of Go to file`);
   }
+  // Once the runtime answers, its path names the preview and is the base of its relative links.
+  assert(host.querySelector(".file-preview-header strong")?.title === "docs/guide.md", "docs\\guide.md was not labelled with the runtime's path");
+  previewed.length = 0;
+  await activate(link("other"));
+  await until(() => /Other/.test(host.querySelector(".file-preview")?.textContent), "a relative link in docs\\guide.md did not open docs/other.md");
+  assert(previewed.includes("docs/other.md"), `a relative link in docs\\guide.md previewed ${JSON.stringify(previewed)}`);
+  // A late answer for a path the runtime names differently selects that path but leaves focus on the row the user moved to.
+  let release;
+  holdPreview = new Promise((resolve) => { release = resolve; });
+  await go("docs\\other.md");
+  await until(() => previewed.includes("docs\\other.md"), "docs\\other.md was not asked for");
+  row("entry:notes.md").focus();
+  pressKey(row("entry:notes.md"), "ArrowDown");
+  await settle();
+  const userRow = document.activeElement;
+  assert(userRow !== row("entry:notes.md") && tree().contains(userRow), "ArrowDown did not move focus in the tree");
+  release();
+  holdPreview = null;
+  await until(() => selectedRow("docs/other.md") && /Other/.test(host.querySelector(".file-preview")?.textContent), "the late answer did not select docs/other.md");
+  await settle();
+  assert(document.activeElement === userRow, `a late answer moved focus from the user's row to ${document.activeElement?.outerHTML.slice(0, 80)}`);
+  // Refresh folder for a missing path with "\\" also refreshes the folder a Windows runtime would name.
+  listings.length = 0;
+  await go("docs\\gone.md");
+  await until(refreshFolder, "docs\\gone.md did not offer Refresh folder");
+  await activate(refreshFolder());
+  await until(() => listings.includes("docs") && document.activeElement === row("entry:docs"), `Refresh folder for docs\\gone.md read ${JSON.stringify(listings)}`);
   // A path longer than the runtime accepts is refused at once, with no read.
   listings.length = 0;
   previewed.length = 0;

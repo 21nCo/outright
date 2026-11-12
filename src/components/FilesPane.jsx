@@ -152,6 +152,9 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   // A newer reveal or a tree activation stops a reveal, with its scroll and pending focus move.
   const revealRef = useRef(0);
   const stopReveal = (id = shownIdRef.current) => { revealRef.current += 1; scrollRef.current = ""; moveRef.current = false; setFocusedId(id); };
+  // The file whose reveal waits for the runtime's answer (onResolved); the user's own tree action drops it.
+  const pendingOpenRef = useRef("");
+  const takeTree = (id) => { pendingOpenRef.current = ""; stopReveal(id); };
   // The row that had focus at the last commit, and whether focus is in the
   // tree. A row removed while focused leaves focus on the page body, with no
   // focus event in some browsers, so the last commit's focus is the evidence.
@@ -228,7 +231,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     const id = event.target.closest?.("[data-row-id]")?.dataset.rowId;
     const row = rows.find((candidate) => candidate.id === id);
     if (!row) return;
-    stopReveal(row.id);
+    takeTree(row.id);
     activate(row);
   };
   const onTreeKeyDown = (event) => {
@@ -239,7 +242,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     const index = focusedIndex >= 0 ? focusedIndex : activeIndex;
     const row = rows[index];
     if (!row) return;
-    if (["Enter", " ", "ArrowRight", "ArrowLeft"].includes(event.key) || treeKeyTarget(rows, index, event.key) >= 0) stopReveal(row.id);
+    if (["Enter", " ", "ArrowRight", "ArrowLeft"].includes(event.key) || treeKeyTarget(rows, index, event.key) >= 0) takeTree(row.id);
     if (event.key === "Enter" || event.key === " ") { event.preventDefault(); activate(row); return; }
     if (event.key === "ArrowRight" && row.expandable && !row.open) { event.preventDefault(); toggleFolder(row.entry.path, true); return; }
     if (event.key === "ArrowLeft" && row.expandable && row.open) { event.preventDefault(); toggleFolder(row.entry.path, false); return; }
@@ -279,10 +282,17 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     if (!revealable(file)) { setAnnouncement("That path is too long or invalid to open"); return; }
     setAnnouncement(`Opening ${file}`);
     keepFocus();
+    pendingOpenRef.current = file;
     if (file.includes("\\")) stopReveal(); else void reveal(file, false); // On Windows "\\" separates folders: revealed in onResolved.
     setSelected(file);
   }, [reveal, keepFocus]);
-  const onResolved = useCallback((file, path) => { if (path !== file || file.includes("\\")) { setResolved({ file, path }); void reveal(path, false); } }, [reveal]);
+  // The tree selects the runtime's path; it is revealed only for an open that nothing has superseded.
+  const onResolved = useCallback((file, path) => {
+    const owned = pendingOpenRef.current === file;
+    pendingOpenRef.current = "";
+    if (path !== file) setResolved({ file, path });
+    if (owned && (path !== file || file.includes("\\"))) void reveal(path, false);
+  }, [reveal]);
 
   const revealFolder = useCallback((path) => {
     setSelected((current) => (current === path ? "" : current));
@@ -291,11 +301,14 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     void reveal(path, true);
   }, [reveal, keepFocus]);
 
+  // A path the runtime never named may separate folders with "\\" (Windows): that folder is refreshed too when shown.
   const refreshFolderOf = useCallback((file) => {
-    const directory = ancestorsOf(file).at(-1) ?? "";
+    const parents = [file, file.replaceAll("\\", "/")].map((path) => ancestorsOf(path).at(-1) ?? "");
+    const directories = [...new Set(parents)].filter((directory, index) => !index || foldersRef.current.has(directory));
+    const directory = directories.at(-1);
     keepFocus();
     if (directory) moveFocus(`entry:${directory}`);
-    void loadFolder(directory);
+    for (const each of directories) void loadFolder(each);
     setSelected("");
     setAnnouncement(`Refreshed ${directory || "the worktree root"}`);
   }, [loadFolder, keepFocus, moveFocus]);
