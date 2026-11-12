@@ -40,6 +40,8 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   // collapse on refresh or unmount aborts its requests.
   const controllersRef = useRef(new Map());
   const abortListing = (directory) => { controllersRef.current.get(directory)?.abort(); controllersRef.current.delete(directory); };
+  // The read in flight for each folder, with the reveal (find, active) it serves.
+  const readsRef = useRef(new Map());
   useEffect(() => { aliveRef.current = true; return () => { aliveRef.current = false; for (const controller of controllersRef.current.values()) controller.abort(); }; }, []);
 
   const reportable = (error) => error.status === 429 || (error.status >= 500 && error.payload?.code !== "LISTING_UNAVAILABLE");
@@ -48,8 +50,12 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   // to list that many entries again, installed together. Each read starts a
   // new listing generation: an older read or a "load more" from an older
   // listing is dropped. The shown entries stay until the new ones arrive.
-  const loadFolder = useCallback(async (directory, { keep = 0, find = "", active } = {}) => {
+  const loadFolder = useCallback((directory, { keep = 0, find = "", active } = {}) => {
     if (typeof directory !== "string") return;
+    // A reload replacing a reveal's read keeps looking for its target, and the reveal waits on it.
+    const prior = readsRef.current.get(directory);
+    const reload = !active && Boolean(prior?.active?.());
+    if (reload) ({ find, active } = prior);
     const generation = (tokensRef.current.get(directory) ?? 0) + 1;
     tokensRef.current.set(directory, generation);
     abortListing(directory);
@@ -59,7 +65,8 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     const fresh = () => aliveRef.current && tokensRef.current.get(directory) === generation;
     // A superseded reveal stops paging; the pages read so far are installed.
     const wanted = () => (!active || active() ? find : "");
-    try {
+    const replacement = () => { const next = readsRef.current.get(directory); return active && next?.active === active && next.generation > generation ? next.promise : undefined; };
+    const promise = (async () => { try {
       const read = (cursor) => api(query("/api/files", { projectId: project.id, path: worktree.path, dir: directory, cursor, hidden: hidden ? "true" : undefined,
         limit: find ? MAX_PAGE_SIZE : keep > PAGE_SIZE ? Math.min(keep, MAX_PAGE_SIZE) : undefined }), { signal });
       const page = await read();
@@ -68,17 +75,38 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
         Object.assign(page, await read(page.nextCursor));
         entries = [...entries, ...page.entries];
       }
-      if (!fresh()) return;
+      if (!fresh()) return replacement();
+      readsRef.current.delete(directory);
       setFolders((current) => withFolder(current, directory, { status: "loaded", generation, hidden, entries,
         nextCursor: page.nextCursor, total: page.total, remaining: page.remaining, hiddenCount: page.hiddenCount, truncated: page.truncated, scanLimit: page.scanLimit }));
       if (wanted() && !entries.some((entry) => entry.path === find)) setAnnouncement(`${find} is not ${page.nextCursor || page.truncated ? `in the first ${entries.length} entries of` : "in"} ${directory || "the worktree root"}`);
       return entries;
     } catch (error) {
-      if (!fresh()) return;
+      if (!fresh()) return replacement();
+      readsRef.current.delete(directory);
       if (reportable(error)) onErrorRef.current(error);
       setFolders((current) => withFolder(current, directory, { status: "error", error: { message: error.message, code: error.payload?.code ?? "" } }));
-    }
+    } })();
+    readsRef.current.set(directory, { generation, find, active, reload, promise });
+    return promise;
   }, [project.id, worktree.path]);
+
+  // Ends a folder's read in flight, which a stopped reveal or a collapse no longer
+  // wants: its answer is dropped, and the listing shown before stays (`keepShown`)
+  // or the folder is read afresh when next opened.
+  const dropListing = (directory, keepShown) => {
+    const shown = foldersRef.current.get(directory);
+    if ((!readsRef.current.has(directory) && !shown?.loadingMore) || (keepShown && !shown?.entries)) return false;
+    readsRef.current.delete(directory);
+    const generation = (tokensRef.current.get(directory) ?? 0) + 1;
+    tokensRef.current.set(directory, generation);
+    abortListing(directory);
+    controllersRef.current.set(directory, new AbortController());
+    setFolders((current) => { const next = new Map(current); if (keepShown) next.set(directory, { ...current.get(directory), status: "loaded", loadingMore: false, generation }); else next.delete(directory); return next; });
+    return true;
+  };
+  // A reload's read stays: it was asked for in its own right.
+  const dropReveal = () => { for (const [directory, read] of readsRef.current) if (read.active && !read.reload) dropListing(directory, true); };
 
   // Reads the next page of the listing that is shown, with that listing's
   // cursor and hidden-file policy. It never supersedes a first-page read.
@@ -105,7 +133,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   // as each folder had loaded; a hidden-file change starts from page one.
   const reloadAll = useCallback(({ keepPages = false } = {}) => {
     for (const directory of foldersRef.current.keys()) {
-      if (directory && !expandedRef.current.has(directory)) { tokensRef.current.set(directory, (tokensRef.current.get(directory) ?? 0) + 1); abortListing(directory); }
+      if (directory && !expandedRef.current.has(directory)) { tokensRef.current.set(directory, (tokensRef.current.get(directory) ?? 0) + 1); abortListing(directory); readsRef.current.delete(directory); }
     }
     const loaded = foldersRef.current;
     setFolders((current) => new Map([...current].filter(([directory]) => !directory || expandedRef.current.has(directory))));
@@ -151,7 +179,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   const scrollRef = useRef("");
   // A newer reveal or a tree activation stops a reveal, with its scroll and pending focus move.
   const revealRef = useRef(0);
-  const stopReveal = (id = shownIdRef.current) => { revealRef.current += 1; scrollRef.current = ""; moveRef.current = false; setFocusedId(id); };
+  const stopReveal = (id = shownIdRef.current) => { revealRef.current += 1; dropReveal(); scrollRef.current = ""; moveRef.current = false; setFocusedId(id); };
   // The file whose reveal waits for the runtime's answer (onResolved); the user's own tree action drops it.
   const pendingOpenRef = useRef("");
   const takeTree = (id) => { pendingOpenRef.current = ""; stopReveal(id); };
@@ -209,9 +237,11 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
 
   const toggleFolder = useCallback((path, open) => {
     if (!isFolderPath(path)) return;
+    // A collapse ends the reads in flight under it; those folders close, and are read afresh when opened.
+    const dropped = open ? [] : [...foldersRef.current.keys()].filter((directory) => (directory === path || directory.startsWith(`${path}/`)) && dropListing(directory, false));
     setExpanded((current) => {
       const next = new Set(current);
-      if (open) next.add(path); else next.delete(path);
+      if (open) next.add(path); else for (const each of [path, ...dropped]) next.delete(each);
       return next;
     });
     const folder = foldersRef.current.get(path);
@@ -258,6 +288,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   // until it lists the next step (revealPath), and opens `path` with `open`.
   // Only folders found are opened; a failed reveal leaves no scroll or focus move armed.
   const reveal = useCallback(async (path, open) => {
+    dropReveal();
     const generation = ++revealRef.current;
     const active = () => aliveRef.current && revealRef.current === generation;
     const expand = (paths) => setExpanded((current) => new Set([...current, ...paths]));
@@ -285,13 +316,14 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     setAnnouncement(`Opening ${file}`);
     keepFocus();
     pendingOpenRef.current = file;
-    if (file.includes("\\")) stopReveal(); else void reveal(file, false); // On Windows "\\" separates folders: revealed in onResolved.
+    // The runtime already named this path (a repeated open gets no new answer); on Windows "\\" separates folders: revealed in onResolved.
+    if (resolved.file === file) void reveal(resolved.path, false); else if (file.includes("\\")) stopReveal(); else void reveal(file, false);
     setSelected(file);
-  }, [reveal, keepFocus]);
+  }, [reveal, keepFocus, resolved]);
   // The tree selects the runtime's path; it is revealed only for an open that nothing has superseded.
   const onResolved = useCallback((file, path) => {
     const owned = claimOpen(file);
-    if (path !== file) setResolved({ file, path });
+    setResolved({ file, path });
     if (owned && (path !== file || file.includes("\\"))) void reveal(path, false);
   }, [reveal]);
 
@@ -303,17 +335,15 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     if (owned) void reveal(path, true);
   }, [reveal, keepFocus]);
 
-  // A path the runtime never named may separate folders with "\\" (Windows): that folder is refreshed too when shown.
+  // A Windows runtime, whose worktree path has a drive or UNC prefix, also separates folders with "\\"; elsewhere it is part of a name.
   const refreshFolderOf = useCallback((file) => {
-    const parents = [file, file.replaceAll("\\", "/")].map((path) => ancestorsOf(path).at(-1) ?? "");
-    const directories = [...new Set(parents)].filter((directory, index) => !index || foldersRef.current.has(directory));
-    const directory = directories.at(-1);
+    const directory = ancestorsOf(/^([A-Za-z]:|\\\\)/.test(worktree.path) ? file.replaceAll("\\", "/") : file).at(-1) ?? "";
     keepFocus();
     if (directory) moveFocus(`entry:${directory}`);
-    for (const each of directories) void loadFolder(each);
+    void loadFolder(directory);
     setSelected("");
     setAnnouncement(`Refreshed ${directory || "the worktree root"}`);
-  }, [loadFolder, keepFocus, moveFocus]);
+  }, [loadFolder, keepFocus, moveFocus, worktree.path]);
 
   useEffect(() => {
     if (!quickOpen) return;

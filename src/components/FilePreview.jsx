@@ -44,6 +44,8 @@ class PreviewBoundary extends Component {
 // asked for, so a slow answer for an earlier selection is never shown. A
 // refresh keeps the shown preview until its answer arrives, and keeps it
 // as it is (scroll, PDF page) only when the answer shows the same thing.
+const FILE_STATES = new Set(["MISSING", "BROKEN_LINK", "OUTSIDE_WORKTREE", "PATH_OUTSIDE", "LINK_LOOP", "EXCLUDED", "UNREADABLE", "PREVIEW_UNAVAILABLE"]);
+
 export function FilePreview({ project, worktree, file, refreshKey, settings, onNavigate, onResolved, onFolder, onRefreshFolder, onError }) {
   const [state, setState] = useState({ status: "loading", file });
   const [mode, setMode] = useState("rendered");
@@ -73,6 +75,8 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
       .catch((error) => {
         if (!current) return;
         if (error.payload?.code === "IS_DIRECTORY") { onFolder?.(file); return; }
+        // A background refresh that fails for a passing reason (network, server) keeps the shown preview; one that names the file's state replaces it.
+        if (background && !FILE_STATES.has(error.payload?.code)) { onError?.(error); return; }
         setState((prior) => ({ status: "error", file, path: prior.path, code: error.payload?.code ?? "", message: error.message }));
       });
     return () => { current = false; controller.abort(); };

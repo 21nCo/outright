@@ -739,8 +739,7 @@ export function App() {
   const noteRunEnded = useCallback(async (conversationId) => {
     if (!filesShownRef.current) return;
     const [projectId, worktreeId] = [selectedProjectRef.current, selectedWorktreeRef.current];
-    const listChats = (archived) => api(query("/api/conversations", { projectId, worktreeId, archived: archived ? "true" : undefined })).then((result) => result.conversations);
-    const owned = await worktreeOwnsChat(conversationId, conversationsRef.current.filter((chat) => chat.worktreeId === worktreeId), listChats);
+    const owned = await worktreeOwnsChat(conversationId, { projectId, worktreeId }, conversationsRef.current, (id) => api(`/api/conversations/${encodeURIComponent(id)}`));
     if (owned && selectedProjectRef.current === projectId && selectedWorktreeRef.current === worktreeId) setFilesCompletions((count) => count + 1);
   }, []);
   const handleRuntimeEvent = useCallback((event) => {
@@ -972,9 +971,9 @@ export function App() {
       // On macOS only ⌘P: Ctrl+P moves up a line in a text field there.
       const quickOpenKey = APPLE_PLATFORM ? event.metaKey && !event.ctrlKey : event.metaKey || event.ctrlKey;
       if (quickOpenKey && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "p") {
-        event.preventDefault();
-        // The open drawer or a dialog owns the keyboard; the workspace is inert.
+        // The open drawer or a dialog owns the keyboard; the workspace is inert and the key keeps its browser action (Print).
         if (!paneLayoutRef.current || (isNarrow && sidebarOpen) || document.querySelector('[role="dialog"][data-open]:not(#project-sidebar)')) return;
+        event.preventDefault();
         paneLayoutRef.current?.open("files");
         setQuickOpenRequest((value) => value + 1);
       }

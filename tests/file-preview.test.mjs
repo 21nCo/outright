@@ -460,20 +460,33 @@ test("a folder read pages on to keep its shown entries or reach the target, and 
   assert.equal(needsPage(entries(10)), false);
 });
 
-test("a run that ends in an open or archived chat of the shown worktree refreshes Files; one elsewhere does not", async () => {
-  const asked = [];
-  const lists = { false: [{ id: "open-2" }], true: [{ id: "archived-1" }] };
-  const listChats = (archived) => { asked.push(archived); return Promise.resolve(lists[archived]); };
-  // An open chat is known without asking.
-  assert.equal(await worktreeOwnsChat("open-1", [{ id: "open-1" }], listChats), true);
-  assert.deepEqual(asked, []);
-  // A chat archived while its run finished is not among the open chats.
-  assert.equal(await worktreeOwnsChat("archived-1", [{ id: "open-1" }], listChats), true);
-  // A chat opened since the open chats were read.
-  assert.equal(await worktreeOwnsChat("open-2", [], listChats), true);
-  assert.equal(await worktreeOwnsChat("other-worktree", [{ id: "open-1" }], listChats), false);
-  // A list that cannot be read is no evidence of ownership.
-  assert.equal(await worktreeOwnsChat("archived-1", [], () => Promise.reject(new Error("offline"))), false);
-  // One list that cannot be read does not hide a match in the other.
-  assert.equal(await worktreeOwnsChat("archived-1", [], (archived) => archived ? Promise.resolve(lists.true) : Promise.reject(new Error("offline"))), true);
+test("a run that ends in an open or archived chat of the shown worktree refreshes Files; one elsewhere does not, and no lookup reads a chat list", async () => {
+  const shown = { projectId: "p", worktreeId: "w" };
+  const stored = new Map([["archived-1", { id: "archived-1", projectId: "p", worktreeId: "w", archived: true }], ["elsewhere", { id: "elsewhere", projectId: "p", worktreeId: "other" }],
+    ["other-project", { id: "other-project", projectId: "q", worktreeId: "w" }]]);
+  const read = [];
+  // One chat is read by its id: the cost is the same however many chats were archived.
+  const readChat = (id) => { read.push(id); return stored.has(id) ? Promise.resolve(stored.get(id)) : Promise.reject(Object.assign(new Error("Conversation not found"), { status: 404 })); };
+  const known = [{ id: "open-1", projectId: "p", worktreeId: "w" }, { id: "open-elsewhere", projectId: "p", worktreeId: "other" }];
+  // A listed chat is known without asking, in this worktree or another.
+  assert.equal(await worktreeOwnsChat("open-1", shown, known, readChat), true);
+  assert.equal(await worktreeOwnsChat("open-elsewhere", shown, known, readChat), false);
+  assert.deepEqual(read, []);
+  // A chat archived while its run finished is not listed, and is read alone.
+  assert.equal(await worktreeOwnsChat("archived-1", shown, known, readChat), true);
+  assert.equal(await worktreeOwnsChat("elsewhere", shown, known, readChat), false);
+  assert.equal(await worktreeOwnsChat("other-project", shown, known, readChat), false);
+  assert.deepEqual(read, ["archived-1", "elsewhere", "other-project"]);
+  // A chat that cannot be read, or no longer exists, is no evidence of ownership.
+  assert.equal(await worktreeOwnsChat("gone", shown, known, readChat), false);
+  assert.equal(await worktreeOwnsChat("archived-1", shown, [], () => Promise.reject(new Error("offline"))), false);
+});
+
+test("a run of three emphasis delimiters nests strong and emphasis either way round", () => {
+  assert.deepEqual(parseInline("***x***"), [{ type: "strong", children: [{ type: "emphasis", children: [{ type: "text", value: "x" }] }] }]);
+  assert.deepEqual(parseInline("___x___"), [{ type: "strong", children: [{ type: "emphasis", children: [{ type: "text", value: "x" }] }] }]);
+  assert.deepEqual(parseInline("***x** y*"), [{ type: "emphasis", children: [{ type: "strong", children: [{ type: "text", value: "x" }] }, { type: "text", value: " y" }] }]);
+  // A run of two is unchanged: its closer takes the first two of a longer run.
+  assert.deepEqual(parseInline("**a***"), [{ type: "strong", children: [{ type: "text", value: "a" }] }, { type: "text", value: "*" }]);
+  assert.deepEqual(parseInline("a ***b*** c **d**").map((node) => node.type), ["text", "strong", "text", "strong"]);
 });

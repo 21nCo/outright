@@ -8888,8 +8888,13 @@ async function responsiveFocusRegression() {
     const terminalPane = host.querySelector("#pane-terminal");
     assert(conversationPane.inert && getComputedStyle(conversationPane).visibility === "hidden", `The narrow layout showed two panes at once: ${describePaneState()}`);
     const terminalRect = terminalPane.getBoundingClientRect();
+    // What moved the pane, if anything: a scrolled or transformed ancestor, or a menu still on screen.
+    const displacement = () => [...(function* ancestors(element) { for (; element; element = element.parentElement) yield element; })(terminalPane)]
+      .filter((element) => element.scrollLeft || element.scrollTop || getComputedStyle(element).transform !== "none")
+      .map((element) => `${element.tagName.toLowerCase()}#${element.id}.${[...element.classList].join(".")} scroll=${element.scrollLeft},${element.scrollTop} transform=${getComputedStyle(element).transform}`)
+      .concat([...document.querySelectorAll('[role="menu"]')].map((menu) => `menu ${JSON.stringify(menu.getBoundingClientRect().toJSON())} ${getComputedStyle(menu).transform}`)).join("; ");
     assert(terminalRect.left >= -1 && terminalRect.right <= window.innerWidth + 1 && terminalRect.width >= window.innerWidth - 2,
-      `The narrow terminal pane does not use the viewport width: ${JSON.stringify(terminalRect.toJSON())}`);
+      `The narrow terminal pane does not use the viewport width: ${JSON.stringify(terminalRect.toJSON())}; ${displacement()}`);
     const terminalInput = host.querySelector(".terminal-host .xterm-helper-textarea");
     assert(terminalInput, "Terminal input did not mount");
     await until(() => host.querySelector('.terminal-tabs [role="tab"][aria-selected="true"]'), "active terminal for Escape input");
@@ -10110,12 +10115,19 @@ async function filesFocusRegression() {
   await until(() => selectedRow("docs/other.md") && /Other/.test(host.querySelector(".file-preview")?.textContent), "the late answer did not select docs/other.md");
   await settle();
   assert(document.activeElement === userRow, `a late answer moved focus from the user's row to ${document.activeElement?.outerHTML.slice(0, 80)}`);
-  // Refresh folder for a missing path with "\\" also refreshes the folder a Windows runtime would name.
+  // Go to file again for that path, once its folder is collapsed, gets no new answer: it reveals the path the runtime named.
+  await activate(row("entry:docs"));
+  await until(() => !row("entry:docs/other.md"), "docs did not collapse");
+  await go("docs\\other.md");
+  await until(() => row("entry:docs/other.md") && selectedRow("docs/other.md"), "a repeated Go to file for docs\\other.md did not reveal docs/other.md");
+  // On a POSIX runtime (the worktree path has no drive) "\\" is part of a name: Refresh folder for a
+  // missing root file docs\\gone.md reads the root alone, though docs is shown too.
   listings.length = 0;
   await go("docs\\gone.md");
   await until(refreshFolder, "docs\\gone.md did not offer Refresh folder");
   await activate(refreshFolder());
-  await until(() => listings.includes("docs") && document.activeElement === row("entry:docs"), `Refresh folder for docs\\gone.md read ${JSON.stringify(listings)}`);
+  await until(() => listings.some((dir) => !dir) && /Refreshed the worktree root/.test(pane().querySelector('[role="status"]')?.textContent), `Refresh folder for docs\\gone.md read ${JSON.stringify(listings)}`);
+  assert(!listings.includes("docs") && pane().contains(document.activeElement), `Refresh folder for the root file docs\\gone.md read ${JSON.stringify(listings)} with focus on ${document.activeElement?.outerHTML.slice(0, 80)}`);
   // A late folder answer to an open the user superseded in the tree neither reveals the folder nor takes focus.
   holdPreview = { file: "docs", promise: new Promise((resolve) => { release = resolve; }) };
   await go("docs");
@@ -10146,6 +10158,23 @@ async function filesFocusRegression() {
   await until(() => row("entry:slow/deep"), "slow was not listed");
   await settle();
   assert(!listings.includes("slow/deep") && document.activeElement === row("entry:notes.md"), `a tree activation left the reveal running: ${JSON.stringify(listings)}, focus ${document.activeElement?.outerHTML.slice(0, 80)}`);
+
+  // On a Windows runtime (its worktree path has a drive) "\\" separates folders: Refresh folder for docs\\gone.md reads docs and focuses its row.
+  root.render(null);
+  await settle();
+  root.render(<TooltipProvider><div style={{ width: 720, height: 360 }}><FilesPane project={project} worktree={{ ...worktree, path: "C:\\fixture\\A" }} settings={{ editor: "code" }} completions={0} quickOpen={0} onError={() => {}} /></div></TooltipProvider>);
+  await until(() => row("entry:docs"), "the Windows worktree root was not listed");
+  await activate(row("entry:docs"));
+  await until(() => row("entry:docs/guide.md"), "docs was not listed in the Windows worktree");
+  const windowsJump = host.querySelector(".files-jump input");
+  windowsJump.focus();
+  setControlValue(windowsJump, "docs\\gone.md");
+  windowsJump.form.requestSubmit();
+  await until(refreshFolder, "docs\\gone.md did not offer Refresh folder in the Windows worktree");
+  listings.length = 0;
+  await activate(refreshFolder());
+  await until(() => listings.includes("docs") && document.activeElement === row("entry:docs"), `Refresh folder for docs\\gone.md in a Windows worktree read ${JSON.stringify(listings)}`);
+  assert(!listings.some((dir) => !dir), `Refresh folder for docs\\gone.md in a Windows worktree also read the root: ${JSON.stringify(listings)}`);
 }
 
 // The Files behaviours inherited from OUT-18: ⌘P opens Go to file only while
@@ -10168,23 +10197,35 @@ async function filesInheritedRegression() {
   const signalOf = (kind, key) => requests.findLast((request) => request.kind === kind && request.key === key)?.signal;
   const listed = (key) => requests.filter((request) => request.kind === "list" && request.key === key).length;
   const archived = { ...chats.A, id: "chat-archived", title: "Archived chat", archived: true };
+  const big = Array.from({ length: 3500 }, (_, index) => file(`big/${String(index).padStart(4, "0")}`));
+  const answers = new Map();
   let bootstrap = deferred();
   route = async (url, options = {}) => {
     const parameters = Object.fromEntries(url.searchParams);
     if (url.pathname === "/api/bootstrap") return bootstrap.promise;
-    if (url.pathname === "/api/conversations") return response({ conversations: parameters.archived === "true" ? [archived] : [chats.A] });
+    if (url.pathname === "/api/conversations") { requests.push({ kind: "chat list", key: parameters.archived ?? "" }); return response({ conversations: parameters.archived === "true" ? [archived] : [chats.A] }); }
     if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
+    // An archived chat, or another worktree's, is read alone; its lists are not.
+    if (url.pathname === "/api/conversations/chat-archived") return response(archived);
+    if (url.pathname === "/api/conversations/chat-elsewhere") return response({ ...chats.A, id: "chat-elsewhere", worktreeId: "A-other" });
     if (url.pathname === "/api/files") {
       const directory = parameters.dir ?? "";
-      requests.push({ kind: "list", key: directory, signal: options.signal });
-      if (holds.has(`list:${directory}`)) return held(options.signal);
-      if (!directory) return page([folder("docs"), folder("slow"), file("a.md"), file("b.md"), file("picture.png"), file("huge.png")]);
+      requests.push({ kind: "list", key: directory, cursor: parameters.cursor ?? "0", signal: options.signal });
+      if (holds.has(`list:${directory}`) || holds.has(`list:${directory}@${parameters.cursor ?? "0"}`)) return held(options.signal);
+      if (!directory) return page([folder("big"), folder("docs"), folder("wide"), folder("nest"), folder("slow"), file("a.md"), file("b.md"), file("picture.png"), file("huge.png")]);
       if (directory === "docs") return page([file("docs/guide.md")]);
+      if (directory === "nest") return page([folder("nest/inner")]);
+      if (directory === "nest/inner") return page([file("nest/inner/x.md")]);
+      if (directory === "big" || directory === "wide") {
+        const start = Number(parameters.cursor ?? 0), end = start + Number(parameters.limit ?? 200);
+        return response({ entries: big.slice(start, end).map((entry) => file(entry.path.replace("big", directory))), nextCursor: end < big.length ? String(end) : null, total: big.length, remaining: Math.max(0, big.length - end), hiddenCount: 0, truncated: false });
+      }
       return response({ error: "missing", code: "MISSING" }, 404);
     }
     if (url.pathname === "/api/files/preview") {
       requests.push({ kind: "preview", key: parameters.file, signal: options.signal });
       if (holds.has(`preview:${parameters.file}`)) return held(options.signal);
+      if (answers.has(parameters.file)) return answers.get(parameters.file)();
       if (parameters.file === "huge.png") return response({ path: "huge.png", name: "huge.png", version: "v1", size: 8, link: null, previewType: "oversized", width: 9000, height: 9000, pixelLimit: 1000, reason: "The image is 9000 × 9000 pixels, over the preview limit of 1000 pixels" });
       const image = parameters.file === "picture.png";
       return response({ path: parameters.file, name: parameters.file, version: "v1", size: 8, link: null, previewType: image ? "image" : "markdown", text: image ? undefined : "# Note\n" });
@@ -10208,7 +10249,8 @@ async function filesInheritedRegression() {
     // ⌘P while the runtime is still loading does nothing, now or later.
     root.render(<TooltipProvider><App /></TooltipProvider>);
     await until(() => host.querySelector(".loading-screen"), "the loading screen was not shown");
-    quickOpen();
+    // While ⌘P does nothing, it keeps its browser action (Print): the key is not consumed.
+    assert(!quickOpen().defaultPrevented, "⌘P on the loading screen took the key from the browser's Print");
     bootstrap.resolve(response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] }));
     await until(() => host.querySelector('textarea[aria-label="Message the agent"]') && filesToggle(), "the workspace did not load");
     await settle();
@@ -10217,7 +10259,7 @@ async function filesInheritedRegression() {
 
     // ⌘P opens Files and focuses Go to file.
     host.querySelector('textarea[aria-label="Message the agent"]').focus();
-    quickOpen();
+    assert(quickOpen().defaultPrevented, "⌘P that opens Go to file left the key to the browser's Print");
     await until(() => host.querySelector(".files-pane") && document.activeElement === jumpField(), "⌘P did not focus Go to file");
     await toggleFiles(false);
 
@@ -10225,7 +10267,7 @@ async function filesInheritedRegression() {
     host.querySelector('[aria-label="New chat tab"]').click();
     const dialog = () => document.querySelector('[role="dialog"][data-open]:not(#project-sidebar)');
     await until(() => dialog()?.contains(document.activeElement), "the New chat dialog did not take focus");
-    quickOpen();
+    assert(!quickOpen().defaultPrevented, "⌘P in a dialog took the key from the browser's Print");
     await settle();
     assert(!host.querySelector(".files-pane") && dialog()?.contains(document.activeElement), "⌘P in a dialog opened Files or took focus from the dialog");
     pressKey(document.activeElement, "Escape");
@@ -10239,7 +10281,7 @@ async function filesInheritedRegression() {
       await until(() => host.querySelector('[aria-label="Open projects sidebar"]'), "the narrow layout did not close the drawer");
       host.querySelector('[aria-label="Open projects sidebar"]').click();
       await until(() => host.querySelector("#main-workspace")?.hasAttribute("inert") && host.querySelector("#project-sidebar").contains(document.activeElement), "the narrow drawer did not open");
-      quickOpen();
+      assert(!quickOpen().defaultPrevented, "⌘P in the narrow drawer took the key from the browser's Print");
       await settle();
       assert(!host.querySelector(".files-pane") && host.querySelector("#project-sidebar").contains(document.activeElement), "⌘P in the narrow drawer opened Files or took focus from the drawer");
       window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
@@ -10257,11 +10299,13 @@ async function filesInheritedRegression() {
     row("entry:docs").click();
     await until(() => row("entry:docs/guide.md"), "docs was not listed");
     const send = (conversationId, type) => fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId, runId: `run-${conversationId}-${type}`, payload: { type } }) }));
+    const chatLists = () => requests.filter((request) => request.kind === "chat list").length;
     for (const [conversationId, type, owned] of [["chat-elsewhere", "run.completed", false], ["chat-archived", "run.failed", true], ["chat-A", "run.stopped", true]]) {
-      const before = [listed(""), listed("docs")];
+      const before = [listed(""), listed("docs"), chatLists()];
       send(conversationId, type);
       if (owned) await until(() => listed("") > before[0] && listed("docs") > before[1], `a run that ended in ${conversationId} did not re-list the shown folders`);
       else await remainsTrue(() => listed("") === before[0] && listed("docs") === before[1], 900, `a run that ended in ${conversationId} re-listed the shown folders`);
+      assert(chatLists() === before[2], `deciding whether ${conversationId} is this worktree's read ${chatLists() - before[2]} chat lists`);
     }
   } finally { if (window.__fixtureSetViewport) await window.__fixtureSetViewport(1280); }
 
@@ -10284,7 +10328,8 @@ async function filesInheritedRegression() {
   Element.prototype.setAttribute = function (name, value) { return setAttribute.call(this, name, this instanceof HTMLImageElement && name === "src" ? stand(this, value) : value); };
   Object.defineProperty(HTMLImageElement.prototype, "src", { ...source, set(value) { source.set.call(this, stand(this, value)); } });
   try {
-    root.render(<TooltipProvider><div style={{ width: 720, height: 360 }}><FilesPane project={project} worktree={worktree} settings={{ editor: "code" }} completions={0} quickOpen={0} onError={() => {}} /></div></TooltipProvider>);
+    const mount = (completions) => root.render(<TooltipProvider><div style={{ width: 720, height: 360 }}><FilesPane project={project} worktree={worktree} settings={{ editor: "code" }} completions={completions} quickOpen={0} onError={() => {}} /></div></TooltipProvider>);
+    mount(0);
     await until(() => row("entry:docs"), "the standalone root was not listed");
     const asked = (kind, key) => requests.filter((request) => request.kind === kind && request.key === key).length;
     // A row click selects its file before anything else is checked.
@@ -10292,6 +10337,84 @@ async function filesInheritedRegression() {
       row(`entry:${path}`).click();
       await until(() => row(`entry:${path}`)?.getAttribute("aria-selected") === "true" && asked("preview", path), `${path} was not selected and asked for`);
     };
+    const field = () => host.querySelector(".files-jump input");
+    const jumpTo = async (path) => { field().focus(); setControlValue(field(), path); field().form.requestSubmit(); await settle(); };
+    const pages = (directory) => requests.filter((request) => request.kind === "list" && request.key === directory).map((request) => request.cursor);
+    const inView = (element) => { const box = element.getBoundingClientRect(), view = host.querySelector(".file-tree").getBoundingClientRect(); return box.top >= view.top - 1 && box.bottom <= view.bottom + 1; };
+
+    // (a) A reveal stopped from the tree ends its read at once: the page in
+    // flight is aborted, no later page is asked for, and the folder keeps the
+    // entries it showed, not loading.
+    row("entry:big").click();
+    await until(() => row("entry:big/0199") && row("more:big"), "big did not list its first page");
+    holds.add("list:big@500");
+    await jumpTo("big/1800");
+    await until(() => pages("big").includes("500"), `the reveal of big/1800 did not page big: ${pages("big")}`);
+    const paging = signalOf("list", "big");
+    row("entry:a.md").focus();
+    pressKey(row("entry:a.md"), "ArrowDown");
+    await settle();
+    assert(paging?.aborted === true, "a reveal stopped from the tree left its page request running");
+    holds.delete("list:big@500");
+    const pagesAsked = pages("big").length;
+    await remainsTrue(() => pages("big").length === pagesAsked, 300, `a stopped reveal kept paging big: ${pages("big")}`);
+    assert(row("entry:big/0199") && !row("entry:big/0500") && /Load 200 more/.test(row("more:big")?.textContent ?? ""), `a stopped reveal did not leave big's shown entries: ${row("more:big")?.textContent}`);
+
+    // (b) Refresh files, or the refresh after an owned run ends, replaces the
+    // read of a reveal still wanted; the reveal ends on its target, scrolled
+    // into view, with focus kept in Go to file.
+    for (const [directory, replace] of [["big", refreshFiles], ["wide", () => mount(1)]]) {
+      const target = `${directory}/1800`;
+      if (!row(`more:${directory}`)) { row(`entry:${directory}`).click(); await until(() => row(`more:${directory}`), `${directory} did not list its first page`); }
+      holds.add(`list:${directory}@500`);
+      const before = pages(directory).length;
+      await jumpTo(target);
+      await until(() => pages(directory).slice(before).includes("500"), `the reveal of ${target} did not page: ${pages(directory)}`);
+      holds.delete(`list:${directory}@500`);
+      replace();
+      await until(() => row(`entry:${target}`) && inView(row(`entry:${target}`)), `a refresh during the reveal of ${target} dropped it`);
+      assert(document.activeElement === field(), `the reveal of ${target} after a refresh moved focus to ${document.activeElement?.outerHTML.slice(0, 80)}`);
+    }
+
+    // (c) A collapse aborts the folder's read in flight, and a descendant's,
+    // at once; a late answer installs nothing and opening again reads anew.
+    holds.add("list:nest");
+    row("entry:nest").click();
+    await until(() => asked("list", "nest") === 1, "nest was not read");
+    const nestRead = signalOf("list", "nest");
+    row("entry:nest").click();
+    await settle();
+    assert(nestRead?.aborted === true && row("entry:nest").getAttribute("aria-expanded") === "false", "collapsing nest left its listing running");
+    holds.delete("list:nest");
+    row("entry:nest").click();
+    await until(() => asked("list", "nest") === 2 && row("entry:nest/inner"), "opening nest again did not read it anew");
+    holds.add("list:nest/inner");
+    row("entry:nest/inner").click();
+    await until(() => asked("list", "nest/inner") === 1, "nest/inner was not read");
+    const innerRead = signalOf("list", "nest/inner");
+    row("entry:nest").click();
+    await settle();
+    assert(innerRead?.aborted === true, "collapsing nest left the listing of nest/inner running");
+    holds.delete("list:nest/inner");
+    row("entry:nest").click();
+    await until(() => row("entry:nest/inner")?.getAttribute("aria-expanded") === "false", "nest/inner stayed open, waiting on its aborted read");
+    row("entry:nest/inner").click();
+    await until(() => asked("list", "nest/inner") === 2 && row("entry:nest/inner/x.md"), "opening nest/inner again did not read it anew");
+
+    // A background refresh that fails for a passing reason keeps the shown
+    // preview; one that says the file is gone replaces it.
+    await choose("a.md");
+    await until(() => /Note/.test(host.querySelector(".file-preview")?.textContent ?? ""), "a.md was not previewed");
+    answers.set("a.md", () => response({ error: "busy" }, 503));
+    const tries = asked("preview", "a.md");
+    refreshFiles();
+    await until(() => asked("preview", "a.md") > tries, "Refresh files did not ask for a.md again");
+    await settle();
+    assert(/Note/.test(host.querySelector(".file-preview")?.textContent ?? "") && !host.querySelector('.file-preview [role="alert"]'), `a passing refresh failure replaced the shown preview: ${host.querySelector(".file-preview")?.textContent}`);
+    answers.set("a.md", () => response({ error: "a.md no longer exists", code: "MISSING" }, 404));
+    refreshFiles();
+    await until(() => /no longer exists/.test(host.querySelector(".file-preview")?.textContent ?? ""), "a refresh that found a.md gone kept its preview");
+    answers.clear();
     holds.add("list:docs");
     row("entry:docs").click();
     await until(() => asked("list", "docs") === 1, "docs was not read");

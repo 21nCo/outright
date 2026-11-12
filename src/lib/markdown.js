@@ -377,10 +377,16 @@ function inline(text, start, end, context, depth) {
       const delimiter = text[index + 1] === character ? DOUBLE[character] : character === "~" ? null : character;
       const opens = delimiter && text[index + delimiter.length] && !SPACE.test(text[index + delimiter.length])
         && !(character === "_" && WORD.test(text[index - 1] ?? ""));
-      const close = opens ? closerAt(delimiter, index + delimiter.length) : -1;
-      if (close > index + delimiter?.length && close < end) {
-        const type = delimiter === "~~" ? "delete" : delimiter.length === 2 ? "strong" : "emphasis";
-        push({ type, children: inline(text, index + delimiter.length, close, context, depth + 1) }, close + delimiter.length);
+      let close = opens ? closerAt(delimiter, index + delimiter.length) : -1;
+      let width = delimiter?.length;
+      // A run of three opens both: "***x***" is strong around emphasis, "***x** y*" emphasis around strong.
+      if (width === 2 && character !== "~" && text[index + 2] === character && close > 0) {
+        const outer = text[close + 2] === character ? -1 : closerAt(character, close + 2);
+        if (outer < 0) close += text[close + 2] === character ? 1 : 0; else { close = outer; width = 1; }
+      }
+      if (close > index + width && close < end) {
+        const type = delimiter === "~~" ? "delete" : width === 2 ? "strong" : "emphasis";
+        push({ type, children: inline(text, index + width, close, context, depth + 1) }, close + width);
         continue;
       }
     }

@@ -166,11 +166,10 @@ export async function revealPath(folders, path, read, active, chain) {
   return true;
 }
 
-// Whether a run that ended in chat `id` may have changed the shown
-// worktree: the chat is one of its open chats, or its chat lists (archived
-// ones too, since a chat can be archived while its run finishes) name it.
-export async function worktreeOwnsChat(id, openChats, listChats) {
-  if (openChats.some((chat) => chat.id === id)) return true;
-  const lists = await Promise.allSettled([listChats(false), listChats(true)]);
-  return lists.some((list) => list.status === "fulfilled" && list.value.some((chat) => chat.id === id));
+// Whether a run that ended in chat `id` may have changed the shown worktree:
+// a listed chat answers at once; any other (archived while its run finished,
+// or another project's) is read alone, so the cost does not grow with history.
+export async function worktreeOwnsChat(id, { projectId, worktreeId }, knownChats, readChat) {
+  const chat = knownChats.find((known) => known.id === id) ?? await readChat(id).catch(() => null);
+  return chat?.projectId === projectId && chat?.worktreeId === worktreeId;
 }
