@@ -83,6 +83,7 @@ function parseBlocks(lines, depth, counter) {
     spend(counter, 1);
     const fence = FENCE.exec(line);
     if (fence) {
+      spend(counter, 1); // rendered as pre and code
       const closer = fence[1][0];
       const closes = (candidate) => {
         const trimmed = candidate.trimEnd();
@@ -110,8 +111,9 @@ function parseBlocks(lines, depth, counter) {
     if (ITEM_OPEN.test(line) && depth < MAX_DEPTH) { index = parseList(lines, index, depth, blocks, counter); continue; }
     const align = line.includes("|") ? tableAlignment(lines[index + 1], cells(line).length) : null;
     if (align) {
-      // Every row renders one cell per column, whatever it was written with.
-      spend(counter, align.length);
+      // Every row renders one cell per column, whatever it was written with;
+      // the table also renders a wrapper, table, thead, its row and tbody.
+      spend(counter, align.length + 4);
       const head = cells(line).map((cell) => parseInline(cell, counter));
       const rows = [];
       index += 2;
@@ -162,7 +164,7 @@ function parseList(lines, start, depth, blocks, counter) {
     }
     const task = /^\[([ xX])\][ \t]+/.exec(body[0]);
     if (task) body[0] = body[0].slice(task[0].length);
-    spend(counter, 1);
+    spend(counter, task ? 2 : 1); // the item, and its checkbox
     list.items.push({ checked: task ? task[1] !== " " : null, blocks: parseBlocks(body, depth + 1, counter) });
     if (index < lines.length && !lines[index].trim()) {
       // A blank line ends the list unless another item follows it.

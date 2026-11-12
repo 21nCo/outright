@@ -41,11 +41,16 @@ export function saveHiddenPreference(storage, value) {
 
 export function isFolderPath(path) { return typeof path === "string" && path !== ""; }
 
+// Folders are walked with an explicit stack, not recursion, so a chain of
+// open folders as deep as the deepest revealable path (2,047 levels) cannot
+// overflow the call stack. Rows come out in the same depth-first order.
 export function visibleRows(folders, expanded) {
   const rows = [];
   // A folder is shown once per tree, however its entries name it.
   const visited = new Set();
-  const visit = (directory, level) => {
+  const stack = [];
+  // Adds a folder's own state rows; a listed folder is pushed for its entries.
+  const enter = (directory, level) => {
     visited.add(directory);
     const folder = folders.get(directory);
     if (!folder || (folder.status === "loading" && !folder.entries)) { rows.push({ id: `loading:${directory}`, type: "loading", directory, level }); return; }
@@ -58,19 +63,28 @@ export function visibleRows(folders, expanded) {
     let remaining = 0;
     if (folder.nextCursor) remaining = Number.isInteger(folder.remaining) && folder.remaining >= 0 ? folder.remaining : null;
     const setSize = remaining === null ? folder.entries.length : folder.entries.length + remaining;
-    folder.entries.forEach((entry, index) => {
+    stack.push({ directory, level, folder, remaining, setSize, index: 0 });
+  };
+  enter("", 1);
+  while (stack.length) {
+    const frame = stack.at(-1);
+    const { directory, level, folder } = frame;
+    if (frame.index < folder.entries.length) {
+      const entry = folder.entries[frame.index];
+      frame.index += 1;
       const expandable = isExpandable(entry);
       const open = expandable && expanded.has(entry.path) && !visited.has(entry.path);
       rows.push({ id: entryRowId(directory, entry), type: "entry", entry, directory, level, expandable, open,
-        setSize, position: index + 1 });
-      if (open) visit(entry.path, level + 1);
-    });
+        setSize: frame.setSize, position: frame.index });
+      if (open) enter(entry.path, level + 1);
+      continue;
+    }
+    stack.pop();
     // While the first page reloads, the old cursor belongs to a listing that
     // is being replaced, so "load more" waits for the new one.
-    if (folder.nextCursor) rows.push({ id: `more:${directory}`, type: "more", directory, level, loading: Boolean(folder.loadingMore) || folder.status === "loading", error: folder.moreError, remaining });
+    if (folder.nextCursor) rows.push({ id: `more:${directory}`, type: "more", directory, level, loading: Boolean(folder.loadingMore) || folder.status === "loading", error: folder.moreError, remaining: frame.remaining });
     if (folder.truncated) rows.push({ id: `truncated:${directory}`, type: "truncated", directory, level, limit: folder.scanLimit });
-  };
-  visit("", 1);
+  }
   return rows;
 }
 

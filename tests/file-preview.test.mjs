@@ -112,6 +112,18 @@ test("a wide table repeated over many rows is reported over budget instead of re
   assert.equal(parseMarkdownPreview("- a\n".repeat(MARKDOWN_NODE_BUDGET)).overBudget, true);
 });
 
+test("the Markdown budget counts every element the preview renders", () => {
+  // An empty fenced block renders pre and code: 30,000 of them render the
+  // full budget, and one more is over it rather than mounting past the limit.
+  const fences = (count) => parseMarkdownPreview("```\n```\n".repeat(count));
+  assert.deepEqual([fences(MARKDOWN_NODE_BUDGET / 2).overBudget, fences(MARKDOWN_NODE_BUDGET / 2).blocks.length], [false, MARKDOWN_NODE_BUDGET / 2]);
+  assert.equal(fences(MARKDOWN_NODE_BUDGET / 2 + 1).overBudget, true);
+  // A task item renders ul, li and its checkbox, then the paragraph and text.
+  assert.deepEqual([4, 5].map((budget) => parseMarkdownPreview("- [x] a", budget).overBudget), [true, false]);
+  // A one-cell table renders a wrapper, table, thead, tr, th, tbody, tr and td, plus two texts.
+  assert.deepEqual([9, 10].map((budget) => parseMarkdownPreview("| h |\n| - |\n| d |", budget).overBudget), [true, false]);
+});
+
 test("a code span closes only on a backtick run of the opener's exact length", () => {
   const code = (text) => parseInline(text).map((node) => node.type === "code" ? `<${node.value}>` : node.value).join("");
   assert.deepEqual(["`a `` b`", "``a ` b``", "`` `x` ``", "```a``b```", "`a``", "``a`"].map(code),
@@ -225,6 +237,26 @@ test("a folder's next page waits while its first page reloads, and listing unava
   assert.equal(visibleRows(new Map([["", folder("loading")]]), new Set()).at(-1).loading, true);
   const unavailable = visibleRows(new Map([["", { status: "error", error: { message: "Folder listing is unavailable", code: "LISTING_UNAVAILABLE" } }]]), new Set());
   assert.deepEqual(unavailable.map((row) => [row.id, row.type]), [["unavailable:", "unavailable"]]);
+});
+
+test("a fully open chain as deep as the deepest revealable path lists every row without overflowing", () => {
+  const depth = 2047;
+  const folders = new Map();
+  let directory = "";
+  for (let level = 1; level <= depth; level += 1) {
+    const path = directory ? `${directory}/a` : "a";
+    folders.set(directory, { status: "loaded", entries: [{ name: "a", path, kind: "directory" }], total: 1, nextCursor: level === 1 ? "next" : null, remaining: 4, truncated: level === 2, scanLimit: 10 });
+    directory = path;
+  }
+  folders.set(directory, { status: "loaded", entries: [{ name: "b", path: `${directory}/b`, kind: "file" }], total: 1, nextCursor: null });
+  const rows = visibleRows(folders, new Set(folders.keys()));
+  // Depth first: each folder, then its subtree, then the deepest file; the
+  // truncated and "load more" rows close their folders' subtrees afterwards.
+  assert.equal(rows.length, depth + 3);
+  assert.deepEqual(rows.slice(0, depth + 1).map((row) => row.level), Array.from({ length: depth + 1 }, (_, index) => index + 1));
+  assert.deepEqual([rows[depth].entry.path, rows[depth].position, rows[depth].setSize], [`${"a/".repeat(depth)}b`, 1, 1]);
+  assert.deepEqual(rows.slice(-2).map((row) => [row.id, row.level]), [["truncated:a", 2], ["more:", 1]]);
+  assert.deepEqual([rows[0].setSize, rows.at(-1).remaining], [5, 4]);
 });
 
 test("a PDF page canvas stays within its per-side and total pixel budget, or the page is reported too large", () => {
