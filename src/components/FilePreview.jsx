@@ -81,9 +81,11 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
   const name = file.split("/").at(-1);
   const openInEditor = () => api("/api/editor/open", { method: "POST", body: { path: worktree.path, file, editor: settings?.editor } }).catch(onError);
   const editorButton = <Button variant="outline" size="xs" onClick={openInEditor}><ArrowSquareOut />Open in {settings?.editor ?? "editor"}</Button>;
-  const reload = () => setRetry((value) => value + 1);
+  // Retry replaces its button, so focus moves to the preview, which stays.
+  const sectionRef = useRef(null);
+  const reload = () => { sectionRef.current?.focus(); setRetry((value) => value + 1); };
 
-  if (state.status === "loading" || state.file !== file) return <section className="file-preview" aria-label={`Preview of ${name}`} aria-busy="true"><div className="preview-state" role="status"><SpinnerGap className="spin" />Opening {name}…</div></section>;
+  if (state.status === "loading" || state.file !== file) return <section ref={sectionRef} tabIndex={-1} className="file-preview" aria-label={`Preview of ${name}`} aria-busy="true"><div className="preview-state" role="status"><SpinnerGap className="spin" />Opening {name}…</div></section>;
   if (state.status === "error") {
     const [Icon, text, action] = {
       MISSING: [FileX, `${file} no longer exists. It may have been moved or deleted.`, <Button key="refresh" variant="outline" size="xs" onClick={() => onRefreshFolder?.(file)}><ArrowsClockwise />Refresh folder</Button>],
@@ -95,7 +97,7 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
       UNREADABLE: [Prohibit, `${file} cannot be read with your permissions.`, null],
       PREVIEW_UNAVAILABLE: [Prohibit, "Previews are unavailable on this file system, because Outright cannot prove that an opened file is inside this worktree.", editorButton],
     }[state.code] ?? [WarningCircle, `${file} could not be previewed: ${state.message}`, <Button key="retry" variant="outline" size="xs" onClick={reload}><ArrowsClockwise />Retry</Button>];
-    return <section className="file-preview" aria-label={`Preview of ${name}`}><div className="preview-state" role="alert"><Icon /><p>{text}</p>{action}</div></section>;
+    return <section ref={sectionRef} tabIndex={-1} className="file-preview" aria-label={`Preview of ${name}`}><div className="preview-state" role="alert"><Icon /><p>{text}</p>{action}</div></section>;
   }
 
   const { preview } = state;
@@ -113,7 +115,7 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
   else if (preview.previewType === "oversized") body = <div className="preview-state" role="status"><Prohibit /><p>{name} is {formatBytes(preview.size)}, over the {formatBytes(preview.limit)} preview limit for this type.</p>{editorButton}</div>;
   else body = <div className="preview-state" role="status"><Prohibit /><p>{name} has no preview. {preview.reason ?? ""}</p>{editorButton}</div>;
 
-  return <section className="file-preview" aria-label={`Preview of ${name}`}>
+  return <section ref={sectionRef} tabIndex={-1} className="file-preview" aria-label={`Preview of ${name}`}>
     <header className="file-preview-header">
       <div><strong title={file}>{name}</strong><span>{details}</span></div>
       {preview.previewType === "markdown" && <div className="file-preview-mode" role="group" aria-label="Markdown view">

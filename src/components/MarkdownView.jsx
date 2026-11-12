@@ -79,7 +79,7 @@ function MarkdownImage({ src, alt, title, path }) {
   if (failed) {
     return <span className="markdown-image-failed" role="note">
       [Image could not be loaded{alt ? `: ${alt}` : ""}]
-      <button type="button" className="markdown-link" aria-label={`Retry image ${alt || path}`} onClick={() => { setFailed(false); setAttempt((value) => value + 1); }}>Retry</button>
+      <button type="button" className="markdown-link" aria-label={`Retry image ${alt || path}`} onClick={(event) => { event.currentTarget.closest(".file-preview")?.focus(); setFailed(false); setAttempt((value) => value + 1); }}>Retry</button>
     </span>;
   }
   return <img key={attempt} src={src} alt={alt} title={title || undefined} loading="lazy" onError={() => setFailed(true)} />;

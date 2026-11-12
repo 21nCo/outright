@@ -156,6 +156,17 @@ export function revealReads(folders, path) {
   });
 }
 
+// Makes those reads one at a time, in order, and stops at a folder that does
+// not list its next step (missing, refused or past the bound) or once
+// `active()` is false, so a path deeper than what exists costs one read.
+export async function revealPath(folders, path, read, active) {
+  for (const step of revealReads(folders, path)) {
+    const entries = await read(step);
+    if (!active() || !entries?.some((entry) => entry.path === step.find)) return false;
+  }
+  return true;
+}
+
 // Whether a run that ended in chat `id` may have changed the shown
 // worktree: the chat is one of its open chats, or its chat lists (archived
 // ones too, since a chat can be archived while its run finishes) name it.

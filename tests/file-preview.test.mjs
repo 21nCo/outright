@@ -4,7 +4,7 @@ import { MARKDOWN_NODE_BUDGET, linkTarget, parseInline, parseMarkdown, parseMark
 import { failedModuleUrl, retryingImport } from "../src/lib/module-retry.js";
 import { PDF_CANVAS_LIMITS, pdfCanvasSize } from "../src/lib/pdf-canvas.js";
 import { pdfWorkerStarter } from "../src/lib/pdf-worker.js";
-import { HIDDEN_FILES_KEY, MAX_REVEAL_ENTRIES, ancestorsOf, entryRowId, isExpandable, needsPage, normalizeTypedPath, readHiddenPreference, revealReads, samePreview, saveHiddenPreference, treeKeyTarget, visibleRows, worktreeOwnsChat } from "../src/lib/file-tree.js";
+import { HIDDEN_FILES_KEY, MAX_REVEAL_ENTRIES, ancestorsOf, entryRowId, isExpandable, needsPage, normalizeTypedPath, readHiddenPreference, revealPath, revealReads, samePreview, saveHiddenPreference, treeKeyTarget, visibleRows, worktreeOwnsChat } from "../src/lib/file-tree.js";
 
 const types = (nodes) => nodes.map((node) => node.type);
 function collect(blocks, found = []) {
@@ -387,6 +387,41 @@ test("Go to file reads every folder on its way until the next step is listed, in
     { directory: "lib", find: "lib/deep", keep: 0 }, { directory: "lib/deep", find: "lib/deep/a.md", keep: 0 }]);
   folders.set("src", { status: "error", error: { message: "gone" } });
   assert.deepEqual(revealReads(folders, "src/f001.txt"), [{ directory: "src", find: "src/f001.txt", keep: 0 }]);
+});
+
+test("Go to file reads one folder at a time and stops at the first folder that does not list its next step", async () => {
+  const listings = new Map([["", listed("", ["a", "refused", "z.md"])], ["a", listed("a", ["a", "b"])], ["a/a", listed("a/a", ["x.md"])], ["a/b", listed("a/b", ["c.md"])]]);
+  let reads = [];
+  let inFlight = 0;
+  let most = 0;
+  const read = async ({ directory }) => {
+    reads.push(directory);
+    most = Math.max(most, ++inFlight);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    inFlight -= 1;
+    // A refused or missing folder lists nothing.
+    return listings.get(directory)?.entries;
+  };
+  const always = () => true;
+  assert.equal(await revealPath(new Map(), "a/b/c.md", read, always), true);
+  assert.deepEqual([reads, most], [["", "a", "a/b"], 1]);
+  // A path far deeper than what exists costs one read per folder that does
+  // exist on its way, never one per typed step.
+  for (const [path, expected] of [[`${"a/".repeat(1000)}x.md`, ["", "a", "a/a"]], [`${"q/".repeat(1000)}x.md`, [""]], ["refused/deep/x.md", ["", "refused"]]]) {
+    reads = [];
+    assert.equal(await revealPath(new Map(), path, read, always), false, path);
+    assert.deepEqual(reads, expected, path);
+  }
+  // Folders that already list their next step are not read again.
+  reads = [];
+  assert.equal(await revealPath(listings, "a/b/c.md", read, always), true);
+  assert.deepEqual(reads, []);
+  // A newer reveal stops this one after the read in flight.
+  reads = [];
+  let current = true;
+  const superseding = (step) => { const result = read(step); current = false; return result; };
+  assert.equal(await revealPath(new Map(), "a/b/c.md", superseding, () => current), false);
+  assert.deepEqual(reads, [""]);
 });
 
 test("a folder read pages on to keep its shown entries or reach the target, and stops at the reveal bound", () => {

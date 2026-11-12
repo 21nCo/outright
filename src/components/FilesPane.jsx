@@ -3,7 +3,7 @@ import { ArrowsClockwise, CaretDown, CaretRight, Eye, EyeSlash, File, FileImage,
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { FilePreview } from "@/components/FilePreview";
-import { ancestorsOf, isFolderPath, needsPage, normalizeTypedPath, readHiddenPreference, revealReads, rowElement, saveHiddenPreference, treeKeyTarget, visibleRows } from "@/lib/file-tree";
+import { ancestorsOf, isFolderPath, needsPage, normalizeTypedPath, readHiddenPreference, revealPath, rowElement, saveHiddenPreference, treeKeyTarget, visibleRows } from "@/lib/file-tree";
 import { api, query } from "@/lib/runtime-api";
 
 // Read inside the helpers, so a browser that refuses storage access is caught there.
@@ -46,7 +46,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   // to list that many entries again, installed together. Each read starts a
   // new listing generation: an older read or a "load more" from an older
   // listing is dropped. The shown entries stay until the new ones arrive.
-  const loadFolder = useCallback(async (directory, { keep = 0, find = "" } = {}) => {
+  const loadFolder = useCallback(async (directory, { keep = 0, find = "", active } = {}) => {
     if (typeof directory !== "string") return;
     const generation = (tokensRef.current.get(directory) ?? 0) + 1;
     tokensRef.current.set(directory, generation);
@@ -55,19 +55,22 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     const hidden = hiddenRef.current;
     setFolders((current) => withFolder(current, directory, { ...current.get(directory), status: "loading", loadingMore: false, moreError: "" }));
     const fresh = () => aliveRef.current && tokensRef.current.get(directory) === generation;
+    // A superseded reveal stops paging; the pages read so far are installed.
+    const wanted = () => (!active || active() ? find : "");
     try {
       const read = (cursor) => api(query("/api/files", { projectId: project.id, path: worktree.path, dir: directory, cursor, hidden: hidden ? "true" : undefined,
         limit: find ? MAX_PAGE_SIZE : keep > PAGE_SIZE ? Math.min(keep, MAX_PAGE_SIZE) : undefined }), { signal });
       const page = await read();
       let entries = page.entries;
-      while (fresh() && page.nextCursor && needsPage(entries, { keep, find })) {
+      while (fresh() && page.nextCursor && needsPage(entries, { keep, find: wanted() })) {
         Object.assign(page, await read(page.nextCursor));
         entries = [...entries, ...page.entries];
       }
       if (!fresh()) return;
       setFolders((current) => withFolder(current, directory, { status: "loaded", generation, hidden, entries,
         nextCursor: page.nextCursor, total: page.total, remaining: page.remaining, hiddenCount: page.hiddenCount, truncated: page.truncated, scanLimit: page.scanLimit }));
-      if (find && !entries.some((entry) => entry.path === find)) setAnnouncement(`${find} is not ${page.nextCursor || page.truncated ? `in the first ${entries.length} entries of` : "in"} ${directory || "the worktree root"}`);
+      if (wanted() && !entries.some((entry) => entry.path === find)) setAnnouncement(`${find} is not ${page.nextCursor || page.truncated ? `in the first ${entries.length} entries of` : "in"} ${directory || "the worktree root"}`);
+      return entries;
     } catch (error) {
       if (!fresh()) return;
       if (reportable(error)) onErrorRef.current(error);
@@ -143,6 +146,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   // row follows whichever row has focus.
   const moveRef = useRef(false);
   const moveFocus = useCallback((id) => { moveRef.current = true; setFocusedId(id); }, []);
+  const scrollRef = useRef("");
   // The row that had focus at the last commit, and whether focus is in the
   // tree. A row removed while focused leaves focus on the page body, with no
   // focus event in some browsers, so the last commit's focus is the evidence.
@@ -169,11 +173,14 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     else if (activeId && shownIdRef.current === focusedId) setFocusedId(activeId);
     const tree = treeRef.current;
     if (!tree) return;
+    // A revealed row is scrolled into view wherever focus is (scrollIntoTree).
+    if (foundIndex >= 0 && scrollRef.current === focusedId) { scrollRef.current = ""; scrollIntoTree(tree, rowElement(tree, focusedId), 8); }
     const current = document.activeElement;
     const currentRow = current && tree.contains(current) ? current.closest("[data-row-id]") : null;
     let target = "";
     if (currentRow) {
-      if (moveRef.current) target = activeId;
+      // A move to a row not listed yet stays pending, and focus stays put.
+      if (moveRef.current) target = foundIndex >= 0 ? activeId : "";
       else if (currentRow.dataset.rowId !== focusedId && rows.some((row) => row.id === currentRow.dataset.rowId)) setFocusedId(currentRow.dataset.rowId);
     } else if ((!current || current === document.body) && treeFocusedRef.current && lastFocusRef.current && rows.length) {
       const { id, index } = lastFocusRef.current;
@@ -183,7 +190,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     if (target) {
       const element = rowElement(tree, target);
       if (element && element !== current) element.focus({ preventScroll: false });
-      if (element && target === activeId) moveRef.current = false;
+      if (element && target === activeId && foundIndex >= 0) moveRef.current = false;
     }
     rowsRef.current = rows;
     if (tree.contains(document.activeElement)) noteFocusedRow(document.activeElement);
@@ -238,34 +245,52 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   };
 
   // Shows `path` in the tree: opens each folder on its way and reads each
-  // until it lists the next step (revealReads), and opens `path` with `open`.
-  const reveal = useCallback((path, open) => {
-    setExpanded((current) => new Set([...current, ...ancestorsOf(path), ...(open ? [path] : [])]));
-    for (const read of revealReads(foldersRef.current, path)) void loadFolder(read.directory, read);
-    if (open && !foldersRef.current.has(path)) void loadFolder(path);
+  // until it lists the next step (revealPath), and opens `path` with `open`.
+  // Only folders found are opened; a newer reveal stops this one.
+  const revealRef = useRef(0);
+  const reveal = useCallback(async (path, open) => {
+    const generation = ++revealRef.current;
+    const active = () => aliveRef.current && revealRef.current === generation;
+    const expand = (paths) => setExpanded((current) => new Set([...current, ...paths]));
+    scrollRef.current = `entry:${path}`;
     moveFocus(`entry:${path}`);
+    if (!await revealPath(foldersRef.current, path, (step) => { expand(ancestorsOf(step.find)); return loadFolder(step.directory, { ...step, active }); }, active)) return;
+    expand([...ancestorsOf(path), ...(open ? [path] : [])]);
+    if (open && !foldersRef.current.has(path)) void loadFolder(path);
   }, [loadFolder, moveFocus]);
+
+  // A preview action replaces the control it was activated on, so focus on
+  // the preview (or lost) moves first to the tree, which then follows its move.
+  const keepFocus = useCallback(() => {
+    const tree = treeRef.current;
+    const current = document.activeElement;
+    if (tree && (!current || current === document.body || (tree.parentElement.contains(current) && !tree.contains(current)))) tree.querySelector('[tabindex="0"]')?.focus();
+  }, []);
 
   // Opens an exact worktree path, such as a resolved Markdown link target.
   const openPath = useCallback((file) => {
     if (typeof file !== "string" || !file) return;
     setAnnouncement(`Opening ${file}`);
-    reveal(file, false);
+    keepFocus();
+    void reveal(file, false);
     setSelected(file);
-  }, [reveal]);
+  }, [reveal, keepFocus]);
 
   const revealFolder = useCallback((path) => {
     setSelected((current) => (current === path ? "" : current));
     setAnnouncement(`${path} is a folder; it is open in the tree`);
-    reveal(path, true);
-  }, [reveal]);
+    keepFocus();
+    void reveal(path, true);
+  }, [reveal, keepFocus]);
 
   const refreshFolderOf = useCallback((file) => {
     const directory = ancestorsOf(file).at(-1) ?? "";
+    keepFocus();
+    if (directory) moveFocus(`entry:${directory}`);
     void loadFolder(directory);
     setSelected("");
     setAnnouncement(`Refreshed ${directory || "the worktree root"}`);
-  }, [loadFolder]);
+  }, [loadFolder, keepFocus, moveFocus]);
 
   useEffect(() => {
     if (!quickOpen) return;
@@ -307,6 +332,14 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
         : <div className="file-preview preview-state" role="note">Choose a file to preview it. Markdown, text, images and PDFs open here.</div>}
     </div>
   </section>;
+}
+
+// Rows laid out late (content-visibility) can move a row, so it is checked for a few frames.
+function scrollIntoTree(tree, row, frames) {
+  if (!row?.isConnected) return;
+  const box = row.getBoundingClientRect(), view = tree.getBoundingClientRect();
+  if (box.top < view.top || box.bottom > view.bottom) row.scrollIntoView({ block: "nearest" });
+  if (frames) requestAnimationFrame(() => scrollIntoTree(tree, row, frames - 1));
 }
 
 function withFolder(folders, directory, folder) {

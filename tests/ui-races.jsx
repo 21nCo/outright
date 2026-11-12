@@ -13,6 +13,7 @@ import { TeardownChoices, WorktreeLifecycleDialog } from "../src/components/Work
 import { WorktreeCheckpointsDialog } from "../src/components/WorktreeCheckpoints.jsx";
 import { ProviderAccounts } from "../src/components/ProviderAccounts.jsx";
 import { TerminalPane } from "../src/components/TerminalPane.jsx";
+import { FilesPane } from "../src/components/FilesPane.jsx";
 import { PaneBody, PaneLayout } from "../src/components/PaneLayout.jsx";
 import { computePaneRects } from "../src/lib/pane-layout.js";
 import { TooltipProvider } from "../src/components/ui/tooltip.jsx";
@@ -9955,6 +9956,123 @@ async function worktreeCheckpointsRegression() {
   assert(!errors.length, `unexpected errors: ${errors.map((error) => error.message).join("; ")}`);
 }
 
+// Each preview action that replaces the control it was activated on leaves
+// focus on a stable control in the Files pane, never on the page body; a row
+// that Go to file reveals below the tree's viewport, including through a
+// later page, is scrolled into view while focus stays in Go to file.
+async function filesFocusRegression() {
+  root.render(null);
+  await settle();
+  const project = { id: "A", name: "Review A", path: "/fixture/A" };
+  const worktree = { id: "A", name: "A", path: "/fixture/A", branch: "main" };
+  const file = (path) => ({ name: path.split("/").at(-1), path, kind: "file", hidden: false });
+  const folder = (path) => ({ ...file(path), kind: "directory" });
+  const filler = Array.from({ length: 80 }, (_, index) => file(`f-${String(index).padStart(3, "0")}.txt`));
+  const many = Array.from({ length: 700 }, (_, index) => file(`many/m-${String(index).padStart(3, "0")}.txt`));
+  const markdown = "# Notes\n\n[guide](docs/guide.md) [folder](docs) [gone](docs/gone.md) [flaky](flaky.md) [picture](picture.png)\n";
+  const previews = { "notes.md": { previewType: "markdown", text: markdown }, "docs/guide.md": { previewType: "markdown", text: "# Guide\n" },
+    "picture.png": { previewType: "image" }, "flaky.md": { previewType: "markdown", text: "# Flaky\n" } };
+  const listings = [];
+  let flaky = 0;
+  route = async (url) => {
+    const parameters = Object.fromEntries(url.searchParams);
+    if (url.pathname === "/api/files") {
+      listings.push(parameters.dir);
+      const page = (entries) => response({ entries, nextCursor: null, total: entries.length, remaining: 0, hiddenCount: 0, truncated: false });
+      if (!parameters.dir) return page([folder("docs"), folder("many"), file("notes.md"), ...filler]);
+      if (parameters.dir === "docs") return page([file("docs/guide.md")]);
+      if (parameters.dir === "many") {
+        const start = parameters.cursor ? Number(parameters.cursor) : 0;
+        const end = start + Number(parameters.limit ?? 200);
+        return response({ entries: many.slice(start, end), nextCursor: end < many.length ? String(end) : null, total: many.length, remaining: Math.max(0, many.length - end), hiddenCount: 0, truncated: false });
+      }
+      return response({ error: "missing", code: "MISSING" }, 404);
+    }
+    if (url.pathname === "/api/files/preview") {
+      const path = parameters.file;
+      if (path === "docs") return response({ error: "docs is a folder", code: "IS_DIRECTORY" }, 400);
+      if (path === "flaky.md" && (flaky += 1) === 1) return response({ error: "busy" }, 500);
+      if (!previews[path]) return response({ error: `${path} no longer exists`, code: "MISSING" }, 404);
+      return response({ path, name: path.split("/").at(-1), version: "v1", size: 8, link: null, ...previews[path] });
+    }
+    return response({ error: "unexpected" }, 404);
+  };
+  root.render(<TooltipProvider><div style={{ width: 720, height: 360 }}><FilesPane project={project} worktree={worktree} settings={{ editor: "code" }} completions={0} quickOpen={0} onError={() => {}} /></div></TooltipProvider>);
+  const pane = () => host.querySelector(".files-pane");
+  const tree = () => host.querySelector(".file-tree");
+  const row = (id) => [...(tree()?.querySelectorAll("[data-row-id]") ?? [])].find((element) => element.dataset.rowId === id);
+  const inPane = (label) => assert(document.activeElement && document.activeElement !== document.body && pane().contains(document.activeElement), `${label}: focus left the Files pane for ${document.activeElement?.outerHTML.slice(0, 80)}`);
+  const shown = (element) => { const box = element.getBoundingClientRect(); const view = tree().getBoundingClientRect(); return box.top >= view.top - 1 && box.bottom <= view.bottom + 1; };
+  const link = (label) => [...host.querySelectorAll(".markdown-link")].find((element) => element.textContent === label);
+  const openNotes = async () => {
+    row("entry:notes.md").click();
+    await until(() => link("guide"), "notes.md was not previewed");
+  };
+  // The control is focused and activated as a keyboard user would.
+  const activate = async (element) => { element.focus(); element.click(); await settle(); };
+  await until(() => row("entry:notes.md"), "the root was not listed");
+
+  await openNotes();
+  await activate(link("guide"));
+  inPane("a Markdown file link");
+  await until(() => document.activeElement === row("entry:docs/guide.md") && /Guide/.test(host.querySelector(".file-preview")?.textContent), "a Markdown file link did not move focus to its revealed row");
+
+  await openNotes();
+  await activate(link("folder"));
+  inPane("a Markdown folder link");
+  await until(() => row("entry:docs")?.getAttribute("aria-expanded") === "true" && document.activeElement === row("entry:docs"), "a Markdown folder link did not move focus to the revealed folder");
+  await settle();
+  inPane("a Markdown folder link, once the folder is known");
+
+  await openNotes();
+  await activate(link("gone"));
+  const refreshFolder = () => [...host.querySelectorAll(".file-preview button")].find((element) => element.textContent === "Refresh folder");
+  await until(refreshFolder, "a missing file did not offer Refresh folder");
+  await activate(refreshFolder());
+  inPane("Refresh folder");
+  await until(() => document.activeElement === row("entry:docs"), "Refresh folder did not move focus to the refreshed folder");
+
+  await openNotes();
+  await activate(link("flaky"));
+  const retry = () => [...host.querySelectorAll(".file-preview button")].find((element) => element.textContent === "Retry");
+  await until(retry, "a failed preview did not offer Retry");
+  await activate(retry());
+  inPane("preview Retry");
+  await until(() => /Flaky/.test(host.querySelector(".file-preview")?.textContent), "Retry did not load the preview");
+  inPane("preview Retry, once loaded");
+
+  // The image's bytes do not load here, so the preview offers Retry.
+  await openNotes();
+  await activate(link("picture"));
+  await until(retry, "a failed image did not offer Retry");
+  await activate(retry());
+  inPane("image Retry");
+
+  const jump = host.querySelector('.files-jump input');
+  const go = async (path) => {
+    jump.focus();
+    setControlValue(jump, path);
+    jump.form.requestSubmit();
+    await settle();
+  };
+  tree().scrollTop = 0;
+  await go("f-079.txt");
+  await until(() => row("entry:f-079.txt") && shown(row("entry:f-079.txt")), "Go to file did not scroll a listed row into view");
+  assert(document.activeElement === jump, "Go to file moved focus out of its field");
+  tree().scrollTop = 0;
+  listings.length = 0;
+  await go("many/m-650.txt");
+  await until(() => row("entry:many/m-650.txt") && shown(row("entry:many/m-650.txt")), "Go to file did not scroll a row reached through paging into view");
+  assert(listings.filter((directory) => directory === "many").length === 2, `Go to file read many ${JSON.stringify(listings)}`);
+  assert(document.activeElement === jump, "Go to file through paging moved focus out of its field");
+  // A path deeper than what exists reads only the folders that do exist.
+  listings.length = 0;
+  await go(`${"docs/".repeat(400)}x.md`);
+  await until(() => /is not in docs/.test(host.querySelector(".files-pane [role=status]")?.textContent ?? "") || listings.length >= 2, "a deep missing path was not settled");
+  await settle();
+  assert(listings.length <= 2, `a deep missing path read ${listings.length} folders`);
+}
+
 const MOTION_STEPS = ["diff Find ownership", "diff scrollbar feedback", "diff Find resize", "split pane layout", "pane notices at minimum", "responsive focus"];
 
 try {
@@ -10114,6 +10232,7 @@ try {
     ["pane layout replacement", paneLayoutReplacementRegression, "a separator drag on a replaced layout is discarded unsaved and focus on any removed pane chrome moves to the shown pane", "responsive transition requires the CDP viewport bridge"],
     ["pane drag isolation", paneDragChatTabRegression, "pane title drags never reorder chat tabs, even after an unfinished tab drag"],
     ["responsive focus", responsiveFocusRegression, "narrow drawer and one-at-a-time panes contain and restore focus", "responsive transition requires the CDP viewport bridge"],
+    ["files focus", filesFocusRegression, "Files preview actions keep focus in the pane, and Go to file scrolls listed and paged rows into view without moving focus"],
     ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],
   ];
   // The harness runs every step with reduced motion, as hosted macOS and
