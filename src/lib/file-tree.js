@@ -59,7 +59,7 @@ export function visibleRows(folders, expanded) {
     // can mix generations once later pages are added to earlier ones.
     let remaining = 0;
     if (folder.nextCursor) remaining = Number.isInteger(folder.remaining) && folder.remaining >= 0 ? folder.remaining : null;
-    const setSize = remaining === null ? folder.entries.length : folder.entries.length + remaining;
+    const setSize = remaining === null ? -1 : folder.entries.length + remaining; // -1: aria-setsize for a total not known
     stack.push({ directory, level, folder, remaining, setSize, index: 0 });
   };
   enter("", 1);
@@ -153,8 +153,16 @@ export const failedPreview = (prior, target, error) => ({ status: "error", targe
 export const shownPreview = (state, target, mediaFailed) => (state.status === "ready" && sameTarget(state.target, target) && !mediaFailed ? state : null);
 export const openedPath = (state, target) => (sameTarget(state.target, target) && state.path) || target.file;
 
-// A refresh, or an answer that changes the preview (samePreview keeps an unchanged one), clears a renderer error.
-export const rendersAfresh = (prior, next) => prior.resetKey !== next.resetKey || prior.preview !== next.preview;
+// A refresh, an answer that changes the preview (samePreview keeps an unchanged one) or another view mode clears a renderer error.
+export const rendersAfresh = (prior, next) => prior.resetKey !== next.resetKey || prior.preview !== next.preview || prior.mode !== next.mode;
+
+// What a failed preview request does: a folder goes to the folder view when there is one; else an answer that names the
+// file's state (a folder is one) replaces the shown preview, and a passing failure (network, server) keeps it.
+export const PREVIEW_FILE_STATES = new Set(["IS_DIRECTORY", "MISSING", "BROKEN_LINK", "OUTSIDE_WORKTREE", "PATH_OUTSIDE", "LINK_LOOP", "EXCLUDED", "UNREADABLE", "PREVIEW_UNAVAILABLE"]);
+export const previewFailure = (code, background, folderView) => (code === "IS_DIRECTORY" && folderView ? "folder" : background && !PREVIEW_FILE_STATES.has(code) ? "keep" : "replace");
+
+// Opens a file (its resolved path) in the editor; a refusal goes to onError, if any, and never rejects unhandled.
+export const openInEditor = (request, path, file, editor, onError) => request("/api/editor/open", { method: "POST", body: { path, file, editor } }).catch((error) => onError?.(error));
 
 // A viewer that did not load (module-retry.js) offers a page reload if only that repairs it, else a retry; both if retryable.
 export const viewerFailure = (error) => (error?.reloadRequired ? { reload: true, retry: Boolean(error.retryable) } : { reload: false, retry: true });
@@ -185,7 +193,7 @@ export function revealReads(folders, path, chain = ancestorsOf(path)) {
 export async function revealPath(folders, path, read, active, chain) {
   if (!revealable(path)) return false;
   for (const step of revealReads(folders, path, chain ?? ancestorsOf(path))) {
-    const entries = await read(step);
+    const entries = active() ? await read(step) : null; // a reveal no longer wanted reads nothing more
     if (!active() || !entries?.some((entry) => entry.path === step.find)) return false;
   }
   return true;

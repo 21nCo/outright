@@ -2,7 +2,7 @@ import { Component, lazy, Suspense, useEffect, useRef, useState } from "react";
 import { ArrowSquareOut, ArrowsClockwise, FileX, LinkBreak, Prohibit, SpinnerGap, WarningCircle } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { MarkdownView } from "@/components/MarkdownView";
-import { failedPreview, formatBytes, loadingPreview, openedPath, rendersAfresh, samePreview, sameTarget, shownPreview, viewerFailure } from "@/lib/file-tree";
+import { failedPreview, formatBytes, loadingPreview, openedPath, openInEditor as openFileInEditor, previewFailure, rendersAfresh, samePreview, sameTarget, shownPreview, viewerFailure } from "@/lib/file-tree";
 import { retryingImport } from "@/lib/module-retry";
 import { api, query } from "@/lib/runtime-api";
 
@@ -48,8 +48,6 @@ class PreviewBoundary extends Component {
 // asked for, so a slow answer for an earlier selection is never shown. A
 // refresh keeps the shown preview until its answer arrives, and keeps it
 // as it is (scroll, PDF page) only when the answer shows the same thing.
-const FILE_STATES = new Set(["MISSING", "BROKEN_LINK", "OUTSIDE_WORKTREE", "PATH_OUTSIDE", "LINK_LOOP", "EXCLUDED", "UNREADABLE", "PREVIEW_UNAVAILABLE"]);
-
 export function FilePreview({ project, worktree, file, refreshKey, settings, onNavigate, onResolved, onFolder, onRefreshFolder, onError }) {
   const identity = { projectId: project.id, worktreePath: worktree.path, file };
   const [state, setState] = useState({ status: "loading", target: identity });
@@ -79,10 +77,8 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
       })
       .catch((error) => {
         if (!current) return;
-        if (error.payload?.code === "IS_DIRECTORY") { onFolder?.(file); return; }
-        // A background refresh that fails for a passing reason (network, server) keeps the shown preview; one that names the file's state replaces it.
-        if (background && !FILE_STATES.has(error.payload?.code)) { onError?.(error); return; }
-        setState((prior) => failedPreview(prior, identity, error));
+        const action = previewFailure(error.payload?.code, background, Boolean(onFolder));
+        if (action === "folder") onFolder(file); else if (action === "keep") onError?.(error); else setState((prior) => failedPreview(prior, identity, error));
       });
     return () => { current = false; controller.abort(); };
     // The target is identified by its project, worktree and file alone.
@@ -91,7 +87,7 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
   // Once the runtime answers, its path names the file: label, editor, link and image base, Refresh folder.
   const opened = openedPath(state, identity);
   const name = opened.split("/").at(-1);
-  const openInEditor = () => api("/api/editor/open", { method: "POST", body: { path: worktree.path, file: opened, editor: settings?.editor } }).catch(onError);
+  const openInEditor = () => openFileInEditor(api, worktree.path, opened, settings?.editor, onError);
   const editorButton = <Button variant="outline" size="xs" onClick={openInEditor}><ArrowSquareOut />Open in {settings?.editor ?? "editor"}</Button>;
   // Retry replaces its button, so focus moves to the preview, which stays.
   const sectionRef = useRef(null);
@@ -105,6 +101,7 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
       OUTSIDE_WORKTREE: [LinkBreak, `${file} links outside this worktree, so it is not previewed.`, null],
       PATH_OUTSIDE: [Prohibit, `${file} is not a path inside this worktree. Use a path relative to the worktree root, without "..".`, null],
       LINK_LOOP: [LinkBreak, `${file} is a link that points back to itself.`, null],
+      IS_DIRECTORY: [Prohibit, `${opened} is a folder, so it has no preview.`, null],
       EXCLUDED: [Prohibit, "Git metadata is not shown in Files.", null],
       UNREADABLE: [Prohibit, `${file} cannot be read with your permissions.`, null],
       PREVIEW_UNAVAILABLE: [Prohibit, "Previews are unavailable on this file system, because Outright cannot prove that an opened file is inside this worktree.", editorButton],
@@ -136,6 +133,6 @@ export function FilePreview({ project, worktree, file, refreshKey, settings, onN
       </div>}
       <Button variant="ghost" size="icon-xs" aria-label={`Open ${name} in ${settings?.editor ?? "editor"}`} onClick={openInEditor}><ArrowSquareOut /></Button>
     </header>
-    <div className="file-preview-body"><PreviewBoundary key={retry} resetKey={refreshKey} preview={preview} name={name} onRetry={reload}>{body}</PreviewBoundary></div>
+    <div className="file-preview-body"><PreviewBoundary key={retry} resetKey={refreshKey} preview={preview} mode={mode} name={name} onRetry={reload}>{body}</PreviewBoundary></div>
   </section>;
 }

@@ -7,7 +7,7 @@ import { MARKDOWN_NODE_BUDGET, linkTarget, parseInline, parseMarkdown, parseMark
 import { failedModuleUrl, retryingImport } from "../src/lib/module-retry.js";
 import { PDF_CANVAS_LIMITS, pdfCanvasSize } from "../src/lib/pdf-canvas.js";
 import { pdfWorkerStarter } from "../src/lib/pdf-worker.js";
-import { HIDDEN_FILES_KEY, MAX_REVEAL_ENTRIES, ancestorsOf, entryRowId, failedPreview, isExpandable, loadingPreview, needsPage, normalizeTypedPath, openedPath, readHiddenPreference, rendersAfresh, revealable, revealPath, revealReads, samePreview, saveHiddenPreference, shownPreview, treeKeyTarget, viewerFailure, visibleRows, worktreeOwnsChat } from "../src/lib/file-tree.js";
+import { HIDDEN_FILES_KEY, MAX_REVEAL_ENTRIES, PREVIEW_FILE_STATES, ancestorsOf, entryRowId, failedPreview, isExpandable, loadingPreview, needsPage, normalizeTypedPath, openedPath, openInEditor, previewFailure, readHiddenPreference, rendersAfresh, revealable, revealPath, revealReads, samePreview, saveHiddenPreference, shownPreview, treeKeyTarget, viewerFailure, visibleRows, worktreeOwnsChat } from "../src/lib/file-tree.js";
 
 const types = (nodes) => nodes.map((node) => node.type);
 function collect(blocks, found = []) {
@@ -67,6 +67,12 @@ test("adversarial Markdown near the preview size limit parses with linear work a
     "image openers in link labels": fill("[!["), "badges without a link target": fill("[![a](b)"), "badges before a rejected link": fill("[![a](b) x", "](t"),
     "escaped brackets in labels": fill("[\\[ ![a](b) ", "](t)"),
     "escaped image openers in labels": fill("[\\![a](b)"), "backslash runs before image openers": fill(`[${"\\".repeat(999)}![a](b)`, "](t)"),
+    // An escaped closer is text, so each is checked for the backslashes before it.
+    "backslash runs before closers": fill(`*a${"\\".repeat(999)}* `), "even backslash runs before closers": fill(`**a${"\\".repeat(1000)}** `),
+    "escaped closers": fill("*a\\* ~~b\\~~ __c\\__ "),
+    // Destinations may hold balanced parentheses; a "]" inside them ends the address, so no scan runs on through later labels.
+    "parentheses in destinations": fill("[x](a(b)"), "open parentheses in destinations": fill("[](("), "labels in open parentheses": fill("[](a(b"),
+    "balanced parentheses before labels": fill("[x](a(b)c"), "deep parentheses": fill(`[x](${"(".repeat(32)}${")".repeat(32)}`),
     // Link destinations are scanned once per label: a long space or tab run
     // after "(" was quadratic in the old pattern's overlapping quantifiers.
     "empty labels before spaces": fill(`[](${" ".repeat(2000)}`),
@@ -192,9 +198,14 @@ test("tree rows follow open folders lazily and keyboard moves stay within them",
   const mixed = (extra) => new Map([["", { status: "loaded", entries: Array.from({ length: 400 }, (_, index) => ({ name: `f${index}`, path: `f${index}`, kind: "file" })), total: 251, nextCursor: "next", ...extra }]]);
   const mixedRows = visibleRows(mixed({ remaining: 50 }));
   assert.deepEqual([mixedRows.at(-1).remaining, mixedRows[0].setSize], [50, 450]);
-  // Without the server's count, nothing negative or invented is offered.
+  // Without the server's count, nothing negative or invented is offered: the
+  // set size is unknown (-1), never the loaded count, which reads as complete.
   const uncounted = visibleRows(mixed({}));
-  assert.deepEqual([uncounted.at(-1).remaining, uncounted[0].setSize], [null, 400]);
+  assert.deepEqual([uncounted.at(-1).remaining, uncounted[0].setSize], [null, -1]);
+  const partial = visibleRows(new Map([["", listed("", ["a.md"], { nextCursor: "next" })]]));
+  assert.deepEqual(partial.map((row) => [row.type, row.setSize]), [["entry", -1], ["more", undefined]]);
+  // A complete listing (no cursor) has its loaded count as its size.
+  assert.equal(visibleRows(mixed({ nextCursor: null }))[0].setSize, 400);
   assert.deepEqual(visibleRows(new Map(), new Set()).map((row) => row.type), ["loading"]);
   assert.equal(treeKeyTarget(rows, 1, "ArrowLeft"), 0);
   assert.equal(treeKeyTarget(rows, 0, "ArrowRight"), 1);
@@ -471,6 +482,10 @@ test("Go to file reads one folder at a time and stops at the first folder that d
   const superseding = (step) => { const result = read(step); current = false; return result; };
   assert.equal(await revealPath(new Map(), "a/b/c.md", superseding, () => current), false);
   assert.deepEqual(reads, [""]);
+  // A reveal superseded before it starts reads nothing, even with folders still to read.
+  reads = [];
+  assert.equal(await revealPath(new Map(), "a/b/c.md", read, () => false), false);
+  assert.deepEqual(reads, []);
 });
 
 test("a path the runtime refuses is never planned or read, and one within its limit is planned in linear time", async () => {
@@ -706,4 +721,70 @@ test("a link holds nothing interactive: no link in its label, and an image in it
   assert.doesNotMatch(failed(true), /<button|<a /);
   // The badge link is still charged for its image as a note and a Retry.
   assert.deepEqual([3, 4].map((budget) => parseMarkdownPreview("[![CI](badge.svg)](run)", budget).overBudget), [true, false]);
+});
+
+test("an escaped emphasis, strong or strikethrough closer is text, and an even backslash run before one still closes", () => {
+  const show = (nodes) => nodes.map((node) => node.children ? `<${node.type}>${show(node.children)}</${node.type}>` : node.value).join("");
+  const cases = {
+    // An odd run escapes the closer: it is text, and a later unescaped one closes.
+    "*foo\\*": "*foo*", "*a\\*b*": "<emphasis>a*b</emphasis>", "_a\\_b_": "<emphasis>a_b</emphasis>",
+    "**a\\**": "*<emphasis>a*</emphasis>", "**a\\** b**": "<strong>a** b</strong>", "__a\\__ b__": "<strong>a__ b</strong>",
+    "~~a\\~~": "~~a~~", "~~a\\~~ b~~": "<delete>a~~ b</delete>", "*a\\\\\\*": "*a\\*",
+    // An even run escapes only the backslashes, so the delimiter closes.
+    "*a\\\\*": "<emphasis>a\\</emphasis>", "**a\\\\**": "<strong>a\\</strong>", "~~a\\\\~~": "<delete>a\\</delete>",
+  };
+  for (const [text, expected] of Object.entries(cases)) assert.equal(show(parseInline(text)), expected, text);
+});
+
+test("a link or image destination may hold balanced parentheses; unbalanced ones leave it text", () => {
+  const show = (nodes) => nodes.map((node) => node.type === "link" ? `<a ${node.url}>${show(node.children)}</a>` : node.type === "image" ? `<img ${node.url} ${node.alt}>` : node.value).join("");
+  const cases = {
+    "[x](foo(bar))": "<a foo(bar)>x</a>",
+    "[w](https://en.wikipedia.org/wiki/Foo_(bar))": "<a https://en.wikipedia.org/wiki/Foo_(bar)>w</a>",
+    "[x](a(b(c))d \"t\")": "<a a(b(c))d>x</a>",
+    "![i](shot(1).png)": "<img shot(1).png i>",
+    "[![i](b(1).svg)](run(2))": "<a run(2)><img b(1).svg i></a>",
+    "[x](<a(b)>)": "<a a(b)>x</a>",
+    // Unbalanced, or a "]" inside them, stays text.
+    "[x](foo(bar)": "[x](foo(bar)", "[x](foo(bar )": "[x](foo(bar )", "[x](a)b)": "<a a>x</a>b)", "[x](a(]b))": "[x](a(]b))",
+    [`[x](${"(".repeat(32)}a${")".repeat(32)})`]: `<a ${"(".repeat(32)}a${")".repeat(32)}>x</a>`,
+    [`[x](${"(".repeat(33)}a${")".repeat(33)})`]: `[x](${"(".repeat(33)}a${")".repeat(33)})`,
+  };
+  for (const [text, expected] of Object.entries(cases)) assert.equal(show(parseInline(text)), expected, text);
+  // The address keeps its safety rules: an unsafe scheme with parentheses is still unsafe; a file link resolves.
+  assert.equal(linkTarget(parseInline("[x](javascript:alert(1))")[0].url, "a.md").kind, "unsafe");
+  assert.deepEqual(linkTarget(parseInline("[x](docs/foo(bar).md)")[0].url, "README.md"), { kind: "file", path: "docs/foo(bar).md" });
+});
+
+test("a failed preview request opens a folder only through a folder view, and otherwise always settles", () => {
+  // Initial load: a folder goes to the folder view when there is one; with none it is a file state shown in place.
+  assert.equal(previewFailure("IS_DIRECTORY", false, true), "folder");
+  assert.equal(previewFailure("IS_DIRECTORY", false, false), "replace");
+  // Background refresh: the shown preview of a file that became a folder is replaced, never kept stale.
+  assert.equal(previewFailure("IS_DIRECTORY", true, true), "folder");
+  assert.equal(previewFailure("IS_DIRECTORY", true, false), "replace");
+  // A passing failure keeps a shown preview, a named file state replaces it, and with nothing shown both settle.
+  for (const code of [undefined, "", "INTERNAL"]) assert.deepEqual([previewFailure(code, true, true), previewFailure(code, false, true)], ["keep", "replace"], String(code));
+  for (const code of PREVIEW_FILE_STATES) assert.equal(previewFailure(code, true, false), "replace", code);
+});
+
+test("opening the shown file in the editor sends its resolved path, and a refusal never rejects unhandled", async () => {
+  const sent = [];
+  const refused = new Error("no editor");
+  const request = async (url, options) => { sent.push([url, options]); throw refused; };
+  assert.equal(await openInEditor(request, "/w/main", "docs/real.md", "code"), undefined);
+  assert.deepEqual(sent, [["/api/editor/open", { method: "POST", body: { path: "/w/main", file: "docs/real.md", editor: "code" } }]]);
+  const errors = [];
+  await openInEditor(request, "/w/main", "docs/real.md", undefined, (error) => errors.push(error));
+  assert.deepEqual(errors, [refused]);
+  assert.equal(await openInEditor(async () => "ok", "/w/main", "a.md", "code"), "ok");
+});
+
+test("a renderer error is cleared by switching the Markdown view mode, as by a refresh or a changed preview", () => {
+  const preview = { previewType: "markdown", text: "# a", size: 3 };
+  const shown = { resetKey: 1, preview, mode: "rendered" };
+  assert.equal(rendersAfresh(shown, { resetKey: 1, preview, mode: "source" }), true);
+  assert.equal(rendersAfresh(shown, { resetKey: 1, preview, mode: "rendered" }), false);
+  assert.equal(rendersAfresh(shown, { resetKey: 2, preview, mode: "rendered" }), true);
+  assert.equal(rendersAfresh(shown, { resetKey: 1, preview: { ...preview }, mode: "rendered" }), true);
 });

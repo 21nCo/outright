@@ -247,7 +247,7 @@ const DESTINATION_STOP = /[\s<>()]/;
 
 // The link destination starting at `open`, read in one pass over at most
 // DESTINATION_WINDOW characters: "(", spaces, an optional "<", the address
-// (no spaces, "<", ">", "(" or ")"), an optional ">", then optionally spaces
+// (no spaces, "<" or ">"; parentheses only balanced), an optional ">", then optionally spaces
 // and a "title" in double quotes (no newline), spaces and ")". A title needs
 // a space before its quote, which may be the one after "(" when there is no
 // address. Returns { length, url, title } or null.
@@ -260,11 +260,17 @@ function scanDestination(text, open, stats) {
   skipSpaces();
   if (at < limit && text[at] === "<") at += 1;
   const urlStart = at;
-  while (at < limit && !DESTINATION_STOP.test(text[at])) at += 1;
+  // Up to 32 nested; a "]" inside them ends the address, so a scan crosses at most one other label's end and stays linear.
+  let depth = 0;
+  for (; at < limit; at += 1) {
+    if (text[at] === "(" && depth < 32) depth += 1;
+    else if (text[at] === ")" && depth) depth -= 1;
+    else if (DESTINATION_STOP.test(text[at]) || (depth && text[at] === "]")) break;
+  }
   const url = text.slice(urlStart, at);
   if (at < limit && text[at] === ">") at += 1;
   skipSpaces();
-  if (at < limit && text[at] === "\"" && at - 1 > open && SPACE.test(text[at - 1])) {
+  if (!depth && at < limit && text[at] === "\"" && at - 1 > open && SPACE.test(text[at - 1])) {
     const titleStart = at + 1;
     at = titleStart;
     while (at < limit && text[at] !== "\"" && text[at] !== "\n") at += 1;
@@ -274,7 +280,7 @@ function scanDestination(text, open, stats) {
       skipSpaces();
       if (at < limit && text[at] === ")") found = { length: at + 1 - open, url, title };
     }
-  } else if (at < limit && text[at] === ")") found = { length: at + 1 - open, url, title: undefined };
+  } else if (!depth && at < limit && text[at] === ")") found = { length: at + 1 - open, url, title: undefined };
   // Every character looked at, including the one that ended the scan.
   if (stats) stats.scanned += Math.min(at + 1, limit) - open;
   return found;
@@ -283,7 +289,7 @@ function scanDestination(text, open, stats) {
 // A closing delimiter follows a non-space; a closing "_" is not followed by
 // a letter or digit.
 function canClose(text, delimiter, at) {
-  return !SPACE.test(text[at - 1]) && !(delimiter[0] === "_" && WORD.test(text[at + delimiter.length] ?? ""));
+  return !SPACE.test(text[at - 1]) && !(delimiter[0] === "_" && WORD.test(text[at + delimiter.length] ?? "")) && !escapedAt(text, at); // an escaped one is text
 }
 
 const escapedAt = (text, at) => { let slashes = 0; while (text[at - 1 - slashes] === "\\") slashes += 1; return slashes % 2 === 1; }; // by an odd run of backslashes
