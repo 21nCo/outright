@@ -246,7 +246,7 @@ const DESTINATION_WINDOW = 2049;
 const DESTINATION_STOP = /[\s<>()]/;
 
 // The link destination starting at `open`, read in one pass over at most
-// DESTINATION_WINDOW characters: "(", spaces, then "<address>" (spaces and parentheses allowed; no newline, "<" or ">") or a bare address (no spaces, "<" or ">"; parentheses only balanced), with a backslash making punctuation literal and dropped, then optionally spaces
+// DESTINATION_WINDOW characters: "(", spaces, then "<address>" (" " and parentheses allowed; no other space, "<" or ">") or a bare address (no spaces, "<" or ">"; parentheses only balanced), with a backslash making punctuation literal and dropped, then optionally spaces
 // and a "title" in double quotes (no newline), spaces and ")". A title needs
 // a space before its quote, which may be the one after "(" when there is no
 // address. Returns { length, url, title } or null.
@@ -264,7 +264,7 @@ function scanDestination(text, open, stats) {
   skipSpaces();
   const angle = at < limit && text[at] === "<";
   if (angle) at += 1;
-  const url = read(angle ? (c, escaped) => !escaped && (c === "<" || c === ">" || c === "\n") : bare);
+  const url = read(angle ? (c, escaped) => !escaped && (c === "<" || c === ">" || (c !== " " && SPACE.test(c))) : bare); // of spaces only " "
   const closed = angle ? at < limit && text[at] === ">" : !depth; // "<address" needs its ">", a bare one balanced parentheses
   if (angle && closed) at += 1;
   skipSpaces();

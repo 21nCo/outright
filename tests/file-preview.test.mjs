@@ -774,6 +774,8 @@ test("a destination is either one <address> or one bare address, and a backslash
     "[x](<a\\>b>)": "<a a>b>x</a>", "[x](<> \"t\")": "<a  \"t\">x</a>", "[x](<a> \"t\")": "<a a \"t\">x</a>",
     // An unclosed "<", a stray ">" or "<", or a newline inside the brackets leaves it text.
     "[x](<a)": "[x](<a)", "[x](a>)": "[x](a>)", "[x](a<b)": "[x](a<b)", "[x](<a<b>)": "[x](<a<b>)", "[x](<a\nb>)": "[x](<a b>)",
+    // Of spaces, only " " may sit inside the brackets, so a target never joins words across a tab or reads past other spaces.
+    "[x](<a\tb>)": "[x](<a\tb>)", "[x](<\u00a0//evil.example/x>)": "[x](<\u00a0//evil.example/x>)", "[x](<a\u2028b>)": "[x](<a\u2028b>)",
     // An escaped "]" inside parentheses still ends the address.
     "[x](a(\\]))": "[x](a(]))",
     // A title may hold an escaped quote.
@@ -792,7 +794,7 @@ test("a destination is either one <address> or one bare address, and a backslash
   assert.deepEqual(targets, [{ kind: "file", path: "docs/my notes.md" }, { kind: "file", path: "docs/mynotes.md" }, { kind: "file", path: "img/my pic.png" },
     { kind: "file", path: "docs/a b.md" }, { kind: "external", href: "https://example.com/a%20b?q=c%20d" }]);
   // A scheme is still spotted with spaces, tabs and controls ignored, and one split by a space is never an external link.
-  for (const text of ["[x](<java script:alert(1)>)", "[x](< javascript:alert(1)>)", "[x](<java\tscript:x>)", "[x](<ht tps://example.com>)", "[x](< //evil.example/x>)"]) {
+  for (const text of ["[x](<java script:alert(1)>)", "[x](< javascript:alert(1)>)", "[x](<ht tps://example.com>)", "[x](< //evil.example/x>)"]) {
     assert.equal(linkTarget(parseInline(text)[0].url, "a.md").kind, "unsafe", text);
   }
 });
