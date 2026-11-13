@@ -10,7 +10,8 @@ reviews:
     files:
       # Prose documentation. The local review runs a docs-vs-code check (cubic
       # CLI) before the PR opens and on every fix push.
-      - '**/README.md'
+      - 'automation/hermes/README.md'
+      - 'tests/fixtures/execution-adapters/README.md'
       - '**/CHANGELOG.md'
       - '**/CONTRIBUTING.md'
       # Recorded test data (data file types only; helper code under these folders stays reviewed)
@@ -22,7 +23,6 @@ reviews:
       - '**/fixtures/**/*.txt'
       - '**/fixtures/**/*.csv'
       - '**/fixtures/**/*.tsv'
-      - '**/fixtures/**/*.html'
       - '**/fixtures/**/*.xml'
       - '**/fixtures/**/*.eml'
       - '**/fixtures/**/*.sse'
@@ -37,7 +37,6 @@ reviews:
       - '**/__fixtures__/**/*.txt'
       - '**/__fixtures__/**/*.csv'
       - '**/__fixtures__/**/*.tsv'
-      - '**/__fixtures__/**/*.html'
       - '**/__fixtures__/**/*.xml'
       - '**/__fixtures__/**/*.eml'
       - '**/__fixtures__/**/*.sse'
@@ -52,7 +51,6 @@ reviews:
       - '**/testdata/**/*.txt'
       - '**/testdata/**/*.csv'
       - '**/testdata/**/*.tsv'
-      - '**/testdata/**/*.html'
       - '**/testdata/**/*.xml'
       - '**/testdata/**/*.eml'
       - '**/testdata/**/*.sse'
@@ -67,7 +65,6 @@ reviews:
       - '**/golden/**/*.txt'
       - '**/golden/**/*.csv'
       - '**/golden/**/*.tsv'
-      - '**/golden/**/*.html'
       - '**/golden/**/*.xml'
       - '**/golden/**/*.eml'
       - '**/golden/**/*.sse'
