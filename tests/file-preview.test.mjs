@@ -73,6 +73,12 @@ test("adversarial Markdown near the preview size limit parses with linear work a
     // Destinations may hold balanced parentheses; a "]" inside them ends the address, so no scan runs on through later labels.
     "parentheses in destinations": fill("[x](a(b)"), "open parentheses in destinations": fill("[](("), "labels in open parentheses": fill("[](a(b"),
     "balanced parentheses before labels": fill("[x](a(b)c"), "deep parentheses": fill(`[x](${"(".repeat(32)}${")".repeat(32)}`),
+    // Escaped parentheses are literal and never change the depth; an escaped "]" inside parentheses still ends the address.
+    "escaped parentheses": fill("\\("), "escaped closing parentheses": fill("\\)"), "escaped parentheses in destinations": fill("[x](a\\("),
+    "escaped closers in destinations": fill("[x](a\\)"), "escaped label ends in parentheses": fill("[a\\](b(c)"), "escaped brackets in destinations": fill("[x](a\\]("),
+    // An angle-bracket address ends at the next unescaped "<", so its scan reaches no further than the next one's start.
+    "angle-bracket destinations": fill("[a](<"), "parentheses in angle brackets": fill("[a](<("), "labels in angle brackets": fill("[a](<b](c"),
+    "escaped angle brackets": fill("[a](<b\\<](c"), "escaped quotes in titles": fill("[a](b \"\\\""),
     // Link destinations are scanned once per label: a long space or tab run
     // after "(" was quadratic in the old pattern's overlapping quantifiers.
     "empty labels before spaces": fill(`[](${" ".repeat(2000)}`),
@@ -100,6 +106,7 @@ test("adversarial Markdown near the preview size limit parses with linear work a
     // pattern that backtracks outside the count; no pattern left in the
     // parser has adjacent quantifiers that can match the same text.
     assert.ok(stats.steps > 0 && stats.steps + stats.scanned <= 8 * source.length, `${name}: ${stats.steps} steps and ${stats.scanned} characters searched for ${source.length}`);
+    if (/escaped|angle/.test(name)) assert.ok(stats.scanned <= 4 * source.length, `${name}: ${stats.scanned} characters searched for ${source.length}`);
     // Text is copied in runs, not a piece per character that starts nothing.
     assert.ok(stats.pieces <= source.length / 2, `${name}: ${stats.pieces} text pieces for ${source.length} characters`);
     assert.ok(elapsed < 4000, `${name} took ${Math.round(elapsed)}ms`);
@@ -754,6 +761,31 @@ test("a link or image destination may hold balanced parentheses; unbalanced ones
   // The address keeps its safety rules: an unsafe scheme with parentheses is still unsafe; a file link resolves.
   assert.equal(linkTarget(parseInline("[x](javascript:alert(1))")[0].url, "a.md").kind, "unsafe");
   assert.deepEqual(linkTarget(parseInline("[x](docs/foo(bar).md)")[0].url, "README.md"), { kind: "file", path: "docs/foo(bar).md" });
+});
+
+test("a destination is either one <address> or one bare address, and a backslash makes punctuation in it literal", () => {
+  const show = (nodes) => nodes.map((node) => node.type === "link" ? `<a ${node.url}${node.title ? ` "${node.title}"` : ""}>${show(node.children)}</a>` : node.type === "image" ? `<img ${node.url} ${node.alt}>` : node.value).join("");
+  const cases = {
+    // An escaped parenthesis is part of the address, without its backslash, and never counts toward the balance.
+    "[x](foo\\))": "<a foo)>x</a>", "[x](a\\(b)": "<a a(b>x</a>", "[x](a\\)b)": "<a a)b>x</a>", "![i](foo\\))": "<img foo) i>",
+    "[x](a(b\\)c))": "<a a(b)c)>x</a>", "[x](\\\\))": "<a \\>x</a>)", "[x](a\\b)": "<a a\\b>x</a>",
+    // An <address> holds spaces and any parentheses, and needs its own ">".
+    "[x](<a(b>)": "<a a(b>x</a>", "[x](<a)b>)": "<a a)b>x</a>", "[x](<a b>)": "<a a b>x</a>", "![i](<a(b>)": "<img a(b i>",
+    "[x](<a\\>b>)": "<a a>b>x</a>", "[x](<> \"t\")": "<a  \"t\">x</a>", "[x](<a> \"t\")": "<a a \"t\">x</a>",
+    // An unclosed "<", a stray ">" or "<", or a newline inside the brackets leaves it text.
+    "[x](<a)": "[x](<a)", "[x](a>)": "[x](a>)", "[x](a<b)": "[x](a<b)", "[x](<a<b>)": "[x](<a<b>)", "[x](<a\nb>)": "[x](<a b>)",
+    // An escaped "]" inside parentheses still ends the address.
+    "[x](a(\\]))": "[x](a(]))",
+    // A title may hold an escaped quote.
+    "[x](a \"t\\\"u\")": "<a a \"t\"u\">x</a>",
+    // A badge's link target may be an <address>.
+    "[![b](i.svg)](<t(1)>)": "<a t(1)><img i.svg b></a>",
+  };
+  for (const [text, expected] of Object.entries(cases)) assert.equal(show(parseInline(text)), expected, text);
+  // The unescaped address is what the safety rules see.
+  assert.equal(linkTarget(parseInline("[x](javascript\\:alert(1))")[0].url, "a.md").kind, "unsafe");
+  assert.equal(linkTarget(parseInline("[x](<javascript:alert(1)>)")[0].url, "a.md").kind, "unsafe");
+  assert.deepEqual(linkTarget(parseInline("[x](<docs/a(1).md>)")[0].url, "README.md"), { kind: "file", path: "docs/a(1).md" });
 });
 
 test("a failed preview request opens a folder only through a folder view, and otherwise always settles", () => {

@@ -246,8 +246,7 @@ const DESTINATION_WINDOW = 2049;
 const DESTINATION_STOP = /[\s<>()]/;
 
 // The link destination starting at `open`, read in one pass over at most
-// DESTINATION_WINDOW characters: "(", spaces, an optional "<", the address
-// (no spaces, "<" or ">"; parentheses only balanced), an optional ">", then optionally spaces
+// DESTINATION_WINDOW characters: "(", spaces, then "<address>" (spaces and parentheses allowed; no newline, "<" or ">") or a bare address (no spaces, "<" or ">"; parentheses only balanced), with a backslash making punctuation literal and dropped, then optionally spaces
 // and a "title" in double quotes (no newline), spaces and ")". A title needs
 // a space before its quote, which may be the one after "(" when there is no
 // address. Returns { length, url, title } or null.
@@ -257,30 +256,27 @@ function scanDestination(text, open, stats) {
   let at = open + 1;
   let found = null;
   const skipSpaces = () => { while (at < limit && SPACE.test(text[at])) at += 1; };
-  skipSpaces();
-  if (at < limit && text[at] === "<") at += 1;
-  const urlStart = at;
-  // Up to 32 nested; a "]" inside them ends the address, so a scan crosses at most one other label's end and stays linear.
+  // Reads up to the first character `stops` accepts; an escaped one is passed to it as escaped and kept without its backslash.
+  const read = (stops, value = "") => { for (let escaped; at < limit && !stops(text[(escaped = text[at] === "\\" && at + 1 < limit && PUNCTUATION.test(text[at + 1])) ? at + 1 : at], escaped); at += 1) value += text[escaped ? ++at : at]; return value; };
+  // Up to 32 nested; any "]" inside them, even an escaped one, ends the address, so a scan crosses at most one other label's end and stays linear.
   let depth = 0;
-  for (; at < limit; at += 1) {
-    if (text[at] === "(" && depth < 32) depth += 1;
-    else if (text[at] === ")" && depth) depth -= 1;
-    else if (DESTINATION_STOP.test(text[at]) || (depth && text[at] === "]")) break;
-  }
-  const url = text.slice(urlStart, at);
-  if (at < limit && text[at] === ">") at += 1;
+  const bare = (c, escaped) => (depth > 0 && c === "]") || (!escaped && (c === "(" && depth < 32 ? (depth += 1, false) : c === ")" && depth > 0 ? (depth -= 1, false) : DESTINATION_STOP.test(c)));
   skipSpaces();
-  if (!depth && at < limit && text[at] === "\"" && at - 1 > open && SPACE.test(text[at - 1])) {
-    const titleStart = at + 1;
-    at = titleStart;
-    while (at < limit && text[at] !== "\"" && text[at] !== "\n") at += 1;
+  const angle = at < limit && text[at] === "<";
+  if (angle) at += 1;
+  const url = read(angle ? (c, escaped) => !escaped && (c === "<" || c === ">" || c === "\n") : bare);
+  const closed = angle ? at < limit && text[at] === ">" : !depth; // "<address" needs its ">", a bare one balanced parentheses
+  if (angle && closed) at += 1;
+  skipSpaces();
+  if (closed && at < limit && text[at] === "\"" && at - 1 > open && SPACE.test(text[at - 1])) {
+    at += 1;
+    const title = read((c, escaped) => !escaped && (c === "\"" || c === "\n"));
     if (at < limit && text[at] === "\"") {
-      const title = text.slice(titleStart, at);
       at += 1;
       skipSpaces();
       if (at < limit && text[at] === ")") found = { length: at + 1 - open, url, title };
     }
-  } else if (!depth && at < limit && text[at] === ")") found = { length: at + 1 - open, url, title: undefined };
+  } else if (closed && at < limit && text[at] === ")") found = { length: at + 1 - open, url, title: undefined };
   // Every character looked at, including the one that ended the scan.
   if (stats) stats.scanned += Math.min(at + 1, limit) - open;
   return found;
