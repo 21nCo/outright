@@ -413,12 +413,13 @@ function inline(text, start, end, context, depth) {
 // link names a worktree file; anything else (javascript:, data:, file:,
 // protocol-relative) is shown as text.
 export function linkTarget(url, fromFile) {
+  const spelled = String(url ?? "").replace(/[\u0000-\u001f\u007f]/g, "").trim(); // an <address> may hold spaces; its target keeps them, while a scheme is spotted without them
   const cleaned = String(url ?? "").replace(/[\u0000- \u007f]/g, "");
   if (!cleaned) return { kind: "none" };
-  if (/^(?:https?|mailto):/i.test(cleaned)) return { kind: "external", href: cleaned };
+  if (/^(?:https?|mailto):/i.test(cleaned)) return /^(?:https?|mailto):/i.test(spelled) ? { kind: "external", href: spelled.replaceAll(" ", "%20") } : { kind: "unsafe" };
   if (cleaned.startsWith("#")) return { kind: "anchor" };
   if (/^[a-z][a-z0-9+.-]*:/i.test(cleaned) || cleaned.startsWith("//") || cleaned.startsWith("\\")) return { kind: "unsafe" };
-  const target = cleaned.split(/[?#]/, 1)[0];
+  const target = spelled.split(/[?#]/, 1)[0];
   let decoded;
   try { decoded = decodeURIComponent(target); } catch { return { kind: "unsafe" }; }
   const parts = target.startsWith("/") ? [] : String(fromFile ?? "").split("/").slice(0, -1);

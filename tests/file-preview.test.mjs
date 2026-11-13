@@ -786,6 +786,15 @@ test("a destination is either one <address> or one bare address, and a backslash
   assert.equal(linkTarget(parseInline("[x](javascript\\:alert(1))")[0].url, "a.md").kind, "unsafe");
   assert.equal(linkTarget(parseInline("[x](<javascript:alert(1)>)")[0].url, "a.md").kind, "unsafe");
   assert.deepEqual(linkTarget(parseInline("[x](<docs/a(1).md>)")[0].url, "README.md"), { kind: "file", path: "docs/a(1).md" });
+  // Spaces in an <address> stay in the file, image or external target it names, never joining the words into another name.
+  const targets = ["[x](<docs/my notes.md>)", "[x](docs/mynotes.md)", "![i](<img/my pic.png>)", "[x](< docs/a b.md >)", "[x](<https://example.com/a b?q=c d>)"]
+    .map((text) => linkTarget(parseInline(text)[0].url, "README.md"));
+  assert.deepEqual(targets, [{ kind: "file", path: "docs/my notes.md" }, { kind: "file", path: "docs/mynotes.md" }, { kind: "file", path: "img/my pic.png" },
+    { kind: "file", path: "docs/a b.md" }, { kind: "external", href: "https://example.com/a%20b?q=c%20d" }]);
+  // A scheme is still spotted with spaces, tabs and controls ignored, and one split by a space is never an external link.
+  for (const text of ["[x](<java script:alert(1)>)", "[x](< javascript:alert(1)>)", "[x](<java\tscript:x>)", "[x](<ht tps://example.com>)", "[x](< //evil.example/x>)"]) {
+    assert.equal(linkTarget(parseInline(text)[0].url, "a.md").kind, "unsafe", text);
+  }
 });
 
 test("a failed preview request opens a folder only through a folder view, and otherwise always settles", () => {
