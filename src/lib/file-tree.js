@@ -1,0 +1,208 @@
+// The Files tree's visible rows, in reading order. Folders load lazily, so a
+// row is an entry, or a folder's loading, failure, empty, "load more" or
+// scan-limit state; each is reachable from the keyboard. Folders are kept in
+// a Map keyed by path, so a folder named "constructor" or "__proto__" is an
+// ordinary key rather than an inherited property. An entry without a path
+// (a name that is not UTF-8) cannot be addressed, so it never expands.
+
+export function isExpandable(entry) {
+  return isFolderPath(entry?.path) && (entry.kind === "directory" || (entry.kind === "symlink" && entry.target?.state === "directory"));
+}
+
+// A path names one entry; an entry without one is named by its folder and
+// its raw name bytes (nameKey), since two such names can decode alike. Ids
+// carry no NUL or other control character (JSON escapes them), since a row
+// id is a DOM attribute value.
+export function entryRowId(directory, entry) {
+  return typeof entry.path === "string" ? `entry:${entry.path}` : `raw:${JSON.stringify([directory, entry.nameKey ?? entry.name])}`;
+}
+
+// The row element with `id`, compared as a string rather than through a CSS
+// selector, which cannot match every attribute value.
+export function rowElement(tree, id) {
+  for (const element of tree.querySelectorAll("[data-row-id]")) if (element.dataset.rowId === id) return element;
+  return null;
+}
+
+// The show-hidden choice is saved in the browser. Storage that is full,
+// unavailable or refused (a private window, a sandboxed frame) keeps the
+// choice in memory for this pane: reading gives false and saving returns
+// false, and neither throws into the workspace. `storage` returns the
+// Storage, so a refused localStorage getter is caught here too.
+export const HIDDEN_FILES_KEY = "outright.files.show-hidden";
+
+export function readHiddenPreference(storage) {
+  try { return storage().getItem(HIDDEN_FILES_KEY) === "true"; } catch { return false; }
+}
+
+export function saveHiddenPreference(storage, value) {
+  try { storage().setItem(HIDDEN_FILES_KEY, String(Boolean(value))); return true; } catch { return false; }
+}
+
+export function isFolderPath(path) { return typeof path === "string" && path !== ""; }
+
+// Walks open folders depth-first with a stack, not recursion: a 2,047-level reveal cannot overflow the call stack.
+export function visibleRows(folders, expanded) {
+  const rows = [];
+  // A folder is shown once per tree, however its entries name it.
+  const visited = new Set();
+  const stack = [];
+  const enter = (directory, level) => { // adds a folder's state rows, or pushes a listed folder for its entries
+    visited.add(directory);
+    const folder = folders.get(directory);
+    if (!folder || (folder.status === "loading" && !folder.entries)) { rows.push({ id: `loading:${directory}`, type: "loading", directory, level }); return; }
+    if (folder.status === "error" && folder.error?.code === "LISTING_UNAVAILABLE") { rows.push({ id: `unavailable:${directory}`, type: "unavailable", directory, level, error: folder.error }); return; }
+    if (folder.status === "error") { rows.push({ id: `error:${directory}`, type: "error", directory, level, error: folder.error }); return; }
+    if (!folder.entries.length) rows.push({ id: `empty:${directory}`, type: "empty", directory, level, hiddenCount: folder.hiddenCount });
+    // What follows the shown entries, as the server counted it with the
+    // last page; unknown (null) without that count. The folder's total
+    // can mix generations once later pages are added to earlier ones.
+    let remaining = 0;
+    if (folder.nextCursor) remaining = Number.isInteger(folder.remaining) && folder.remaining >= 0 ? folder.remaining : null;
+    const setSize = remaining === null ? -1 : folder.entries.length + remaining; // -1: aria-setsize for a total not known
+    stack.push({ directory, level, folder, remaining, setSize, index: 0 });
+  };
+  enter("", 1);
+  while (stack.length) {
+    const frame = stack.at(-1), { directory, level, folder } = frame;
+    if (frame.index < folder.entries.length) {
+      const entry = folder.entries[frame.index++];
+      const expandable = isExpandable(entry);
+      const open = expandable && expanded.has(entry.path) && !visited.has(entry.path);
+      rows.push({ id: entryRowId(directory, entry), type: "entry", entry, directory, level, expandable, open,
+        setSize: frame.setSize, position: frame.index });
+      if (open) enter(entry.path, level + 1);
+      continue;
+    }
+    stack.pop();
+    // While the first page reloads, the old cursor belongs to a listing that
+    // is being replaced, so "load more" waits for the new one.
+    if (folder.nextCursor) rows.push({ id: `more:${directory}`, type: "more", directory, level, loading: Boolean(folder.loadingMore) || folder.status === "loading", error: folder.moreError, remaining: frame.remaining });
+    if (folder.truncated) rows.push({ id: `truncated:${directory}`, type: "truncated", directory, level, limit: folder.scanLimit });
+  }
+  return rows;
+}
+
+// The row a key moves to from `index`, or -1 when the key is not a move.
+export function treeKeyTarget(rows, index, key) {
+  if (!rows.length) return -1;
+  if (!(Number.isInteger(index) && index >= 0 && index < rows.length)) index = -1; // no row: every key moves as from -1
+  if (key === "ArrowDown") return Math.min(rows.length - 1, index + 1);
+  if (key === "ArrowUp") return Math.max(0, index - 1);
+  if (key === "Home") return 0;
+  if (key === "End") return rows.length - 1;
+  if (key === "ArrowLeft") {
+    const directory = rows[index]?.directory;
+    return directory ? rows.findIndex((row) => row.type === "entry" && row.entry.path === directory) : -1;
+  }
+  if (key === "ArrowRight") return rows[index]?.open ? Math.min(rows.length - 1, index + 1) : -1;
+  if (key.length === 1 && key.trim()) {
+    const lower = key.toLowerCase();
+    for (let step = 1; step <= rows.length; step += 1) {
+      const row = rows[(index + step) % rows.length];
+      if (row.type === "entry" && row.entry.name.toLowerCase().startsWith(lower)) return (index + step) % rows.length;
+    }
+  }
+  return -1;
+}
+
+export function formatBytes(bytes) {
+  if (!Number.isFinite(bytes)) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB"];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+  return `${value >= 10 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+}
+
+// A typed path, as the runtime names it: empty and "." segments are dropped as it drops them. Spaces
+// and backslashes are part of a POSIX name, so they are kept (on Windows, see FilePreview onResolved).
+export function normalizeTypedPath(value) {
+  const typed = String(value ?? "");
+  if (!typed.trim()) return "";
+  return typed.split("/").filter((segment) => segment && segment !== ".").join("/");
+}
+
+// The runtime refuses a path over 4096 characters, or with NUL, so none is planned or read.
+export const revealable = (path) => typeof path === "string" && path !== "" && path.length <= 4096 && !path.includes("\0");
+
+export function ancestorsOf(file) {
+  const found = [];
+  for (let at = file.indexOf("/"); at > 0; at = file.indexOf("/", at + 1)) found.push(file.slice(0, at));
+  return found;
+}
+
+// Text is compared as text (and size), so a write the file's version cannot see (a
+// timestamp of coarse resolution) is still shown. An image or PDF is kept
+// only on the same version, which raw also checks before serving bytes.
+export function samePreview(shown, next) {
+  if (shown.previewType !== next.previewType || (shown.link?.target ?? null) !== (next.link?.target ?? null)) return false;
+  // The size is shown too: a byte order mark added or removed leaves the
+  // decoded text alike but changes it.
+  if (typeof shown.text === "string" || typeof next.text === "string") return shown.text === next.text && shown.size === next.size;
+  return shown.version === next.version && shown.size === next.size && shown.limit === next.limit && shown.reason === next.reason;
+}
+
+// A preview's state names its target (project, worktree, file). Its resolved path (label, Refresh folder)
+// and a preview a refresh may keep carry over only within that target, never to another file or worktree.
+export const sameTarget = (a, b) => a?.projectId === b?.projectId && a?.worktreePath === b?.worktreePath && a?.file === b?.file;
+const keptPath = (prior, target) => (sameTarget(prior?.target, target) ? prior.path : undefined);
+export const loadingPreview = (prior, target) => ({ status: "loading", target, path: keptPath(prior, target) });
+export const failedPreview = (prior, target, error) => ({ status: "error", target, path: keptPath(prior, target), code: error?.payload?.code ?? "", message: error?.message });
+export const shownPreview = (state, target, mediaFailed) => (state.status === "ready" && sameTarget(state.target, target) && !mediaFailed ? state : null);
+export const openedPath = (state, target) => (sameTarget(state.target, target) && state.path) || target.file;
+
+// A refresh, an answer that changes the preview (samePreview keeps an unchanged one) or another view mode clears a renderer error.
+export const rendersAfresh = (prior, next) => prior.resetKey !== next.resetKey || prior.preview !== next.preview || prior.mode !== next.mode;
+
+// What a failed preview request does: a folder goes to the folder view when there is one; else an answer that names the
+// file's state (a folder is one) replaces the shown preview, and a passing failure (network, server) keeps it.
+export const PREVIEW_FILE_STATES = new Set(["IS_DIRECTORY", "MISSING", "BROKEN_LINK", "OUTSIDE_WORKTREE", "PATH_OUTSIDE", "LINK_LOOP", "EXCLUDED", "UNREADABLE", "PREVIEW_UNAVAILABLE"]);
+export const previewFailure = (code, background, folderView) => (code === "IS_DIRECTORY" && folderView ? "folder" : background && !PREVIEW_FILE_STATES.has(code) ? "keep" : "replace");
+
+// Opens a file (its resolved path) in the editor; a refusal goes to onError, if any, and never rejects unhandled.
+export const openInEditor = (request, path, file, editor, onError) => request("/api/editor/open", { method: "POST", body: { path, file, editor } }).catch((error) => onError?.(error));
+
+// A viewer that did not load (module-retry.js) offers a page reload if only that repairs it, else a retry; both if retryable.
+export const viewerFailure = (error) => (error?.reloadRequired ? { reload: true, retry: Boolean(error.retryable) } : { reload: false, retry: true });
+
+// Go to file looks for each step of its path in up to this many entries of a folder.
+export const MAX_REVEAL_ENTRIES = 2000;
+
+// Whether a listing read needs another page: to list as many entries as
+// were shown, or to reach `find` within MAX_REVEAL_ENTRIES.
+export function needsPage(entries, { keep = 0, find = "" } = {}) {
+  return entries.length < keep || (Boolean(find) && entries.length < MAX_REVEAL_ENTRIES && !entries.some((entry) => entry.path === find));
+}
+
+// The reads that show `path` in the tree: each folder on its way whose
+// listing does not name the next step yet, read again until it does (depth: folders of `chain` it opens).
+export function revealReads(folders, path, chain = ancestorsOf(path)) {
+  return ["", ...chain].flatMap((directory, depth) => {
+    const find = chain[depth] ?? path;
+    const folder = folders.get(directory);
+    if (folder?.status !== "error" && folder?.entries?.some((entry) => entry.path === find)) return [];
+    return [{ directory, find, keep: folder?.entries?.length ?? 0, depth }];
+  });
+}
+
+// Makes those reads one at a time, in order, and stops at a folder that does
+// not list its next step (missing, refused or past the bound) or once
+// `active()` is false, so a path deeper than what exists costs one read; a refused path costs none.
+export async function revealPath(folders, path, read, active, chain) {
+  if (!revealable(path)) return false;
+  for (const step of revealReads(folders, path, chain ?? ancestorsOf(path))) {
+    const entries = active() ? await read(step) : null; // a reveal no longer wanted reads nothing more
+    if (!active() || !entries?.some((entry) => entry.path === step.find)) return false;
+  }
+  return true;
+}
+
+// Whether a run that ended in chat `id` may have changed the shown worktree:
+// a listed chat answers at once; any other (archived while its run finished,
+// or another project's) is read alone, so the cost does not grow with history.
+export async function worktreeOwnsChat(id, { projectId, worktreeId }, knownChats, readChat) {
+  const chat = knownChats.find((known) => known.id === id) ?? await readChat(id).catch(() => null);
+  return chat?.projectId === projectId && chat?.worktreeId === worktreeId;
+}
