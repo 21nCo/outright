@@ -15,7 +15,7 @@ const MAX_PAGE_SIZE = 500;
 // Browses one worktree. The pane is keyed by the worktree, so nothing it
 // loaded can appear for another one; each folder's request is fenced by a
 // token, so a reload or a hidden-file change supersedes answers in flight.
-export function FilesPane({ project, worktree, settings, completions, quickOpen, onQuickOpenHandled, onError }) {
+export function FilesPane({ project, worktree, settings, completions, quickOpen, quickOpenHint = "⌘P", onQuickOpenHandled, onError }) {
   const [showHidden, setShowHidden] = useState(() => readHiddenPreference(browserStorage));
   const [folders, setFolders] = useState(() => new Map());
   const [expanded, setExpanded] = useState(() => new Set());
@@ -237,11 +237,13 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
 
   const toggleFolder = useCallback((path, open) => {
     if (!isFolderPath(path)) return;
-    // A collapse ends the reads in flight under it; those folders close, and are read afresh when opened.
-    const dropped = open ? [] : [...foldersRef.current.keys()].filter((directory) => (directory === path || directory.startsWith(`${path}/`)) && dropListing(directory, false));
+    // A collapse closes every folder under it too, so a reload reads only shown folders;
+    // the reads in flight under it end, and those folders are read afresh when opened.
+    const under = (directory) => directory === path || directory.startsWith(`${path}/`);
+    if (!open) for (const directory of [...foldersRef.current.keys()].filter(under)) dropListing(directory, false);
     setExpanded((current) => {
       const next = new Set(current);
-      if (open) next.add(path); else for (const each of [path, ...dropped]) next.delete(each);
+      if (open) next.add(path); else for (const each of current) if (under(each)) next.delete(each);
       return next;
     });
     const folder = foldersRef.current.get(path);
@@ -372,7 +374,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
       </div>
     </header>
     <form className="files-jump" role="search" aria-label="Go to file" onSubmit={(event) => { event.preventDefault(); openPath(normalizeTypedPath(jump)); }}>
-      <Input ref={jumpRef} aria-label="Go to file path" placeholder="Go to file… (⌘P)" value={jump} onChange={(event) => setJump(event.target.value)} spellCheck={false} autoComplete="off" />
+      <Input ref={jumpRef} aria-label="Go to file path" placeholder={`Go to file… (${quickOpenHint})`} value={jump} onChange={(event) => setJump(event.target.value)} spellCheck={false} autoComplete="off" />
     </form>
     <span className="sr-only" role="status" aria-live="polite">{announcement}</span>
     <div className="files-layout">

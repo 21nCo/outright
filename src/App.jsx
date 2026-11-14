@@ -42,6 +42,8 @@ import { PANE_LAYOUT_PRESETS, PANE_STORE_PROBLEMS, applyPreset, defaultPaneLayou
 
 const CHAT_TAB_DRAG_TYPE = "application/x-outright-chat-tab";
 const APPLE_PLATFORM = typeof navigator !== "undefined" && /mac|iphone|ipad|ipod/i.test(navigator.userAgentData?.platform ?? navigator.platform ?? "");
+// Go to file is ⌘P on Apple platforms and Ctrl+P elsewhere (the keyboard handler).
+const QUICK_OPEN_HINT = APPLE_PLATFORM ? "⌘P" : "Ctrl+P";
 const MAX_RENDERED_MESSAGES = 1000;
 function moveMessageViewport(viewport, top) {
   if (!viewport) return;
@@ -2090,7 +2092,7 @@ export function App() {
   filesShownRef.current = paneViews.includes("files");
   // Pane toggles in the toolbar; at 520px or less they move into the Panes
   // menu, so every toolbar action stays within a 320px window.
-  const PANE_TOGGLES = [["changes", "Changes", GitDiff, "Changes"], ["terminal", "Terminal", TerminalWindow, "Terminal ⌘⇧T"], ["context", "Project context", Info, "Project context"], ["files", "Files", FolderOpen, "Files ⌘P"]];
+  const PANE_TOGGLES = [["changes", "Changes", GitDiff, "Changes"], ["terminal", "Terminal", TerminalWindow, "Terminal ⌘⇧T"], ["context", "Project context", Info, "Project context"], ["files", "Files", FolderOpen, `Files ${QUICK_OPEN_HINT}`]];
   // As with a toggle, a pane opened from the menu takes focus; closing one
   // returns focus to the menu's trigger.
   const togglePaneFromMenu = (view) => { paneMenuFocusRef.current = paneViews.includes(view) ? "" : view; paneLayoutRef.current?.toggle(view); };
@@ -2124,7 +2126,7 @@ export function App() {
     changes: <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />,
     terminal: <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} terminalsVersion={terminalsVersion} unverifiedTerminalIds={unverifiedTerminalIds} sendRuntime={sendRuntime} onError={handleError} />,
     context: <ContextPane worktree={worktree} settings={settings} onError={handleError} />,
-    files: <FilesPane key={`${project.id}:${worktree.path}`} project={project} worktree={worktree} settings={settings} completions={filesCompletions} quickOpen={quickOpenRequest} onQuickOpenHandled={clearQuickOpen} onError={handleError} />,
+    files: <FilesPane key={`${project.id}:${worktree.path}`} project={project} worktree={worktree} settings={settings} completions={filesCompletions} quickOpen={quickOpenRequest} quickOpenHint={QUICK_OPEN_HINT} onQuickOpenHandled={clearQuickOpen} onError={handleError} />,
   };
 
   return <div className={`app-shell ${sidebarOpen ? "sidebar-is-open" : "sidebar-is-closed"}`}>

@@ -10400,6 +10400,17 @@ async function filesInheritedRegression() {
     await until(() => row("entry:nest/inner")?.getAttribute("aria-expanded") === "false", "nest/inner stayed open, waiting on its aborted read");
     row("entry:nest/inner").click();
     await until(() => asked("list", "nest/inner") === 2 && row("entry:nest/inner/x.md"), "opening nest/inner again did not read it anew");
+    // A refresh reads no loaded open folder hidden under a collapsed one; opening it again works.
+    row("entry:nest").click();
+    await until(() => !row("entry:nest/inner"), "nest did not collapse over nest/inner");
+    const [rootReads, innerReads] = [asked("list", ""), asked("list", "nest/inner")];
+    refreshFiles();
+    await until(() => asked("list", "") > rootReads, "Refresh files did not read the root");
+    await remainsTrue(() => asked("list", "nest/inner") === innerReads, 300, "Refresh files read nest/inner under the collapsed nest");
+    row("entry:nest").click();
+    await until(() => row("entry:nest/inner") && !row("loading:nest/inner"), "opening nest again did not list nest/inner");
+    if (row("entry:nest/inner").getAttribute("aria-expanded") === "false") row("entry:nest/inner").click();
+    await until(() => row("entry:nest/inner/x.md"), "opening nest/inner after the refresh did not list it");
 
     // A background refresh that fails for a passing reason keeps the shown
     // preview; one that says the file is gone replaces it.
