@@ -1,0 +1,27 @@
+tests/ui-races.jsx
+  s_e14c12a896ead7::t_d8e8c8f83e569d 10202,10205,10208-10209,10214-10216,10255-10256,10298-10299,10304-10311,10314,10316-10321,10426-10444,10669
+src/components/FilesPane.jsx
+  s_e14c12a896ead7::t_272c7a3b7b9d87 132-137,140-148
+server/agent-manager.test.mjs
+  s_e14c12a896ead7::t_1101a21d721d5c 891-893
+server/agent-manager.mjs
+  s_e14c12a896ead7::t_9bbf9c548a92df 783,811,1282-1284,1290
+src/App.jsx
+  s_e14c12a896ead7::t_5e258d4095bb94 740-746,749,808-809,951
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "469330066ecce4d381b8b546560dc51dd2fab648",
+  "prompts": {},
+  "sessions": {
+    "s_e14c12a896ead7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "777b8542-a212-4d45-a334-0b81bc10d280",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
