@@ -107,8 +107,11 @@ function stopOwned(child, owned, profile) {
   for (const target of new Set(left.map(([pid, group]) => (group === null ? pid : -group)))) kill(target);
 }
 
-// cancel defaults to asking the file over IPC; a test may end the owner instead.
-async function runOwned(args, { env, cancelAt, graceMs, closeMs = 10_000, cancel = (child) => child.send("cancel") }) {
+// cancel defaults to asking the file over IPC; a test may end the owner
+// instead. A closed channel does not throw on send: it reports the error
+// later, to the callback, so asking a file that has gone is a no-op.
+const askCancel = (child) => { if (child.connected) child.send("cancel", () => {}); };
+async function runOwned(args, { env, cancelAt, graceMs, closeMs = 10_000, cancel = askCancel }) {
   const profile = mkdtempSync(path.join(tmpdir(), "outright-fixture-owner-"));
   const runEnv = { ...env, OUTRIGHT_TEST_UI_PROFILE: profile };
   delete runEnv.NODE_TEST_CONTEXT;
@@ -129,7 +132,7 @@ async function runOwned(args, { env, cancelAt, graceMs, closeMs = 10_000, cancel
   let result = await Promise.race([closed, cancelAt(owned).then(() => null)]);
   if (!result) {
     outcome = "cancelled";
-    try { cancel(child); } catch { /* The file has already closed its channel. */ }
+    cancel(child);
     result = await within(graceMs);
   }
   if (!result) {
@@ -191,7 +194,7 @@ const dyingOwner = `
 const { spawn } = require("node:child_process");
 const fixture = spawn(process.execPath, JSON.parse(process.argv[1]), { stdio: ["ignore", "inherit", "inherit", "ipc"], detached: process.platform !== "win32", windowsHide: true });
 process.send({ owned: "fixture", pid: fixture.pid, marker: ${JSON.stringify(path.basename(fixtureFile))} });
-fixture.on("message", (message) => process.send(message));
+fixture.on("message", (message) => { if (process.connected) process.send(message, () => {}); });
 setInterval(() => {}, 1000);`;
 test("a hung fixture whose owner is killed stops its Vite, Chrome and output", { timeout: 120_000 }, async () => {
   const env = { ...process.env, OUTRIGHT_TEST_UI_HANG: "1", OUTRIGHT_UI_STEP: "recovery actions" };

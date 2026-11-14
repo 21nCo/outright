@@ -33,9 +33,11 @@ if (process.send) {
   });
   process.channel?.unref();
 }
+// A closed channel does not throw on send: it reports the error later, to the
+// callback here, so a report to an owner that has gone is a no-op.
 function reportOwned(role, child, marker) {
-  if (!process.send || !child?.pid) return;
-  try { process.send({ owned: role, pid: child.pid, marker }); } catch { /* The owner has gone. */ }
+  if (!process.connected || !child?.pid) return;
+  process.send({ owned: role, pid: child.pid, marker }, () => {});
 }
 
 function chromeExecutable() {
@@ -715,17 +717,18 @@ test("the per-file deadline outlives the browser fixture and the file's earlier 
 });
 
 test("the serial suite deadline composes the slowest serial files with the browser file's and fits the CI job", () => {
-  // Windows CI's slowest observed total: 1287 seconds of serial files, about
-  // 54 for the production preview build file and the browser file at about
-  // 260 seconds with this fixture's steps.
-  const slowestTotal = 1_287_000 + 54_000 + 260_000;
+  // Windows CI's slowest observed total (tests/ui-fixture-budget.mjs): 1287
+  // seconds of serial files, about 59 for the production preview build file
+  // (39 observed and about 20 for its owner tests) and the browser file at
+  // about 260 seconds with this fixture's steps: 1606.
+  const slowestTotal = 1_287_000 + 59_000 + 260_000;
   const jobMs = Number(/timeout-minutes:\s*(\d+)/.exec(readFileSync(path.join(root, ".github", "workflows", "ci.yml"), "utf8"))?.[1]) * 60_000;
   for (const budget of [ordinaryBudget, wheelBudget]) {
     assert(budget.suiteMs >= SERIAL_FILES_MS + budget.fileMs, `suite ${budget.suiteMs} < serial files + file ${budget.fileMs}`);
     assert(budget.suiteMs >= slowestTotal * 1.1, `suite ${budget.suiteMs} leaves under 10% over ${slowestTotal}`);
     assert(budget.suiteMs + CI_JOB_SETUP_MS <= jobMs, `suite ${budget.suiteMs} and setup do not fit the ${jobMs}ms CI job`);
   }
-  assert(SERIAL_FILES_MS >= 1_287_000 + 54_000);
+  assert(SERIAL_FILES_MS >= 1_287_000 + 59_000);
 });
 
 test("scripts/run-tests.mjs gives the suite the composed deadline", { timeout: 30_000 }, () => {
@@ -806,21 +809,28 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     return duration;
   };
   const port = await unusedPort();
+  // A cancel or the deadline while waiting for the port ends the test before
+  // it allocates anything.
+  remaining();
   const profile = process.env.OUTRIGHT_TEST_UI_PROFILE ?? mkdtempSync(path.join(tmpdir(), "outright-ui-races-"));
   // OUTRIGHT_UI_BUILD=1 builds the fixture as the app is built and serves
   // the build (tests/preview-build.test.mjs), so a step loads production
   // chunks instead of the development server's modules.
-  const built = process.env.OUTRIGHT_UI_BUILD === "1" ? mkdtempSync(path.join(tmpdir(), "outright-ui-build-")) : null;
-  if (built) {
-    phase = "build the fixture";
-    const result = spawnSync(process.execPath, [viteCli, "build", "--config", "tests/vite.ui-races.config.mjs", "--outDir", built, "--emptyOutDir", "--logLevel", "warn"], {
-      cwd: root, env: { ...process.env, NO_COLOR: "1" }, encoding: "utf8", timeout: Math.min(120_000, remaining()), windowsHide: true,
-    });
-    if (result.status !== 0) {
-      rmSync(built, { recursive: true, force: true });
-      if (!process.env.OUTRIGHT_TEST_UI_PROFILE) rmSync(profile, { recursive: true, force: true });
-      throw new Error(`The fixture did not build: ${result.error?.message ?? ""}${result.stderr?.slice(-2000) ?? ""}`);
+  let built = null;
+  try {
+    if (process.env.OUTRIGHT_UI_BUILD === "1") {
+      built = mkdtempSync(path.join(tmpdir(), "outright-ui-build-"));
+      phase = "build the fixture";
+      const result = spawnSync(process.execPath, [viteCli, "build", "--config", "tests/vite.ui-races.config.mjs", "--outDir", built, "--emptyOutDir", "--logLevel", "warn"], {
+        cwd: root, env: { ...process.env, NO_COLOR: "1" }, encoding: "utf8", timeout: Math.min(120_000, remaining()), windowsHide: true,
+      });
+      if (result.status !== 0) throw new Error(`The fixture did not build: ${result.error?.message ?? ""}${result.stderr?.slice(-2000) ?? ""}`);
     }
+  } catch (error) {
+    // Nothing has started yet; the cleanup below covers only what follows.
+    if (built) rmSync(built, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    if (!process.env.OUTRIGHT_TEST_UI_PROFILE) rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    throw error;
   }
   const server = built ? ["preview", "--outDir", built] : [];
   const vite = spawn(process.execPath, [viteCli, ...server, "--config", "tests/vite.ui-races.config.mjs", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
