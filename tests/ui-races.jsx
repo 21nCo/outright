@@ -10052,7 +10052,10 @@ async function filesFocusRegression() {
   inPane("a Markdown folder link, once the folder is known");
 
   await openNotes();
+  // The tree row that takes focus from a replaced preview action is scrolled into view inside the tree.
+  tree().scrollTop = tree().scrollHeight;
   await activate(link("gone"));
+  assert(tree().contains(document.activeElement) && shown(document.activeElement), `a replaced preview action focused a tree row out of view: ${document.activeElement?.dataset?.rowId}, tree ${tree().scrollTop}`);
   const refreshFolder = () => [...host.querySelectorAll(".file-preview button")].find((element) => element.textContent === "Refresh folder");
   await until(refreshFolder, "a missing file did not offer Refresh folder");
   await activate(refreshFolder());

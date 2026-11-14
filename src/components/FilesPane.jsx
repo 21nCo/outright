@@ -317,7 +317,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   const keepFocus = useCallback(() => {
     const tree = treeRef.current;
     const current = document.activeElement;
-    if (tree && (!current || current === document.body || (tree.parentElement.contains(current) && !tree.contains(current)))) tree.querySelector('[tabindex="0"]')?.focus({ preventScroll: true });
+    if (tree && (!current || current === document.body || (tree.parentElement.contains(current) && !tree.contains(current)))) { const row = tree.querySelector('[tabindex="0"]'); row?.focus({ preventScroll: true }); if (row) scrollIntoTree(tree, row, 0); }
   }, []);
 
   // Opens an exact worktree path, such as a resolved Markdown link target.

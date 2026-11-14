@@ -83,8 +83,9 @@ function supervisors(t) {
     // Each process runs in its run's directory, which Windows keeps locked
     // until the process has exited, so the tree is removed only after that.
     const left = await waitUntil(() => ended.every((pid) => !alive(pid)), () => `cleanup left ${ended.filter(alive).join(", ")} running`).then(() => null, (error) => error);
+    // A process still running keeps its directory locked; its error, not the EBUSY, is the one reported.
+    if (left) { try { removeTree(root); } catch {} throw left; }
     removeTree(root);
-    if (left) throw left;
   });
   return async (name, modeArgs = []) => {
     const directory = path.join(root, name);
@@ -216,8 +217,9 @@ async function crashedManagedTerminal(t, windowMs) {
     const ended = [owner.pid, supervisorPid].filter(alive);
     for (const pid of ended) try { process.kill(pid); } catch {}
     const left = await waitUntil(() => ended.every((pid) => !alive(pid)), () => `cleanup left ${ended.filter(alive).join(", ")} running`).then(() => null, (error) => error);
+    // A process still running keeps its directory locked; its error, not the EBUSY, is the one reported.
+    if (left) { try { removeTree(directory); } catch {} throw left; }
     removeTree(directory);
-    if (left) throw left;
   });
   let lines = "";
   let stderr = "";
