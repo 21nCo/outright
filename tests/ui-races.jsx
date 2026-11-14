@@ -9177,10 +9177,13 @@ async function filesPdfWorkerLoadRegression() {
 // once and pdf.js twice: Retry loads the viewer, Refresh files asks for
 // pdf.js again, and the next Retry shows the PDF, all without a reload.
 // Run by tests/preview-build.test.mjs against a build of this fixture.
-const BUILT_VIEWER = "/assets/PdfPreview-";
-const BUILT_LIBRARY = "/assets/pdf-";
-const failChunk = async (prefix, times) => assert((await originalFetch(`/__fixture/fail-module?prefix=${encodeURIComponent(prefix)}&times=${times}`)).ok, `the fixture could not fail ${prefix}`);
-const chunkRequests = async (prefix) => (await (await originalFetch(`/__fixture/requests?prefix=${encodeURIComponent(prefix)}`)).json()).count;
+// The worker script (pdf-worker-entry-<hash>.js) shares pdf.js's start, so
+// the library's pattern leaves it out: neither its failures nor its
+// requests may stand in for pdf.js's.
+const BUILT_VIEWER = String.raw`^/assets/PdfPreview-[\w-]+\.js$`;
+const BUILT_LIBRARY = String.raw`^/assets/pdf-(?!worker-entry-)[\w-]+\.js$`;
+const failChunk = async (pattern, times) => assert((await originalFetch(`/__fixture/fail-module?match=${encodeURIComponent(pattern)}&times=${times}`)).ok, `the fixture could not fail ${pattern}`);
+const chunkRequests = async (pattern) => (await (await originalFetch(`/__fixture/requests?match=${encodeURIComponent(pattern)}`)).json()).count;
 async function filesPdfBuildLoadRegression() {
   root.render(null);
   await settle();

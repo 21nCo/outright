@@ -15,14 +15,15 @@ const FIXTURE_PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000
 // of an app module (/__fixture/fail-module?path=/src/x.jsx&times=1), and
 // count the requests for any address (/__fixture/requests?path=/src/x.jsx).
 // A built fixture (vite build, then vite preview) names its chunks by hash,
-// so a step may fail and count them by the start of their address instead
-// (/__fixture/fail-module?prefix=/assets/pdf-&times=1, requests?prefix=).
+// so a step may fail and count them by a pattern of their address instead
+// (/__fixture/fail-module?match=^/assets/pdf-[\w-]+\.js$&times=1,
+// requests?match=).
 const servedPngs = new Set(["logo.png", "docs/logo.png"]);
 const pngReads = new Map();
 const failingModules = new Map();
-const failingPrefixes = new Map();
+const failingPatterns = new Map();
 const requestCounts = new Map();
-const prefixCount = (prefix) => [...requestCounts].reduce((sum, [pathname, count]) => sum + (pathname.startsWith(prefix) ? count : 0), 0);
+const matchCount = (pattern) => [...requestCounts].reduce((sum, [pathname, count]) => sum + (new RegExp(pattern).test(pathname) ? count : 0), 0);
 // Only the path and query of a request's address matter here; the loopback
 // origin just lets URL parse them.
 const requestUrl = (request) => new URL(request.url, "http://127.0.0.1");
@@ -39,13 +40,13 @@ function fixtureMiddleware(server) {
       }
       if (url.pathname === "/requests") {
         response.setHeader("Content-Type", "application/json");
-        const prefix = url.searchParams.get("prefix");
-        response.end(JSON.stringify({ count: prefix ? prefixCount(prefix) : requestCounts.get(url.searchParams.get("path")) ?? 0 }));
+        const pattern = url.searchParams.get("match");
+        response.end(JSON.stringify({ count: pattern ? matchCount(pattern) : requestCounts.get(url.searchParams.get("path")) ?? 0 }));
         return;
       }
       if (url.pathname === "/fail-module") {
         const times = Number(url.searchParams.get("times") ?? 1);
-        if (url.searchParams.has("prefix")) failingPrefixes.set(url.searchParams.get("prefix"), times);
+        if (url.searchParams.has("match")) failingPatterns.set(url.searchParams.get("match"), times);
         else failingModules.set(url.searchParams.get("path"), times);
       }
       response.end("ok");
@@ -53,9 +54,9 @@ function fixtureMiddleware(server) {
     server.middlewares.use((request, response, next) => {
       const pathname = requestUrl(request).pathname;
       requestCounts.set(pathname, (requestCounts.get(pathname) ?? 0) + 1);
-      const prefix = [...failingPrefixes.keys()].find((start) => pathname.startsWith(start) && failingPrefixes.get(start) > 0);
-      const failing = prefix === undefined ? failingModules : failingPrefixes;
-      const key = prefix ?? pathname;
+      const pattern = [...failingPatterns.keys()].find((match) => failingPatterns.get(match) > 0 && new RegExp(match).test(pathname));
+      const failing = pattern === undefined ? failingModules : failingPatterns;
+      const key = pattern ?? pathname;
       const left = failing.get(key) ?? 0;
       if (left <= 0) { next(); return; }
       failing.set(key, left - 1);
@@ -106,5 +107,7 @@ export default defineConfig({
     target: "es2022",
     rollupOptions: { input: path.join(root, "tests", "ui-races.html"), output: { manualChunks: fixtureChunks } },
   },
+  // The app builds its PDF worker as an ES module (vite.config.mjs).
+  worker: { format: "es" },
   plugins: [tailwindcss(), react(), fixtureRawFiles, pdfjsAssetsPlugin()],
 });

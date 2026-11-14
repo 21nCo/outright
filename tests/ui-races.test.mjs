@@ -16,13 +16,21 @@ const cooperativeChild = path.join(root, "tests", "fixtures", "cooperative-child
 const exitedLeader = path.join(root, "tests", "fixtures", "exited-leader.mjs");
 
 // An owner that runs this file (tests/preview-build.test.mjs) may cancel it
-// over IPC. The browser test then stops waiting, and its own cleanup stops
-// Chrome, Vite and their files before the file exits. It reports each tree
-// it starts to the owner first, with a marker of its command line, so the
-// owner can stop them itself if that cleanup hangs.
+// over IPC, and losing the owner (its channel closes when it dies, even by
+// SIGKILL) cancels it the same way. The browser test then stops waiting,
+// and its own cleanup stops Chrome, Vite and their files before the file
+// exits. It reports each tree it starts to the owner first, with a marker
+// of its command line, so the owner can stop them itself if that cleanup
+// hangs.
 const ownerCancel = new AbortController();
 if (process.send) {
   process.on("message", (message) => { if (message === "cancel") ownerCancel.abort(new Error("The fixture's owner cancelled it")); });
+  process.once("disconnect", () => {
+    // A dead owner may have closed this file's output too; a failed write
+    // must not end the file before its cleanup has run.
+    for (const stream of [process.stdout, process.stderr]) stream.on("error", () => {});
+    ownerCancel.abort(new Error("The fixture's owner went away"));
+  });
   process.channel?.unref();
 }
 function reportOwned(role, child, marker) {
@@ -1067,13 +1075,23 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     await send("Page.navigate", { url });
     phase = "run browser interaction fixtures";
     // An injected hang (tests/preview-build.test.mjs): the fixture never
-    // reports, so only the owner's cancel ends this wait.
+    // reports, so only the owner's cancel, losing the owner, or the phase
+    // deadline ends this wait.
     if (process.env.OUTRIGHT_TEST_UI_HANG === "1") {
       phase = "hang until the owner cancels";
-      await new Promise((_, reject) => {
-        if (ownerCancel.signal.aborted) reject(ownerCancel.signal.reason);
-        else ownerCancel.signal.addEventListener("abort", () => reject(ownerCancel.signal.reason), { once: true });
-      });
+      let timer;
+      let onAbort;
+      try {
+        await new Promise((_, reject) => {
+          onAbort = () => reject(ownerCancel.signal.reason);
+          timer = setTimeout(() => reject(new Error(`UI fixture exceeded its pre-cleanup deadline during ${phase}`)), Math.max(0, deadline - Date.now()));
+          if (ownerCancel.signal.aborted) onAbort();
+          else ownerCancel.signal.addEventListener("abort", onAbort, { once: true });
+        });
+      } finally {
+        clearTimeout(timer);
+        ownerCancel.signal.removeEventListener("abort", onAbort);
+      }
     }
     const state = await waitForFixture(async (method, params) => {
       if (viewportError) throw viewportError;
