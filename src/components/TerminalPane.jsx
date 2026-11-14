@@ -38,7 +38,7 @@ function findCoveredColumn(xterm, bar) {
   return Math.max(0, Math.floor((bar.getBoundingClientRect().left - screen.left) / (screen.width / xterm.cols)));
 }
 // Ctrl+F is a shell key, so outside macOS Find takes Ctrl+Shift+F. Either
-// shortcut is withheld from the process; every other key still reaches it.
+// shortcut is withheld from the process, as is Go to file (isQuickOpenShortcut); every other key still reaches it.
 const MAC_SHORTCUTS = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
 const FIND_SHORTCUT = MAC_SHORTCUTS ? "Meta+F" : "Control+Shift+F";
 function isFindShortcut(event) {
