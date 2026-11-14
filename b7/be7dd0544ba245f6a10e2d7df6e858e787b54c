@@ -1,0 +1,23 @@
+server/agent-supervisor-windows.test.mjs
+  s_3710288722b03e::t_a3409fb16f6796 86-87,220-221
+src/components/FilesPane.jsx
+  s_3710288722b03e::t_44aa9c7ebeaf5e 320
+tests/ui-races.jsx
+  s_3710288722b03e::t_ea5fe983b1e178 10055-10056,10058
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b7be7dd0544ba245f6a10e2d7df6e858e787b54c",
+  "prompts": {},
+  "sessions": {
+    "s_3710288722b03e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_3710288722b03e",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
