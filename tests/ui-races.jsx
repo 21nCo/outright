@@ -10199,20 +10199,21 @@ async function filesInheritedRegression() {
   const archived = { ...chats.A, id: "chat-archived", title: "Archived chat", archived: true };
   const big = Array.from({ length: 3500 }, (_, index) => file(`big/${String(index).padStart(4, "0")}`));
   const answers = new Map();
-  let bootstrap = deferred();
+  let bootstrap = deferred(), booted = null;
   route = async (url, options = {}) => {
     const parameters = Object.fromEntries(url.searchParams);
-    if (url.pathname === "/api/bootstrap") return bootstrap.promise;
+    if (url.pathname === "/api/bootstrap") return booted ? response(booted) : bootstrap.promise;
     if (url.pathname === "/api/conversations") { requests.push({ kind: "chat list", key: parameters.archived ?? "" }); return response({ conversations: parameters.archived === "true" ? [archived] : [chats.A] }); }
     if (url.pathname === "/api/conversations/chat-A") return response(chats.A);
-    // An archived chat, or another worktree's, is read alone; its lists are not.
-    if (url.pathname === "/api/conversations/chat-archived") return response(archived);
-    if (url.pathname === "/api/conversations/chat-elsewhere") return response({ ...chats.A, id: "chat-elsewhere", worktreeId: "A-other" });
+    // A run's end is not a reason to read an archived chat, or another worktree's.
+    if (url.pathname === "/api/conversations/chat-archived" || url.pathname === "/api/conversations/chat-elsewhere") { requests.push({ kind: "chat detail", key: url.pathname }); return response(archived); }
     if (url.pathname === "/api/files") {
       const directory = parameters.dir ?? "";
       requests.push({ kind: "list", key: directory, cursor: parameters.cursor ?? "0", signal: options.signal });
       if (holds.has(`list:${directory}`) || holds.has(`list:${directory}@${parameters.cursor ?? "0"}`)) return held(options.signal);
-      if (!directory) return page([folder("big"), folder("docs"), folder("wide"), folder("nest"), folder("slow"), file("a.md"), file("b.md"), file("picture.png"), file("huge.png")]);
+      if (!directory) return page([...(parameters.hidden === "true" ? [{ ...folder(".cache"), hidden: true }] : []), folder("big"), folder("docs"), folder("wide"), folder("nest"), folder("slow"), file("a.md"), file("b.md"), file("picture.png"), file("huge.png")]);
+      if (directory === ".cache") return page([{ ...folder(".cache/deep"), hidden: true }]);
+      if (directory === ".cache/deep") return page([file(".cache/deep/x.md")]);
       if (directory === "docs") return page([file("docs/guide.md")]);
       if (directory === "nest") return page([folder("nest/inner")]);
       if (directory === "nest/inner") return page([file("nest/inner/x.md")]);
@@ -10251,7 +10252,8 @@ async function filesInheritedRegression() {
     await until(() => host.querySelector(".loading-screen"), "the loading screen was not shown");
     // While ⌘P does nothing, it keeps its browser action (Print): the key is not consumed.
     assert(!quickOpen().defaultPrevented, "⌘P on the loading screen took the key from the browser's Print");
-    bootstrap.resolve(response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] }));
+    booted = { projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] };
+    bootstrap.resolve(response(booted));
     await until(() => host.querySelector('textarea[aria-label="Message the agent"]') && filesToggle(), "the workspace did not load");
     await settle();
     assert(!host.querySelector(".files-pane"), "⌘P on the loading screen opened Files");
@@ -10293,20 +10295,30 @@ async function filesInheritedRegression() {
     }
 
     // A run that ends in an open or archived chat of this worktree re-lists the
-    // shown folders once its burst settles; a run elsewhere does not.
+    // shown folders once its burst settles; a run elsewhere does not. Its event
+    // names its chat's worktree, so no chat list or chat is read to decide.
     await toggleFiles(true);
     await until(() => row("entry:docs"), "the root was not listed");
     row("entry:docs").click();
     await until(() => row("entry:docs/guide.md"), "docs was not listed");
-    const send = (conversationId, type) => fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "run.event", conversationId, runId: `run-${conversationId}-${type}`, payload: { type } }) }));
-    const chatLists = () => requests.filter((request) => request.kind === "chat list").length;
-    for (const [conversationId, type, owned] of [["chat-elsewhere", "run.completed", false], ["chat-archived", "run.failed", true], ["chat-A", "run.stopped", true]]) {
-      const before = [listed(""), listed("docs"), chatLists()];
-      send(conversationId, type);
+    const dispatch = (event) => fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify(event) }));
+    const send = (conversationId, type, owner) => dispatch({ type: "run.event", conversationId, ...owner, runId: `run-${conversationId}-${type}`, payload: { type } });
+    const chatReads = () => requests.filter((request) => request.kind === "chat list" || request.kind === "chat detail").length;
+    const [here, elsewhere] = [{ projectId: "A", worktreeId: "A" }, { projectId: "A", worktreeId: "A-other" }];
+    for (const [conversationId, type, owner, owned] of [["chat-elsewhere", "run.completed", elsewhere, false], ["chat-elsewhere", "run.failed", elsewhere, false],
+      ["chat-archived", "run.failed", here, true], ["chat-archived", "run.completed", here, true], ["chat-A", "run.stopped", undefined, true]]) {
+      const before = [listed(""), listed("docs"), chatReads()];
+      send(conversationId, type, owner);
       if (owned) await until(() => listed("") > before[0] && listed("docs") > before[1], `a run that ended in ${conversationId} did not re-list the shown folders`);
       else await remainsTrue(() => listed("") === before[0] && listed("docs") === before[1], 900, `a run that ended in ${conversationId} re-listed the shown folders`);
-      assert(chatLists() === before[2], `deciding whether ${conversationId} is this worktree's read ${chatLists() - before[2]} chat lists`);
+      assert(chatReads() === before[2], `deciding whether ${conversationId} is this worktree's read ${JSON.stringify(requests.filter((request) => request.kind.startsWith("chat")).slice(before[2]))}`);
     }
+    // A reconnect that missed events, or found a restarted runtime, re-lists them too: a run may have ended unseen. One that missed nothing does not.
+    const reconnected = [listed(""), listed("docs")];
+    dispatch({ type: "runtime.connected", payload: { replay: { requestedAfter: 5, missed: false } } });
+    await remainsTrue(() => listed("") === reconnected[0] && listed("docs") === reconnected[1], 900, "a reconnect that missed nothing re-listed the shown folders");
+    dispatch({ type: "runtime.connected", payload: { replay: { requestedAfter: 5, missed: true } } });
+    await until(() => listed("") > reconnected[0] && listed("docs") > reconnected[1], "a reconnect that missed events did not re-list the shown folders");
   } finally { if (window.__fixtureSetViewport) await window.__fixtureSetViewport(1280); }
 
   // Each request no longer wanted is aborted.
@@ -10411,6 +10423,25 @@ async function filesInheritedRegression() {
     await until(() => row("entry:nest/inner") && !row("loading:nest/inner"), "opening nest again did not list nest/inner");
     if (row("entry:nest/inner").getAttribute("aria-expanded") === "false") row("entry:nest/inner").click();
     await until(() => row("entry:nest/inner/x.md"), "opening nest/inner after the refresh did not list it");
+    // Hiding hidden files closes an open dotfolder and its open subfolder: no reload reads
+    // either, and showing hidden files again lists the dotfolder closed, to be read afresh.
+    const toggleHidden = async (shown) => { host.querySelector('.files-pane [aria-label="Show hidden files"]').click(); await until(() => Boolean(row("entry:.cache")) === shown, `.cache was ${shown ? "not " : ""}listed`); };
+    await toggleHidden(true);
+    row("entry:.cache").click();
+    await until(() => row("entry:.cache/deep"), ".cache was not listed");
+    row("entry:.cache/deep").click();
+    await until(() => row("entry:.cache/deep/x.md"), ".cache/deep was not listed");
+    const dotReads = () => [asked("list", ".cache"), asked("list", ".cache/deep")].join();
+    const [shownDotReads, hiddenRootReads] = [dotReads(), asked("list", "")];
+    await toggleHidden(false);
+    refreshFiles();
+    await until(() => asked("list", "") >= hiddenRootReads + 2, "Refresh files did not read the root");
+    await remainsTrue(() => dotReads() === shownDotReads, 300, `a reload read a dotfolder with hidden files off: ${dotReads()} after ${shownDotReads}`);
+    await toggleHidden(true);
+    await until(() => row("entry:.cache")?.getAttribute("aria-expanded") === "false", ".cache stayed open with hidden files shown again");
+    row("entry:.cache").click();
+    await until(() => row("entry:.cache/deep") && asked("list", ".cache") > Number(shownDotReads.split(",")[0]), "opening .cache again did not read it afresh");
+    await toggleHidden(false);
 
     // A background refresh that fails for a passing reason keeps the shown
     // preview; one that says the file is gone replaces it.
@@ -10635,7 +10666,7 @@ try {
     ["pane drag isolation", paneDragChatTabRegression, "pane title drags never reorder chat tabs, even after an unfinished tab drag"],
     ["responsive focus", responsiveFocusRegression, "narrow drawer and one-at-a-time panes contain and restore focus", "responsive transition requires the CDP viewport bridge"],
     ["files focus", filesFocusRegression, "Files preview actions keep focus in the pane, and Go to file scrolls listed and paged rows into view without moving focus"],
-    ["files inherited", filesInheritedRegression, "⌘P opens Go to file only while the workspace takes input, owned run ends re-list the shown folders, unwanted Files requests are aborted and Refresh files asks for a top-level image again"],
+    ["files inherited", filesInheritedRegression, "⌘P opens Go to file only while the workspace takes input, owned run ends and missed replays re-list the shown folders, unwanted Files requests are aborted and Refresh files asks for a top-level image again"],
     ["recovery actions", recoveryActionsRegression, "phone-width recovery decisions remain inside the viewport", "phone geometry requires a narrow viewport"],
   ];
   // The harness runs every step with reduced motion, as hosted macOS and

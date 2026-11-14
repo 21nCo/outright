@@ -129,15 +129,23 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     }
   }, [project.id, worktree.path]);
 
-  // Reloads the root and every open folder. A refresh keeps as many entries
-  // as each folder had loaded; a hidden-file change starts from page one.
+  // Reloads the root and every open folder shown under it: one its open
+  // parent lists, as the hidden-file policy now in force would, or one a
+  // reveal is reading. Any other (under a collapsed folder, hidden, or gone)
+  // is closed and its read ends, so it is read afresh when shown again. A
+  // refresh keeps as many entries as each folder had loaded; a hidden-file
+  // change starts from page one.
   const reloadAll = useCallback(({ keepPages = false } = {}) => {
-    for (const directory of foldersRef.current.keys()) {
-      if (directory && !expandedRef.current.has(directory)) { tokensRef.current.set(directory, (tokensRef.current.get(directory) ?? 0) + 1); abortListing(directory); readsRef.current.delete(directory); }
-    }
     const loaded = foldersRef.current;
-    setFolders((current) => new Map([...current].filter(([directory]) => !directory || expandedRef.current.has(directory))));
-    for (const directory of ["", ...expandedRef.current]) void loadFolder(directory, { keep: keepPages ? loaded.get(directory)?.entries?.length ?? 0 : 0 });
+    const shown = new Set([""]);
+    for (const row of visibleRows(loaded, expandedRef.current)) if (row.type === "entry" && row.open && shown.has(row.directory) && (hiddenRef.current || !row.entry.hidden)) shown.add(row.entry.path);
+    for (const [directory, read] of readsRef.current) if (read.active?.()) for (const each of [...ancestorsOf(directory), directory]) shown.add(each);
+    for (const directory of loaded.keys()) {
+      if (!shown.has(directory)) { tokensRef.current.set(directory, (tokensRef.current.get(directory) ?? 0) + 1); abortListing(directory); readsRef.current.delete(directory); }
+    }
+    setFolders((current) => new Map([...current].filter(([directory]) => shown.has(directory))));
+    setExpanded((current) => new Set([...current].filter((directory) => shown.has(directory))));
+    for (const directory of shown) void loadFolder(directory, { keep: keepPages ? loaded.get(directory)?.entries?.length ?? 0 : 0 });
   }, [loadFolder]);
   const refresh = useCallback(() => { reloadAll({ keepPages: true }); setRefreshKey((value) => value + 1); }, [reloadAll]);
 

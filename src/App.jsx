@@ -23,7 +23,6 @@ import { ESTIMATED_MESSAGE_HEIGHT, WindowedMessages } from "@/components/Windowe
 import { CommandPalette } from "@/components/CommandPalette";
 import { ContextPane } from "@/components/ContextPane";
 import { FilesPane } from "@/components/FilesPane";
-import { worktreeOwnsChat } from "@/lib/file-tree";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { TerminalPane } from "@/components/TerminalPane";
 import { LifecycleMark, LifecycleState, TeardownChoices, WorktreeLifecycleDialog } from "@/components/WorktreeLifecycle";
@@ -738,14 +737,16 @@ export function App() {
   }, [loadConversation, conversationListPending, conversationLoadFailed, conversationDetailReady, selectedConversationId]);
   const selectedRecoveryRunId = recoveryGate(conversation)?.id ?? null;
 
-  const noteRunEnded = useCallback(async (conversationId) => {
-    if (!filesShownRef.current) return;
-    const [projectId, worktreeId] = [selectedProjectRef.current, selectedWorktreeRef.current];
-    const owned = await worktreeOwnsChat(conversationId, { projectId, worktreeId }, conversationsRef.current, (id) => api(`/api/conversations/${encodeURIComponent(id)}`));
-    if (owned && selectedProjectRef.current === projectId && selectedWorktreeRef.current === worktreeId) setFilesCompletions((count) => count + 1);
+  // Asks the mounted Files pane for one coalesced refresh (FilesPane
+  // `completions`), after a run ended in the shown worktree: its terminal
+  // event names its chat's worktree, archived or not, so no chat is read to
+  // decide; an event without it is matched to a listed chat.
+  const refreshShownFiles = useCallback((runEvent) => {
+    const owner = runEvent?.worktreeId ? runEvent : runEvent && conversationsRef.current.find((chat) => chat.id === runEvent.conversationId);
+    if (filesShownRef.current && (!runEvent || (owner?.projectId === selectedProjectRef.current && owner?.worktreeId === selectedWorktreeRef.current))) setFilesCompletions((count) => count + 1);
   }, []);
   const handleRuntimeEvent = useCallback((event) => {
-    if (event.type === "run.event" && ["run.completed", "run.failed", "run.stopped"].includes(event.payload?.type)) void noteRunEnded(event.conversationId);
+    if (event.type === "run.event" && ["run.completed", "run.failed", "run.stopped"].includes(event.payload?.type)) refreshShownFiles(event);
     if (terminalCommandFenceRef.current.observe(event)) {
       setUnverifiedTerminalIds(terminalCommandFenceRef.current.snapshot());
     }
@@ -804,6 +805,8 @@ export function App() {
     if (event.type === "runtime.connected" && (event.payload?.replay?.missed || event.payload?.restarted)) {
       loadBootstrap();
       loadConversation({ preservePage: true });
+      // A run may have ended unseen during the gap.
+      refreshShownFiles();
     }
     if (event.type === "conversation.created" || event.type === "conversation.updated") loadConversations(event.conversationId);
     if (shouldReloadConversationForResolvedRun(event, selectedConversationRef.current, selectedRecoveryRunId)) loadConversation({ preservePage: true });
@@ -945,7 +948,7 @@ export function App() {
         if (document.hidden && settings.notifications && Notification.permission === "granted") new Notification(`Outright run ${runEvent.type.split(".")[1]}`, { body: conversation?.title ?? "Agent run" });
       }
     }
-  }, [loadConversation, loadConversations, settings.notifications, conversation?.title, selectedRecoveryRunId, applyStreamingText, refreshMessageCount, lifecycleEvents, noteRunEnded]);
+  }, [loadConversation, loadConversations, settings.notifications, conversation?.title, selectedRecoveryRunId, applyStreamingText, refreshMessageCount, lifecycleEvents, refreshShownFiles]);
   runtimeHandlerRef.current = handleRuntimeEvent;
 
   useEffect(() => {
