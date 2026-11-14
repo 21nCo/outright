@@ -1,0 +1,35 @@
+scripts/run-tests.mjs
+  s_ff552dd0df6c7a::t_ed61810f062f3e 27
+server/pdf-preview-lib.test.mjs
+  s_ff552dd0df6c7a::t_0536e3758ef8f2 224,265-279,291
+src/lib/pdf-text.js
+  s_ff552dd0df6c7a::t_80376194e1da54 17-19
+tests/fixtures/owned-hang.mjs
+  s_ff552dd0df6c7a::t_7ea4a808c277aa 1-13
+tests/preview-build.test.mjs
+  s_ff552dd0df6c7a::t_9fc2df7c6c2f62 1-192
+tests/ui-fixture-budget.mjs
+  s_ff552dd0df6c7a::t_654a5d91dcedbf 5-14,18-28,32
+tests/ui-races.jsx
+  s_ff552dd0df6c7a::t_c2d3d0a2337ce9 44-45,52-58,8151,8188-8195,8235-8246,8993-9886,11738-11744,11749-11750
+tests/ui-races.test.mjs
+  s_ff552dd0df6c7a::t_19fb7ce4a709fa 18-32,62,280,295,372,694,699,710-713,720,795,802-818,825,868,1057,1069-1077,1087-1088,1109
+tests/vite.ui-races.config.mjs
+  s_ff552dd0df6c7a::t_a9c2327dc8da44 5-7,10-93,102-109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6baa120da7a3f6e57d82b1bf3b9ec25edd0e66c2",
+  "prompts": {},
+  "sessions": {
+    "s_ff552dd0df6c7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_ff552dd0df6c7a",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
