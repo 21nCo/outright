@@ -197,7 +197,7 @@ test("the restore notice names the repair that happened", () => {
   for (const problem of ["storage", "store", "unreadable", "version"]) assert.match(paneRestoreMessage([problem]), /could not be read; showing the default layout/);
 });
 
-test("Go to file is Meta+P on Apple platforms and Ctrl+P or Meta+P elsewhere", () => {
+test("Go to file is Meta+P on Apple platforms and Ctrl+P or Meta+P elsewhere, where the terminal leaves Ctrl+P to the shell", () => {
   const key = (init) => ({ key: "p", metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, ...init });
   assert.equal(isQuickOpenShortcut(key({ metaKey: true }), true), true);
   assert.equal(isQuickOpenShortcut(key({ key: "P", metaKey: true }), true), true);
@@ -205,10 +205,19 @@ test("Go to file is Meta+P on Apple platforms and Ctrl+P or Meta+P elsewhere", (
   assert.equal(isQuickOpenShortcut(key({ ctrlKey: true }), true), false);
   assert.equal(isQuickOpenShortcut(key({ ctrlKey: true }), false), true);
   assert.equal(isQuickOpenShortcut(key({ metaKey: true }), false), true);
-  // Shift, Alt, another key or no modifier is not Go to file.
+  // Elsewhere Ctrl+P is the shell's previous-history key too: a focused terminal keeps it for the
+  // process and withholds Ctrl+Shift+P instead, which the app's handler also takes.
+  assert.equal(isQuickOpenShortcut(key({ ctrlKey: true }), false, true), false);
+  assert.equal(isQuickOpenShortcut(key({ key: "P", ctrlKey: true, shiftKey: true }), false, true), true);
+  assert.equal(isQuickOpenShortcut(key({ key: "P", ctrlKey: true, shiftKey: true }), false), true);
+  assert.equal(isQuickOpenShortcut(key({ metaKey: true }), true, true), true);
+  // On Apple platforms Shift is not Go to file, nor anywhere are Alt, another key or no modifier.
+  assert.equal(isQuickOpenShortcut(key({ metaKey: true, shiftKey: true }), true), false);
   for (const apple of [true, false]) {
     const modifier = apple ? { metaKey: true } : { ctrlKey: true };
-    for (const other of [{ shiftKey: true }, { altKey: true }, { key: "o" }]) assert.equal(isQuickOpenShortcut(key({ ...modifier, ...other }), apple), false, JSON.stringify([apple, other]));
-    assert.equal(isQuickOpenShortcut(key({}), apple), false);
+    for (const shell of [false, true]) {
+      for (const other of [{ altKey: true, shiftKey: shell }, { key: "o", shiftKey: shell }]) assert.equal(isQuickOpenShortcut(key({ ...modifier, ...other }), apple, shell), false, JSON.stringify([apple, shell, other]));
+      assert.equal(isQuickOpenShortcut(key({}), apple, shell), false);
+    }
   }
 });

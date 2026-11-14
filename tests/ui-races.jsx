@@ -2811,15 +2811,18 @@ async function terminalScrollbackFindRegression() {
   const resizesBeforeFind = resizes();
   const mac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
   const shortcut = mac ? { metaKey: true } : { ctrlKey: true, shiftKey: true };
-  // Go to file (⌘P on macOS, Ctrl+P elsewhere) passes through the terminal to the
-  // app's window handler, which opens Files: the shell gets nothing.
+  // Ctrl+P stays the shell's (previous history) everywhere. Go to file in the terminal is ⌘P on macOS
+  // and Ctrl+Shift+P elsewhere; it passes through to the app's window handler, which opens Files.
   let windowKey = null;
   const seeWindowKey = (event) => { windowKey = event; };
   window.addEventListener("keydown", seeWindowKey);
-  key(textarea(), { key: "p", code: "KeyP", keyCode: 80, ...(mac ? { metaKey: true } : { ctrlKey: true }) });
+  key(textarea(), { key: "p", code: "KeyP", keyCode: 80, ctrlKey: true });
+  assert(!windowKey && inputs().join("") === "\x1b\x10", `Ctrl+P in the terminal ${windowKey ? "reached the window and " : ""}sent ${JSON.stringify(inputs())}`);
+  key(textarea(), { key: mac ? "p" : "P", code: "KeyP", keyCode: 80, ...(mac ? { metaKey: true } : { ctrlKey: true, shiftKey: true }) });
   window.removeEventListener("keydown", seeWindowKey);
-  assert(windowKey?.key === "p" && !windowKey.defaultPrevented && inputs().join("") === "\x1b",
+  assert(windowKey?.key.toLowerCase() === "p" && !windowKey.defaultPrevented && inputs().join("") === "\x1b\x10",
     `Go to file in the terminal ${windowKey ? "" : "did not reach the window and "}sent ${JSON.stringify(inputs())}`);
+  sent.splice(sent.findIndex((message) => message.type === "terminal.input" && message.data === "\x10"), 1);
   key(textarea(), { key: mac ? "f" : "F", code: "KeyF", keyCode: 70, ...shortcut });
   await until(() => find() && document.activeElement === find(), "Find shortcut focuses the query");
   const opener = host.querySelector('[aria-label="Find in terminal"]');
@@ -9977,6 +9980,8 @@ async function worktreeCheckpointsRegression() {
 async function filesFocusRegression() {
   root.render(null);
   await settle();
+  // The pane's 720px frame must fit the window, or focusing its controls scrolls the page for later steps.
+  if (window.__fixtureSetViewport) await window.__fixtureSetViewport(1280);
   const project = { id: "A", name: "Review A", path: "/fixture/A" };
   const worktree = { id: "A", name: "A", path: "/fixture/A", branch: "main" };
   const file = (path) => ({ name: path.split("/").at(-1), path, kind: "file", hidden: false });
@@ -10077,10 +10082,28 @@ async function filesFocusRegression() {
     jump.form.requestSubmit();
     await settle();
   };
+  // Only the tree scrolls to show a row, by Go to file or the keyboard: a pane around it that can scroll sideways stays put.
+  const frame = tree().closest(".files-pane").parentElement;
+  const spacer = frame.appendChild(document.createElement("div"));
+  spacer.style.cssText = "width: 2000px; height: 1px";
+  frame.style.overflow = "hidden";
   tree().scrollTop = 0;
-  await go("f-079.txt");
+  // Focusing the field may scroll the pane itself; the offset is set after it.
+  jump.focus();
+  frame.scrollLeft = 20;
+  setControlValue(jump, "f-079.txt");
+  jump.form.requestSubmit();
   await until(() => row("entry:f-079.txt") && shown(row("entry:f-079.txt")), "Go to file did not scroll a listed row into view");
   assert(document.activeElement === jump, "Go to file moved focus out of its field");
+  assert(frame.scrollLeft === 20, `Go to file scrolled the pane around the tree: ${frame.scrollLeft}`);
+  tree().scrollTop = tree().scrollHeight;
+  row("entry:f-079.txt").focus();
+  frame.scrollLeft = 20;
+  pressKey(row("entry:f-079.txt"), "Home");
+  await until(() => document.activeElement === row("entry:docs") && shown(row("entry:docs")), "Home did not focus and show the first row");
+  assert(frame.scrollLeft === 20, `moving focus in the tree scrolled the pane around it: ${frame.scrollLeft}`);
+  frame.style.overflow = "";
+  spacer.remove();
   // A row activated as soon as the reveal scrolls ends the reveal's follow-up scrolling: the tree stays where the user put it.
   tree().scrollTop = 0;
   const userTookTree = new Promise((resolve) => tree().addEventListener("scroll", () => { row("entry:notes.md").click(); tree().scrollTop = 0; resolve(); }, { once: true }));
@@ -10297,6 +10320,12 @@ async function filesInheritedRegression() {
     assert(quickOpen().defaultPrevented, "⌘P that opens Go to file left the key to the browser's Print");
     await until(() => host.querySelector(".files-pane") && document.activeElement === jumpField(), "⌘P did not focus Go to file");
     await toggleFiles(false);
+    // The terminal's Go to file key (Ctrl+Shift+P off Apple platforms, ⌘P on them) reaches this handler and opens it too.
+    const apple = /mac|iphone|ipad|ipod/i.test(navigator.userAgentData?.platform ?? navigator.platform ?? "");
+    host.querySelector('textarea[aria-label="Message the agent"]').focus();
+    assert(pressKey(document.activeElement, apple ? "p" : "P", apple ? { metaKey: true } : { ctrlKey: true, shiftKey: true }).defaultPrevented, "the terminal's Go to file key was left to the browser");
+    await until(() => host.querySelector(".files-pane") && document.activeElement === jumpField(), "the terminal's Go to file key did not focus Go to file");
+    await toggleFiles(false);
 
     // While a dialog owns the keyboard, ⌘P neither opens Files nor leaves a request.
     host.querySelector('[aria-label="New chat tab"]').click();
@@ -10321,17 +10350,43 @@ async function filesInheritedRegression() {
       assert(!host.querySelector(".files-pane") && host.querySelector("#project-sidebar").contains(document.activeElement), "⌘P in the narrow drawer opened Files or took focus from the drawer");
       window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
       await until(() => !host.querySelector("#main-workspace")?.hasAttribute("inert"), "the narrow drawer did not close");
-      // Crossing 520px moves focus from a pane toggle the toolbar hides to the Panes menu, and back to a toggle.
-      // CDP can acknowledge a hidden tab's new metrics before its resize event, so the test sends that event.
+      // Crossing 520px moves focus, without scrolling, from a pane toggle the toolbar hides to the Panes menu
+      // trigger and back, and closes an open Panes menu; focus elsewhere stays where it is.
       const panesTrigger = () => host.querySelector(".pane-menu-trigger");
-      const crossTo = async (width) => { await window.__fixtureSetViewport(width); await until(() => window.innerWidth === width, `real ${width}px layout`); window.dispatchEvent(new Event("resize")); };
-      // The fixture page lacks system focus, so focus() sends no focusin; send the one a focused window would.
-      filesToggle().focus();
-      filesToggle().dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+      const visible = (element) => Boolean(element?.getClientRects().length);
+      const onToggle = () => document.activeElement?.closest(".pane-toggles") && visible(document.activeElement);
+      const crossTo = async (width) => {
+        const scrolled = document.scrollingElement.scrollLeft;
+        await window.__fixtureSetViewport(width);
+        await until(() => window.innerWidth === width, `real ${width}px layout`);
+        await settle(); // NOSONAR S9382: the media change lands before the page is checked
+        assert(document.scrollingElement.scrollLeft <= scrolled, `crossing to ${width}px scrolled the page sideways: ${scrolled} -> ${document.scrollingElement.scrollLeft}`);
+      };
+      // The fixture page lacks system focus, so focus() sends no focusin; the test sends the one a focused window would.
+      const focusToggle = () => { filesToggle().focus(); filesToggle().dispatchEvent(new FocusEvent("focusin", { bubbles: true })); };
+      focusToggle();
       await crossTo(390);
-      await until(() => panesTrigger()?.getClientRects().length && document.activeElement === panesTrigger(), "crossing to 390px did not move focus from the hidden Files toggle to the Panes menu");
+      await until(() => visible(panesTrigger()) && document.activeElement === panesTrigger(), "crossing to 390px did not move focus from the hidden Files toggle to the Panes menu");
       await crossTo(640);
-      await until(() => document.activeElement?.closest(".pane-toggles") && document.activeElement.getClientRects().length, "crossing back to 640px did not move focus from the hidden Panes menu to a pane toggle");
+      await until(onToggle, "crossing back to 640px did not move focus from the hidden Panes menu to a pane toggle");
+      // A browser may blur the toggle it hides to the page, even with a focusin there, before the change
+      // arrives; focus still goes to the trigger.
+      focusToggle();
+      filesToggle().blur();
+      document.body.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+      await crossTo(390);
+      await until(() => document.activeElement === panesTrigger(), `a toggle blurred to the page as it hid did not hand focus to the Panes menu: ${document.activeElement?.outerHTML.slice(0, 80)}`);
+      // An open Panes menu closes when the toolbar widens, and focus goes to a toggle, never the hidden trigger.
+      panesTrigger().click();
+      await until(() => document.querySelector('[role="menuitemcheckbox"]'), "the Panes menu did not open");
+      document.querySelector('[role="menuitemcheckbox"]').focus();
+      await crossTo(640);
+      await until(() => !document.querySelector('[role="menuitemcheckbox"]') && onToggle(), `crossing to 640px with the Panes menu open left focus on ${document.activeElement?.outerHTML.slice(0, 80)}`);
+      const composer = host.querySelector('textarea[aria-label="Message the agent"]');
+      composer.focus();
+      await crossTo(390);
+      await crossTo(640);
+      assert(document.activeElement === composer, "crossing 520px moved focus out of the composer");
       await window.__fixtureSetViewport(1280);
       window.dispatchEvent(new Event("resize"));
       await until(() => filesToggle()?.getClientRects().length, "the wide layout did not return");
@@ -10348,6 +10403,11 @@ async function filesInheritedRegression() {
     // The Files tree's carets are its own size; the sidebar's project carets keep theirs.
     const caretWidth = (selector) => host.querySelector(`${selector} .tree-caret svg`)?.getBoundingClientRect().width;
     assert(caretWidth(".project-row") === 13 && caretWidth(".file-tree") === 10, `caret widths: sidebar ${caretWidth(".project-row")}, Files ${caretWidth(".file-tree")}`);
+    // Neither tree's caret box reaches the other: the sidebar's is 23 × 32, and the Files one fits its 12px column and 26px row.
+    const box = (selector) => host.querySelector(selector)?.getBoundingClientRect();
+    const sizes = () => JSON.stringify([".project-row .tree-caret", ".file-tree .tree-caret", ".file-tree .tree-row"].map((selector) => [box(selector)?.width, box(selector)?.height]));
+    assert(box(".project-row .tree-caret").width === 23 && box(".project-row .tree-caret").height === 32 && box(".file-tree .tree-caret").width <= 12
+      && box(".file-tree .tree-row").height <= 26.5, `caret boxes and Files row: ${sizes()}`);
     const dispatch = (event) => fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify(event) }));
     const send = (conversationId, type, owner) => dispatch({ type: "run.event", conversationId, ...owner, runId: `run-${conversationId}-${type}`, payload: { type } });
     const chatReads = () => requests.filter((request) => request.kind === "chat list" || request.kind === "chat detail").length;

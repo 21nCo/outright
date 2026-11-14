@@ -130,12 +130,9 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     }
   }, [project.id, worktree.path]);
 
-  // Reloads the root and every open folder shown under it: one its open
-  // parent lists, as the hidden-file policy now in force would, or one a
-  // reveal is reading. Any other (under a collapsed folder, hidden, or gone)
-  // is closed and its read ends, so it is read afresh when shown again. A
-  // refresh keeps as many entries as each folder had loaded; a hidden-file
-  // change starts from page one.
+  // Reloads the root and every open folder shown under it: one its open parent lists, as the hidden-file policy now in force would, or one a reveal is reading.
+  // Any other (under a collapsed folder, hidden, or gone) is closed and its read ends, so it is read afresh when shown again.
+  // A refresh keeps as many entries as each folder had loaded; a hidden-file change starts from page one.
   const reloadAll = useCallback(({ keepPages = false } = {}) => {
     const loaded = foldersRef.current;
     const shown = new Set([""]);
@@ -156,16 +153,14 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     saveHiddenPreference(browserStorage, showHidden);
     if (listedHiddenRef.current === showHidden) return;
     listedHiddenRef.current = showHidden;
-    // A reveal of a path with a hidden name ends when hidden files are hidden: the
-    // reload then closes its folders and ends their reads, and nothing is focused. So does an open of one waiting for the runtime's answer (claimOpen).
+    // A reveal of a path with a hidden name ends when hidden files are hidden: the reload then closes its folders and ends their reads, and nothing is focused. So does an open of one waiting for the runtime's answer (claimOpen).
     const shownReveal = revealTargetRef.current, hiddenName = (path) => path.split(/^([A-Za-z]:|\\\\)/.test(worktree.path) ? /[\\/]/ : "/").some((name) => name.startsWith(".") && name !== "." && name !== "..");
     if (!showHidden) { if (hiddenName(pendingOpenRef.current)) pendingOpenRef.current = ""; if (revealRef.current === shownReveal.generation && hiddenName(shownReveal.path)) stopReveal(); }
     reloadAll();
   }, [showHidden, reloadAll]);
 
-  // `completions` counts runs that ended in this worktree's chats, and
-  // reconnects that missed events or found a restarted runtime (App.jsx), so
-  // no other event can hide one. One refresh covers a burst.
+  // `completions` counts runs that ended in this worktree's chats, and reconnects that missed events or found a restarted runtime (App.jsx),
+  // so no other event can hide one. One refresh covers a burst.
   const completionsRef = useRef(completions);
   const refreshTimerRef = useRef(null);
   useEffect(() => {
@@ -242,7 +237,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     }
     if (target) {
       const element = rowElement(tree, target);
-      if (element && element !== current) element.focus({ preventScroll: false });
+      if (element && element !== current) { element.focus({ preventScroll: true }); scrollIntoTree(tree, element, 0); }
       if (element && target === activeId && foundIndex >= 0) moveRef.current = false;
     }
     rowsRef.current = rows;
@@ -252,8 +247,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
 
   const toggleFolder = useCallback((path, open) => {
     if (!isFolderPath(path)) return;
-    // A collapse closes every folder under it too, so a reload reads only shown folders;
-    // the reads in flight under it end, and those folders are read afresh when opened.
+    // A collapse closes every folder under it too, so a reload reads only shown folders; the reads in flight under it end, and those folders are read afresh when opened.
     const under = (directory) => directory === path || directory.startsWith(`${path}/`);
     if (!open) for (const directory of [...foldersRef.current.keys()].filter(under)) dropListing(directory, false);
     setExpanded((current) => {
@@ -405,11 +399,11 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   </section>;
 }
 
-// Rows laid out late (content-visibility) can move a row, so it is checked for a few frames.
+// Rows laid out late (content-visibility) can move a row, so it is checked for a few frames. Only the tree scrolls: scrollIntoView would also scroll the page and panes around it.
 function scrollIntoTree(tree, row, frames, frameRef) {
   if (!row?.isConnected) return;
-  const box = row.getBoundingClientRect(), view = tree.getBoundingClientRect();
-  if (box.top < view.top || box.bottom > view.bottom) row.scrollIntoView({ block: "nearest" });
+  const box = row.getBoundingClientRect(), top = tree.getBoundingClientRect().top + tree.clientTop, bottom = top + tree.clientHeight;
+  if (box.top < top || box.bottom > bottom) tree.scrollTop += box.top < top ? box.top - top : box.bottom - bottom;
   if (frames) frameRef.current = requestAnimationFrame(() => scrollIntoTree(tree, row, frames - 1, frameRef));
 }
 

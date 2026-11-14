@@ -22,8 +22,8 @@ export const MIN_PANE_SIZE = Object.freeze({
   files: Object.freeze({ width: 280, height: 340 }),
 });
 export const APPLE_PLATFORM = typeof navigator !== "undefined" && /mac|iphone|ipad|ipod/i.test(navigator.userAgentData?.platform ?? navigator.platform ?? "");
-// Go to file (the app's handler and the terminal, so the shell never gets it): ⌘P on Apple platforms, where Ctrl+P moves up a line; Ctrl+P or Meta+P elsewhere.
-export function isQuickOpenShortcut(event, apple = APPLE_PLATFORM) { return Boolean(apple ? event.metaKey && !event.ctrlKey : event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey && event.key?.toLowerCase() === "p"; }
+// Go to file: ⌘P on Apple platforms, where Ctrl+P moves up a line; Ctrl+P or Meta+P elsewhere, where Ctrl+P is a shell key too, so a focused terminal (shell) passes it to the process and withholds Ctrl+Shift+P instead, as Find takes Ctrl+Shift+F; the app's handler accepts both.
+export function isQuickOpenShortcut(event, apple = APPLE_PLATFORM, shell = false) { return Boolean(apple ? event.metaKey && !event.ctrlKey && !event.shiftKey : (event.metaKey || event.ctrlKey) && (!shell || event.shiftKey)) && !event.altKey && event.key?.toLowerCase() === "p"; }
 export const PANE_SEPARATOR_SIZE = 6;
 export const PANE_SIDES = Object.freeze(["left", "right", "up", "down"]);
 export const PANE_LAYOUT_STORAGE_KEY = "outright.pane-layouts";

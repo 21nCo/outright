@@ -180,9 +180,9 @@ button, input, textarea, select { font: inherit; }
 .project-tree.is-active { background: color-mix(in oklab, var(--sidebar-accent) 70%, transparent); }
 .project-row { min-height: 46px; display: grid; grid-template-columns: 23px minmax(0,1fr) 29px; align-items: center; padding: 2px 4px 2px 7px; border-radius: 8px; }
 .project-row:hover { background: var(--hover); }
-.tree-caret, .project-select { appearance: none; border: 0; background: transparent; cursor: pointer; }
-.tree-caret { width: 23px; height: 32px; padding: 0; display: flex; align-items: center; justify-content: center; color: var(--muted-foreground); }
-.tree-caret svg { width: 13px; height: 13px; }
+.project-row .tree-caret, .project-select { appearance: none; border: 0; background: transparent; cursor: pointer; }
+.project-row .tree-caret { width: 23px; height: 32px; padding: 0; display: flex; align-items: center; justify-content: center; color: var(--muted-foreground); }
+.project-row .tree-caret svg { width: 13px; height: 13px; }
 .project-select { min-width: 0; height: 42px; padding: 0; display: grid; grid-template-columns: 20px minmax(0,1fr); gap: 8px; align-items: center; text-align: left; }
 .project-select > svg { width: 18px; height: 18px; color: var(--muted-foreground); }
 .project-tree.is-active .project-select > svg { color: var(--foreground); }

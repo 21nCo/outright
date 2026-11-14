@@ -75,12 +75,16 @@ function supervisors(t) {
   const provider = path.join(root, "provider.cjs");
   writeFileSync(provider, PROVIDER_SOURCE);
   const runs = [];
-  t.after(() => {
+  t.after(async () => {
+    const ended = [];
     for (const run of runs) {
-      try { run.owner.kill(); } catch {}
-      for (const pid of [run.supervisorPid, run.providerPid(), run.escapedPid()]) if (alive(pid)) try { process.kill(pid); } catch {}
+      for (const pid of [run.owner.pid, run.supervisorPid, run.providerPid(), run.escapedPid()]) if (alive(pid)) { ended.push(pid); try { process.kill(pid); } catch {} }
     }
+    // Each process runs in its run's directory, which Windows keeps locked
+    // until the process has exited, so the tree is removed only after that.
+    const left = await waitUntil(() => ended.every((pid) => !alive(pid)), () => `cleanup left ${ended.filter(alive).join(", ")} running`).then(() => null, (error) => error);
     removeTree(root);
+    if (left) throw left;
   });
   return async (name, modeArgs = []) => {
     const directory = path.join(root, name);
