@@ -10372,10 +10372,13 @@ async function filesInheritedRegression() {
     await remainsTrue(() => pages("big").length === pagesAsked, 300, `a stopped reveal kept paging big: ${pages("big")}`);
     assert(row("entry:big/0199") && !row("entry:big/0500") && /Load 200 more/.test(row("more:big")?.textContent ?? ""), `a stopped reveal did not leave big's shown entries: ${row("more:big")?.textContent}`);
 
-    // (b) Refresh files, or the refresh after an owned run ends, replaces the
-    // read of a reveal still wanted; the reveal ends on its target, scrolled
-    // into view, with focus kept in Go to file.
-    for (const [directory, replace] of [["big", refreshFiles], ["wide", () => mount(1)]]) {
+    // (b) Refresh files, the refresh after an owned run ends, or a hidden-file
+    // change, replaces the read of a reveal still wanted; the reveal ends on
+    // its target, scrolled into view, with focus kept in Go to file.
+    const hiddenButton = () => host.querySelector('.files-pane [aria-label="Show hidden files"]');
+    // Hiding hidden files again reads each folder's first page only, so big pages again after it.
+    const hideHidden = async () => { hiddenButton().click(); await until(() => !row("entry:.cache") && hiddenButton().getAttribute("aria-pressed") === "false" && !row("entry:big/0200"), "hidden files were not hidden again"); };
+    for (const [directory, replace, after] of [["big", refreshFiles], ["wide", () => hiddenButton().click(), hideHidden], ["big", () => mount(1)]]) {
       const target = `${directory}/1800`;
       if (!row(`more:${directory}`)) { row(`entry:${directory}`).click(); await until(() => row(`more:${directory}`), `${directory} did not list its first page`); }
       holds.add(`list:${directory}@500`);
@@ -10386,6 +10389,7 @@ async function filesInheritedRegression() {
       replace();
       await until(() => row(`entry:${target}`) && inView(row(`entry:${target}`)), `a refresh during the reveal of ${target} dropped it`);
       assert(document.activeElement === field(), `the reveal of ${target} after a refresh moved focus to ${document.activeElement?.outerHTML.slice(0, 80)}`);
+      await after?.();
     }
 
     // (c) A collapse aborts the folder's read in flight, and a descendant's,
@@ -10425,7 +10429,7 @@ async function filesInheritedRegression() {
     await until(() => row("entry:nest/inner/x.md"), "opening nest/inner after the refresh did not list it");
     // Hiding hidden files closes an open dotfolder and its open subfolder: no reload reads
     // either, and showing hidden files again lists the dotfolder closed, to be read afresh.
-    const toggleHidden = async (shown) => { host.querySelector('.files-pane [aria-label="Show hidden files"]').click(); await until(() => Boolean(row("entry:.cache")) === shown, `.cache was ${shown ? "not " : ""}listed`); };
+    const toggleHidden = async (shown) => { hiddenButton().click(); await until(() => Boolean(row("entry:.cache")) === shown, `.cache was ${shown ? "not " : ""}listed`); };
     await toggleHidden(true);
     row("entry:.cache").click();
     await until(() => row("entry:.cache/deep"), ".cache was not listed");
@@ -10441,6 +10445,20 @@ async function filesInheritedRegression() {
     await until(() => row("entry:.cache")?.getAttribute("aria-expanded") === "false", ".cache stayed open with hidden files shown again");
     row("entry:.cache").click();
     await until(() => row("entry:.cache/deep") && asked("list", ".cache") > Number(shownDotReads.split(",")[0]), "opening .cache again did not read it afresh");
+    // Hiding hidden files during Go to file of a hidden path ends that reveal: its held
+    // read is aborted, no dotfolder is read again, and nothing opens or takes focus later.
+    holds.add("list:.cache/deep");
+    const deepReads = asked("list", ".cache/deep");
+    await jumpTo(".cache/deep/x.md");
+    await until(() => asked("list", ".cache/deep") > deepReads, "Go to file did not read .cache/deep");
+    const deepRead = signalOf("list", ".cache/deep");
+    const revealDotReads = dotReads();
+    await toggleHidden(false);
+    assert(deepRead?.aborted === true, "hiding hidden files left the reveal's read of .cache/deep running");
+    holds.delete("list:.cache/deep");
+    await remainsTrue(() => dotReads() === revealDotReads, 300, `a reveal of a hidden path read dotfolders with hidden files off: ${dotReads()} after ${revealDotReads}`);
+    await toggleHidden(true);
+    await remainsTrue(() => row("entry:.cache")?.getAttribute("aria-expanded") === "false" && document.activeElement === field(), 300, "a stopped reveal of .cache/deep/x.md opened .cache or took focus");
     await toggleHidden(false);
 
     // A background refresh that fails for a passing reason keeps the shown

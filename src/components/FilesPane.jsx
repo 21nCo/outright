@@ -140,7 +140,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     const shown = new Set([""]);
     for (const row of visibleRows(loaded, expandedRef.current)) if (row.type === "entry" && row.open && shown.has(row.directory) && (hiddenRef.current || !row.entry.hidden)) shown.add(row.entry.path);
     for (const [directory, read] of readsRef.current) if (read.active?.()) for (const each of [...ancestorsOf(directory), directory]) shown.add(each);
-    for (const directory of loaded.keys()) {
+    for (const directory of new Set([...loaded.keys(), ...readsRef.current.keys()])) {
       if (!shown.has(directory)) { tokensRef.current.set(directory, (tokensRef.current.get(directory) ?? 0) + 1); abortListing(directory); readsRef.current.delete(directory); }
     }
     setFolders((current) => new Map([...current].filter(([directory]) => shown.has(directory))));
@@ -155,11 +155,16 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     saveHiddenPreference(browserStorage, showHidden);
     if (listedHiddenRef.current === showHidden) return;
     listedHiddenRef.current = showHidden;
+    // A reveal of a path with a hidden name ends when hidden files are hidden: the
+    // reload then closes its folders and ends their reads, and nothing is focused.
+    const shownReveal = revealTargetRef.current;
+    if (!showHidden && revealRef.current === shownReveal.generation && shownReveal.path.split("/").some((name) => name.startsWith("."))) stopReveal();
     reloadAll();
   }, [showHidden, reloadAll]);
 
-  // `completions` counts runs that ended in this worktree's chats (App.jsx),
-  // so no other event can hide one. One refresh covers a burst.
+  // `completions` counts runs that ended in this worktree's chats, and
+  // reconnects that missed events or found a restarted runtime (App.jsx), so
+  // no other event can hide one. One refresh covers a burst.
   const completionsRef = useRef(completions);
   const refreshTimerRef = useRef(null);
   useEffect(() => {
@@ -187,6 +192,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   const scrollRef = useRef("");
   // A newer reveal or a tree activation stops a reveal, with its scroll and pending focus move.
   const revealRef = useRef(0);
+  const revealTargetRef = useRef({ generation: 0, path: "" });
   const stopReveal = (id = shownIdRef.current) => { revealRef.current += 1; dropReveal(); scrollRef.current = ""; moveRef.current = false; setFocusedId(id); };
   // The file whose reveal waits for the runtime's answer (onResolved); the user's own tree action drops it.
   const pendingOpenRef = useRef("");
@@ -300,6 +306,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   const reveal = useCallback(async (path, open) => {
     dropReveal();
     const generation = ++revealRef.current;
+    revealTargetRef.current = { generation, path };
     const active = () => aliveRef.current && revealRef.current === generation;
     const expand = (paths) => setExpanded((current) => new Set([...current, ...paths]));
     const target = `entry:${path}`;

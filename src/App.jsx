@@ -155,7 +155,8 @@ export function App() {
   // The pane the toolbar's Panes menu last opened, focused when it closes.
   const paneMenuFocusRef = useRef("");
   // Counts runs that ended in a chat of the shown worktree, archived chats
-  // too; Files refreshes on each new count.
+  // too, and reconnects that missed events or found a restarted runtime;
+  // Files refreshes on each new count.
   const [filesCompletions, setFilesCompletions] = useState(0);
   const filesShownRef = useRef(false); // A Files pane not in the layout loads afresh when opened.
   // Setup state and output events, and checkpoint changes, reach an open
@@ -738,7 +739,8 @@ export function App() {
   const selectedRecoveryRunId = recoveryGate(conversation)?.id ?? null;
 
   // Asks the mounted Files pane for one coalesced refresh (FilesPane
-  // `completions`), after a run ended in the shown worktree: its terminal
+  // `completions`), after a reconnect that missed events or found a restarted
+  // runtime (no event), or after a run ended in the shown worktree: its terminal
   // event names its chat's worktree, archived or not, so no chat is read to
   // decide; an event without it is matched to a listed chat.
   const refreshShownFiles = useCallback((runEvent) => {
