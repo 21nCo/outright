@@ -1,0 +1,21 @@
+src/components/FilesPane.jsx
+  s_5c52c5622f7287::t_c3aaa753353416 161
+src/components/TerminalPane.jsx
+  s_5c52c5622f7287::t_a45f920bced5ac 41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a46fb034ecd288d5555c5f215c4ca347358ddc46",
+  "prompts": {},
+  "sessions": {
+    "s_5c52c5622f7287": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "00649395-c1d3-404f-bde5-f10cf344d0c4",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
