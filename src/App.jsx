@@ -4,13 +4,13 @@ import {
   Check, CheckCircle, ClockCounterClockwise, Command, Desktop, DotsThree,
   FolderOpen, FolderPlus, Folders, GearSix, GitBranch, GitDiff, Info,
   Layout, MagnifyingGlass, Moon, PaperPlaneTilt, PencilSimple, PushPin, Plus,
-  ShieldCheck, SidebarSimple, Sparkle, Stop, Sun, TerminalWindow, Trash,
+  ShieldCheck, SidebarSimple, Sparkle, SquaresFour, Stop, Sun, TerminalWindow, Trash,
   WarningCircle, Wrench, X,
 } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import {
-  DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem,
+  DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem,
   DropdownMenuLabel, DropdownMenuRadioGroup, DropdownMenuRadioItem,
   DropdownMenuSeparator, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
@@ -22,6 +22,8 @@ import { ChangesPane } from "@/components/ChangesPane";
 import { ESTIMATED_MESSAGE_HEIGHT, WindowedMessages } from "@/components/WindowedMessages";
 import { CommandPalette } from "@/components/CommandPalette";
 import { ContextPane } from "@/components/ContextPane";
+import { FilesPane } from "@/components/FilesPane";
+import { worktreeOwnsChat } from "@/lib/file-tree";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { TerminalPane } from "@/components/TerminalPane";
 import { LifecycleMark, LifecycleState, TeardownChoices, WorktreeLifecycleDialog } from "@/components/WorktreeLifecycle";
@@ -39,6 +41,7 @@ import { lifecycleFor, mergeLifecycleSnapshot, removalRequest, teardownProblem, 
 import { PANE_LAYOUT_PRESETS, PANE_STORE_PROBLEMS, applyPreset, defaultPaneLayout, focusView, layoutViews, loadPaneLayout, paneRestoreMessage, savePaneLayout } from "@/lib/pane-layout";
 
 const CHAT_TAB_DRAG_TYPE = "application/x-outright-chat-tab";
+const APPLE_PLATFORM = typeof navigator !== "undefined" && /mac|iphone|ipad|ipod/i.test(navigator.userAgentData?.platform ?? navigator.platform ?? "");
 const MAX_RENDERED_MESSAGES = 1000;
 function moveMessageViewport(viewport, top) {
   if (!viewport) return;
@@ -144,6 +147,16 @@ export function App() {
   const [removeState, setRemoveState] = useState({ pending: false, problem: null, target: null, notice: "" });
   const [lifecyclePath, setLifecyclePath] = useState("");
   const [checkpointsPath, setCheckpointsPath] = useState("");
+  // ⌘P asks the Files pane to focus Go to file once it is shown; the pane
+  // clears the request, so a later remount for another worktree does not.
+  const [quickOpenRequest, setQuickOpenRequest] = useState(0);
+  const clearQuickOpen = useCallback(() => setQuickOpenRequest(0), []);
+  // The pane the toolbar's Panes menu last opened, focused when it closes.
+  const paneMenuFocusRef = useRef("");
+  // Counts runs that ended in a chat of the shown worktree, archived chats
+  // too; Files refreshes on each new count.
+  const [filesCompletions, setFilesCompletions] = useState(0);
+  const filesShownRef = useRef(false); // A Files pane not in the layout loads afresh when opened.
   // Setup state and output events, and checkpoint changes, reach an open
   // setup or checkpoints dialog through this.
   const [lifecycleEvents] = useState(() => new EventTarget());
@@ -723,7 +736,14 @@ export function App() {
   }, [loadConversation, conversationListPending, conversationLoadFailed, conversationDetailReady, selectedConversationId]);
   const selectedRecoveryRunId = recoveryGate(conversation)?.id ?? null;
 
+  const noteRunEnded = useCallback(async (conversationId) => {
+    if (!filesShownRef.current) return;
+    const [projectId, worktreeId] = [selectedProjectRef.current, selectedWorktreeRef.current];
+    const owned = await worktreeOwnsChat(conversationId, { projectId, worktreeId }, conversationsRef.current, (id) => api(`/api/conversations/${encodeURIComponent(id)}`));
+    if (owned && selectedProjectRef.current === projectId && selectedWorktreeRef.current === worktreeId) setFilesCompletions((count) => count + 1);
+  }, []);
   const handleRuntimeEvent = useCallback((event) => {
+    if (event.type === "run.event" && ["run.completed", "run.failed", "run.stopped"].includes(event.payload?.type)) void noteRunEnded(event.conversationId);
     if (terminalCommandFenceRef.current.observe(event)) {
       setUnverifiedTerminalIds(terminalCommandFenceRef.current.snapshot());
     }
@@ -923,7 +943,7 @@ export function App() {
         if (document.hidden && settings.notifications && Notification.permission === "granted") new Notification(`Outright run ${runEvent.type.split(".")[1]}`, { body: conversation?.title ?? "Agent run" });
       }
     }
-  }, [loadConversation, loadConversations, settings.notifications, conversation?.title, selectedRecoveryRunId, applyStreamingText, refreshMessageCount, lifecycleEvents]);
+  }, [loadConversation, loadConversations, settings.notifications, conversation?.title, selectedRecoveryRunId, applyStreamingText, refreshMessageCount, lifecycleEvents, noteRunEnded]);
   runtimeHandlerRef.current = handleRuntimeEvent;
 
   useEffect(() => {
@@ -947,6 +967,15 @@ export function App() {
       if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "t") {
         event.preventDefault();
         paneLayoutRef.current?.open("terminal");
+      }
+      // On macOS only ⌘P: Ctrl+P moves up a line in a text field there.
+      const quickOpenKey = APPLE_PLATFORM ? event.metaKey && !event.ctrlKey : event.metaKey || event.ctrlKey;
+      if (quickOpenKey && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "p") {
+        // The open drawer or a dialog owns the keyboard; the workspace is inert and the key keeps its browser action (Print).
+        if (!paneLayoutRef.current || (isNarrow && sidebarOpen) || document.querySelector('[role="dialog"][data-open]:not(#project-sidebar)')) return;
+        event.preventDefault();
+        paneLayoutRef.current?.open("files");
+        setQuickOpenRequest((value) => value + 1);
       }
       if (event.key === "Escape" && !document.querySelector('[role="dialog"][data-open]:not(#project-sidebar)')) {
         if (isNarrow && sidebarOpen) closeSidebar();
@@ -2058,9 +2087,21 @@ export function App() {
   if (activeRun) composerAction = <Button size="icon" type="button" variant="destructive" onClick={stopRun} aria-label="Stop active agent run"><Stop weight="fill" /></Button>;
 
   const paneViews = layoutViews(paneState.layout.root);
+  filesShownRef.current = paneViews.includes("files");
+  // Pane toggles in the toolbar; at 520px or less they move into the Panes
+  // menu, so every toolbar action stays within a 320px window.
+  const PANE_TOGGLES = [["changes", "Changes", GitDiff, "Changes"], ["terminal", "Terminal", TerminalWindow, "Terminal ⌘⇧T"], ["context", "Project context", Info, "Project context"], ["files", "Files", FolderOpen, "Files ⌘P"]];
+  // As with a toggle, a pane opened from the menu takes focus; closing one
+  // returns focus to the menu's trigger.
+  const togglePaneFromMenu = (view) => { paneMenuFocusRef.current = paneViews.includes(view) ? "" : view; paneLayoutRef.current?.toggle(view); };
+  const paneMenuFinalFocus = () => {
+    const view = paneMenuFocusRef.current;
+    paneMenuFocusRef.current = "";
+    return (view && document.getElementById(paneId(view))) || true;
+  };
   const paneToggle = (view, label, Icon, hint) => {
     const shown = paneViews.includes(view);
-    return <Tooltip><TooltipTrigger render={<Button variant={shown ? "secondary" : "ghost"} size="icon-sm" onClick={() => paneLayoutRef.current?.toggle(view)} aria-label={label} aria-pressed={shown} aria-controls={shown ? paneId(view) : undefined} />}><Icon /></TooltipTrigger><TooltipContent>{hint}</TooltipContent></Tooltip>;
+    return <Tooltip key={view}><TooltipTrigger render={<Button variant={shown ? "secondary" : "ghost"} size="icon-sm" onClick={() => paneLayoutRef.current?.toggle(view)} aria-label={label} aria-pressed={shown} aria-controls={shown ? paneId(view) : undefined} />}><Icon /></TooltipTrigger><TooltipContent>{hint}</TooltipContent></Tooltip>;
   };
   const conversationView = <section className="conversation-pane" id="conversation-panel" role="tabpanel" aria-labelledby={selectedConversationId ? domId("chat-tab", selectedConversationId) : undefined}>
     <span className="sr-only run-announcement" role="status" aria-live="polite" aria-atomic="true">{runAnnouncement}</span>
@@ -2083,6 +2124,7 @@ export function App() {
     changes: <ChangesPane worktree={worktree} runtimeEvent={runtimeEvent} settings={settings} onError={handleError} onToast={setToast} />,
     terminal: <TerminalPane worktree={worktree} runtimeEvent={runtimeEvent} terminalsVersion={terminalsVersion} unverifiedTerminalIds={unverifiedTerminalIds} sendRuntime={sendRuntime} onError={handleError} />,
     context: <ContextPane worktree={worktree} settings={settings} onError={handleError} />,
+    files: <FilesPane key={`${project.id}:${worktree.path}`} project={project} worktree={worktree} settings={settings} completions={filesCompletions} quickOpen={quickOpenRequest} onQuickOpenHandled={clearQuickOpen} onError={handleError} />,
   };
 
   return <div className={`app-shell ${sidebarOpen ? "sidebar-is-open" : "sidebar-is-closed"}`}>
@@ -2096,7 +2138,7 @@ export function App() {
     {isNarrow && sidebarOpen && <div className="mobile-scrim" onClick={closeSidebar} aria-hidden="true" />}
 
     <main id="main-workspace" className="workspace" inert={isNarrow && sidebarOpen ? true : undefined} aria-hidden={isNarrow && sidebarOpen ? true : undefined}>
-      <header className="workspace-bar">{!sidebarOpen && <Button variant="ghost" size="icon-sm" onClick={openSidebar} aria-label="Open projects sidebar" aria-controls="project-sidebar" aria-expanded={sidebarOpen}><SidebarSimple /></Button>}<div className="workspace-context"><span>{project.name}</span><CaretRight /><GitBranch /><strong>{worktree.name}</strong></div><div className="workspace-tools"><RunState run={pendingOutcomeRun ?? activeRun ?? latestRun} outcomePending={outcomePending} /><WorktreeState worktree={worktree} /><LifecycleState key={worktree.path} state={worktreeLifecycle} onOpen={() => setLifecyclePath(worktree.path)} />{paneToggle("changes", "Changes", GitDiff, "Changes")}{paneToggle("terminal", "Terminal", TerminalWindow, "Terminal ⌘⇧T")}{paneToggle("context", "Project context", Info, "Project context")}<DropdownMenu><span id="pane-layout-hint" className="sr-only">F6 moves focus between panes</span><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Pane layout" aria-describedby="pane-layout-hint" />}><Layout /></DropdownMenuTrigger><DropdownMenuContent align="end" className="w-auto min-w-60" aria-describedby="pane-layout-hint"><DropdownMenuGroup><DropdownMenuLabel>Pane layout</DropdownMenuLabel>{PANE_LAYOUT_PRESETS.map((preset) => <DropdownMenuItem key={preset.id} onClick={() => changePaneLayout(applyPreset(paneState.layout, preset.id))}>{preset.label}</DropdownMenuItem>)}</DropdownMenuGroup><DropdownMenuSeparator /><p className="pane-layout-hint" aria-hidden="true">F6 moves focus between panes</p></DropdownMenuContent></DropdownMenu><ThemeMenu theme={theme} onThemeChange={setTheme} /><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Worktree options" />}><DotsThree weight="bold" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={() => api("/api/editor/open", { method: "POST", body: { path: worktree.path, editor: settings.editor } }).then(() => setToast(`Opened in ${settings.editor}`)).catch((nextError) => setError(nextError.message))}><PencilSimple />Open in {settings.editor}</DropdownMenuItem><DropdownMenuItem onClick={() => setWorktreeDialog(project)}><GitBranch />New worktree</DropdownMenuItem><DropdownMenuItem onClick={() => setLifecyclePath(worktree.path)}><Wrench />Worktree setup</DropdownMenuItem><DropdownMenuItem onClick={() => setCheckpointsPath(worktree.path)}><ClockCounterClockwise />Checkpoints</DropdownMenuItem>{worktree.isLinked && <><DropdownMenuSeparator /><DropdownMenuItem variant="destructive" onClick={() => { setRemoveState((current) => current.pending ? current : { pending: false, problem: null, target: null, notice: "" }); setRemoveDialog((current) => sameRemoveTarget(current, selectedTarget) ? { ...current, open: true } : { ...selectedTarget, open: true, confirmation: "" }); }}><Trash />Remove worktree</DropdownMenuItem></>}</DropdownMenuContent></DropdownMenu></div></header>
+      <header className="workspace-bar">{!sidebarOpen && <Button variant="ghost" size="icon-sm" onClick={openSidebar} aria-label="Open projects sidebar" aria-controls="project-sidebar" aria-expanded={sidebarOpen}><SidebarSimple /></Button>}<div className="workspace-context"><span>{project.name}</span><CaretRight /><GitBranch /><strong>{worktree.name}</strong></div><div className="workspace-tools"><RunState run={pendingOutcomeRun ?? activeRun ?? latestRun} outcomePending={outcomePending} /><WorktreeState worktree={worktree} /><LifecycleState key={worktree.path} state={worktreeLifecycle} onOpen={() => setLifecyclePath(worktree.path)} /><span className="pane-toggles">{PANE_TOGGLES.map(([view, label, Icon, hint]) => paneToggle(view, label, Icon, hint))}</span><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" className="pane-menu-trigger" aria-label="Show or hide panes" />}><SquaresFour /></DropdownMenuTrigger><DropdownMenuContent align="end" className="w-auto min-w-48" finalFocus={paneMenuFinalFocus}><DropdownMenuGroup><DropdownMenuLabel>Panes</DropdownMenuLabel>{PANE_TOGGLES.map(([view, label, Icon]) => <DropdownMenuCheckboxItem key={view} closeOnClick checked={paneViews.includes(view)} onCheckedChange={() => togglePaneFromMenu(view)}><Icon />{label}</DropdownMenuCheckboxItem>)}</DropdownMenuGroup></DropdownMenuContent></DropdownMenu><DropdownMenu><span id="pane-layout-hint" className="sr-only">F6 moves focus between panes</span><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Pane layout" aria-describedby="pane-layout-hint" />}><Layout /></DropdownMenuTrigger><DropdownMenuContent align="end" className="w-auto min-w-60" aria-describedby="pane-layout-hint"><DropdownMenuGroup><DropdownMenuLabel>Pane layout</DropdownMenuLabel>{PANE_LAYOUT_PRESETS.map((preset) => <DropdownMenuItem key={preset.id} onClick={() => changePaneLayout(applyPreset(paneState.layout, preset.id))}>{preset.label}</DropdownMenuItem>)}</DropdownMenuGroup><DropdownMenuSeparator /><p className="pane-layout-hint" aria-hidden="true">F6 moves focus between panes</p></DropdownMenuContent></DropdownMenu><ThemeMenu theme={theme} onThemeChange={setTheme} /><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="Worktree options" />}><DotsThree weight="bold" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={() => api("/api/editor/open", { method: "POST", body: { path: worktree.path, editor: settings.editor } }).then(() => setToast(`Opened in ${settings.editor}`)).catch((nextError) => setError(nextError.message))}><PencilSimple />Open in {settings.editor}</DropdownMenuItem><DropdownMenuItem onClick={() => setWorktreeDialog(project)}><GitBranch />New worktree</DropdownMenuItem><DropdownMenuItem onClick={() => setLifecyclePath(worktree.path)}><Wrench />Worktree setup</DropdownMenuItem><DropdownMenuItem onClick={() => setCheckpointsPath(worktree.path)}><ClockCounterClockwise />Checkpoints</DropdownMenuItem>{worktree.isLinked && <><DropdownMenuSeparator /><DropdownMenuItem variant="destructive" onClick={() => { setRemoveState((current) => current.pending ? current : { pending: false, problem: null, target: null, notice: "" }); setRemoveDialog((current) => sameRemoveTarget(current, selectedTarget) ? { ...current, open: true } : { ...selectedTarget, open: true, confirmation: "" }); }}><Trash />Remove worktree</DropdownMenuItem></>}</DropdownMenuContent></DropdownMenu></div></header>
       <nav className="chat-tabs" aria-label="Agent chats"><div className="chat-tabs-scroll" role="tablist" aria-label="Open agent chats" aria-orientation="horizontal" onKeyDown={(event) => navigateTabs(event, '[role="tab"]', (id) => { revealConversationPane(); selectConversation(id); })}>{conversations.map((item) => <div className={`chat-tab ${item.id === selectedConversationId ? "is-active" : ""}`} key={item.id} draggable onDragStart={(event) => { dragConversationRef.current = item.id; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData(CHAT_TAB_DRAG_TYPE, item.id); }} onDragEnd={() => { dragConversationRef.current = ""; }} onDragOver={(event) => { if (isChatTabDrag(event)) event.preventDefault(); }} onDrop={(event) => { if (!isChatTabDrag(event)) return; event.preventDefault(); void reorderConversation(item.id); }}><button className="tab-select" id={domId("chat-tab", item.id)} data-tab-id={item.id} role="tab" aria-selected={item.id === selectedConversationId} aria-controls="conversation-panel" tabIndex={item.id === selectedConversationId ? 0 : -1} onClick={() => { revealConversationPane(); selectConversation(item.id); }} onDoubleClick={() => { selectConversation(item.id); window.setTimeout(openManageChat, 0); }}>{item.pinned ? <PushPin weight="fill" /> : <ChatCircle weight={item.id === selectedConversationId ? "fill" : "regular"} />}<span>{item.title}</span></button><button className="tab-close" aria-label={`Archive ${item.title}`} onClick={(event) => { event.stopPropagation(); void archiveChat(item, event.currentTarget); }}><X /></button></div>)}</div><Button variant="ghost" size="icon-sm" className="add-tab" onClick={() => setNewChatOpen(true)} aria-label="New chat tab"><Plus /></Button></nav>
       <PaneLayout ref={paneLayoutRef} className="work-area" layout={paneState.layout} onChange={changePaneLayout} compactPreferred={isNarrow} views={paneViewElements} />
     </main>
