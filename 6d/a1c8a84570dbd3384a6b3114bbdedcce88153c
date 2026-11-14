@@ -1,0 +1,38 @@
+src/components/FilesPane.jsx
+  s_c526181c479e7f::t_5974044eaac3ce 45-47,162-165,200,233,312,401,412-413,417
+src/lib/pane-layout.js
+  s_c526181c479e7f::t_28383af36bb6e0 24-25
+  s_c526181c479e7f::t_b83bee5e134b26 26
+README.md
+  s_c526181c479e7f::t_c685ff566ebea0 71
+tests/ui-races.test.mjs
+  s_c526181c479e7f::t_3b79dbb4125080 675,680
+src/App.jsx
+  s_c526181c479e7f::t_3464bd0af0cc2d 40,977,990-998
+tests/ui-races.jsx
+  s_c526181c479e7f::t_f4e70adc4cba94 2814-2822,10083-10088,10306-10316,10330-10332,10491-10505
+src/components/TerminalPane.jsx
+  s_c526181c479e7f::t_66eaca4aaea928 10,141-142
+tests/pane-layout.test.mjs
+  s_c526181c479e7f::t_2d668b0f1de1ba 5,199-214
+src/styles.css
+  s_c526181c479e7f::t_2831de3c2dc25e 492,504-505
+tests/ui-fixture-budget.mjs
+  s_c526181c479e7f::t_283339ff3fc3c3 5-12,15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6da1c8a84570dbd3384a6b3114bbdedcce88153c",
+  "prompts": {},
+  "sessions": {
+    "s_c526181c479e7f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b38dc916-d96f-4d4d-93e9-60443b9008a9",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
