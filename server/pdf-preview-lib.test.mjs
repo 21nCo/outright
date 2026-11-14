@@ -221,7 +221,7 @@ function textStream(chunks, counters = {}) {
       index += 1;
       if (next) controller.enqueue({ items: next }); else controller.close();
     },
-    cancel() { counters.cancelled = true; },
+    cancel(reason) { counters.cancelled = true; counters.reason = reason; },
   }, { highWaterMark: 0 });
 }
 
@@ -262,6 +262,21 @@ test("page text stops at its input budget for endless whitespace, empty items an
   assert.ok(none.cancelled && none.pulls <= 51, `pulled ${none.pulls} chunks`);
 });
 
+test("pdf.js's text stream is cancelled with an Error, after a spent budget and after an abort", async () => {
+  // pdf.js's cancel asserts an Error reason; without one the stream is never
+  // marked closed and the worker's next chunk throws an uncaught TypeError.
+  const spent = {};
+  await readPageText(textStream(() => [{ str: "word ".repeat(50) }], spent), { max: 10 });
+  assert.ok(spent.cancelled && spent.reason instanceof Error, `cancelled with ${spent.reason}`);
+  const aborted = {};
+  const controller = new AbortController();
+  const reading = readPageText(stallingStream([[{ str: "abc" }]], aborted), { signal: controller.signal });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  controller.abort();
+  await reading;
+  assert.ok(aborted.cancelled && aborted.reason instanceof Error, `cancelled with ${aborted.reason}`);
+});
+
 // Sends the given chunks, then never answers another pull, like a pdf.js
 // worker that has stalled.
 function stallingStream(chunks, counters) {
@@ -273,7 +288,7 @@ function stallingStream(chunks, counters) {
       if (index < chunks.length) { controller.enqueue({ items: chunks[index++] }); return undefined; }
       return new Promise(() => {});
     },
-    cancel() { counters.cancelled = true; },
+    cancel(reason) { counters.cancelled = true; counters.reason = reason; },
   }, { highWaterMark: 0 });
 }
 

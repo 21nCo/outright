@@ -14,7 +14,9 @@ export const PAGE_TEXT_LIMIT = 100_000;
 
 export async function readPageText(stream, { max = PAGE_TEXT_LIMIT, maxInput = 4 * max, maxItems = 4 * max, signal } = {}) {
   const reader = stream.getReader();
-  const stop = () => { reader.cancel().catch(() => {}); };
+  // pdf.js asserts that a cancel names an Error; without one it never marks
+  // the stream closed and throws on the worker's next chunk.
+  const stop = () => { reader.cancel(new Error("The page text is no longer needed")).catch(() => {}); };
   signal?.addEventListener("abort", stop, { once: true });
   let text = "";
   let input = 0;
