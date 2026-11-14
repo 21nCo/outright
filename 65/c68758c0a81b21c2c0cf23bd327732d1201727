@@ -1,0 +1,19 @@
+server/agent-supervisor-windows.test.mjs
+  s_c151ba2bdaedd9::t_0a397a7099e66a 69,82-84,88-89,221-222,224-225
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "65c68758c0a81b21c2c0cf23bd327732d1201727",
+  "prompts": {},
+  "sessions": {
+    "s_c151ba2bdaedd9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e578168f-02ce-43a3-badd-f818ba10735a",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
