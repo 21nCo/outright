@@ -40,7 +40,7 @@ import { lifecycleFor, mergeLifecycleSnapshot, removalRequest, teardownProblem, 
 import { APPLE_PLATFORM, PANE_LAYOUT_PRESETS, PANE_STORE_PROBLEMS, applyPreset, defaultPaneLayout, focusView, isQuickOpenShortcut, layoutViews, loadPaneLayout, paneRestoreMessage, savePaneLayout } from "@/lib/pane-layout";
 
 const CHAT_TAB_DRAG_TYPE = "application/x-outright-chat-tab";
-// Go to file is ⌘P on Apple platforms and Ctrl+P elsewhere (the keyboard handler).
+// Go to file is ⌘P on Apple platforms and Ctrl+P (or Meta+P) elsewhere (isQuickOpenShortcut).
 const QUICK_OPEN_HINT = APPLE_PLATFORM ? "⌘P" : "Ctrl+P";
 const MAX_RENDERED_MESSAGES = 1000;
 function moveMessageViewport(viewport, top) {

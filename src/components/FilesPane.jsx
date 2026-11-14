@@ -158,7 +158,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     listedHiddenRef.current = showHidden;
     // A reveal of a path with a hidden name ends when hidden files are hidden: the
     // reload then closes its folders and ends their reads, and nothing is focused. So does an open of one waiting for the runtime's answer (claimOpen).
-    const shownReveal = revealTargetRef.current, hiddenName = (path) => path.split("/").some((name) => name.startsWith("."));
+    const shownReveal = revealTargetRef.current, hiddenName = (path) => path.split(/^([A-Za-z]:|\\\\)/.test(worktree.path) ? /[\\/]/ : "/").some((name) => name.startsWith("."));
     if (!showHidden) { if (hiddenName(pendingOpenRef.current)) pendingOpenRef.current = ""; if (revealRef.current === shownReveal.generation && hiddenName(shownReveal.path)) stopReveal(); }
     reloadAll();
   }, [showHidden, reloadAll]);

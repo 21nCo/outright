@@ -9985,7 +9985,7 @@ async function filesFocusRegression() {
   const many = Array.from({ length: 700 }, (_, index) => file(`many/m-${String(index).padStart(3, "0")}.txt`));
   const markdown = "# Notes\n\n[guide](docs/guide.md) [folder](docs) [gone](docs/gone.md) [flaky](flaky.md) [picture](picture.png)\n";
   const previews = { "notes.md": { previewType: "markdown", text: markdown }, "docs/guide.md": { previewType: "markdown", text: "# Guide\n\n[other](other.md)\n" }, "docs/other.md": { previewType: "markdown", text: "# Other\n" },
-    "picture.png": { previewType: "image" }, "flaky.md": { previewType: "markdown", text: "# Flaky\n" } };
+    "picture.png": { previewType: "image" }, "flaky.md": { previewType: "markdown", text: "# Flaky\n" }, "docs/.cache/x.md": { previewType: "markdown", text: "# Cached\n" } };
   const listings = [];
   const previewed = [];
   let flaky = 0;
@@ -9997,7 +9997,8 @@ async function filesFocusRegression() {
       listings.push(parameters.dir);
       const page = (entries) => response({ entries, nextCursor: null, total: entries.length, remaining: 0, hiddenCount: 0, truncated: false });
       if (!parameters.dir) return page([folder("docs"), folder("many"), folder("slow"), file("notes.md"), ...filler]);
-      if (parameters.dir === "docs") return page([file("docs/guide.md"), file("docs/other.md")]);
+      if (parameters.dir === "docs") return page([file("docs/guide.md"), file("docs/other.md"), ...(parameters.hidden === "true" ? [{ ...folder("docs/.cache"), hidden: true }] : [])]);
+      if (parameters.dir === "docs/.cache") return page([file("docs/.cache/x.md")]);
       if (parameters.dir === "slow") { await new Promise((resolve) => { slowListing = resolve; }); return page([folder("slow/deep")]); }
       if (parameters.dir === "many") {
         const start = parameters.cursor ? Number(parameters.cursor) : 0;
@@ -10190,6 +10191,23 @@ async function filesFocusRegression() {
   await activate(refreshFolder());
   await until(() => listings.includes("docs") && document.activeElement === row("entry:docs"), `Refresh folder for docs\\gone.md in a Windows worktree read ${JSON.stringify(listings)}`);
   assert(!listings.some((dir) => !dir), `Refresh folder for docs\\gone.md in a Windows worktree also read the root: ${JSON.stringify(listings)}`);
+  // There "\\" separates hidden names too: hiding dotfiles ends a pending open of docs\\.cache\\x.md, so its late answer reveals nothing.
+  const hiddenFiles = async (shown) => { host.querySelector('.files-pane [aria-label="Show hidden files"]').click(); await until(() => Boolean(row("entry:docs/.cache")) === shown, `docs/.cache was ${shown ? "not " : ""}listed`); };
+  await hiddenFiles(true);
+  holdPreview = { file: "docs\\.cache\\x.md", promise: new Promise((resolve) => { release = resolve; }) };
+  windowsJump.focus();
+  setControlValue(windowsJump, "docs\\.cache\\x.md");
+  windowsJump.form.requestSubmit();
+  await until(() => previewed.includes("docs\\.cache\\x.md"), "docs\\.cache\\x.md was not asked for");
+  await hiddenFiles(false);
+  await hiddenFiles(true);
+  listings.length = 0;
+  release();
+  holdPreview = null;
+  await until(() => /Cached/.test(host.querySelector(".file-preview")?.textContent ?? ""), "the late answer for docs\\.cache\\x.md was not shown");
+  await remainsTrue(() => !listings.includes("docs/.cache") && row("entry:docs/.cache")?.getAttribute("aria-expanded") === "false" && document.activeElement === windowsJump, 300,
+    `a late answer after dotfiles were hidden revealed docs/.cache/x.md: read ${JSON.stringify(listings)}, focus ${document.activeElement?.outerHTML.slice(0, 80)}`);
+  await hiddenFiles(false);
 }
 
 // The Files behaviours inherited from OUT-18: ⌘P opens Go to file only while
