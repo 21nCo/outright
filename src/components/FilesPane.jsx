@@ -131,8 +131,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   }, [project.id, worktree.path]);
 
   // Reloads the root and every open folder shown under it: one its open parent lists, as the hidden-file policy now in force would, or one a reveal is reading.
-  // Any other (under a collapsed folder, hidden, or gone) is closed and its read ends, so it is read afresh when shown again.
-  // A refresh keeps as many entries as each folder had loaded; a hidden-file change starts from page one.
+  // Any other (under a collapsed folder, hidden, or gone) is closed and its read ends, so it is read afresh when shown again. A refresh keeps as many entries as each folder had loaded; a hidden-file change starts from page one.
   const reloadAll = useCallback(({ keepPages = false } = {}) => {
     const loaded = foldersRef.current;
     const shown = new Set([""]);
@@ -318,7 +317,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   const keepFocus = useCallback(() => {
     const tree = treeRef.current;
     const current = document.activeElement;
-    if (tree && (!current || current === document.body || (tree.parentElement.contains(current) && !tree.contains(current)))) tree.querySelector('[tabindex="0"]')?.focus();
+    if (tree && (!current || current === document.body || (tree.parentElement.contains(current) && !tree.contains(current)))) tree.querySelector('[tabindex="0"]')?.focus({ preventScroll: true });
   }, []);
 
   // Opens an exact worktree path, such as a resolved Markdown link target.

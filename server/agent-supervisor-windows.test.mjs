@@ -211,10 +211,13 @@ async function crashedManagedTerminal(t, windowMs) {
   const owner = spawn(process.execPath, ["--input-type=module", "-e", MANAGED_OWNER_SOURCE, managed, id, launchDirectory, directory, String(windowMs)],
     { cwd: directory, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
   let supervisorPid = 0;
-  t.after(() => {
-    try { owner.kill(); } catch {}
-    if (alive(supervisorPid)) try { process.kill(supervisorPid); } catch {}
+  t.after(async () => {
+    // As in supervisors(): the directory is removed only once its processes have exited.
+    const ended = [owner.pid, supervisorPid].filter(alive);
+    for (const pid of ended) try { process.kill(pid); } catch {}
+    const left = await waitUntil(() => ended.every((pid) => !alive(pid)), () => `cleanup left ${ended.filter(alive).join(", ")} running`).then(() => null, (error) => error);
     removeTree(directory);
+    if (left) throw left;
   });
   let lines = "";
   let stderr = "";

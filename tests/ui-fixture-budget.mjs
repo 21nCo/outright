@@ -13,11 +13,13 @@
 //
 // The browser file runs last. Windows CI spent 1139, 1155 and 1287 seconds on
 // the files before it (runs 43569468883, 43585106708, 43595811460) and 200
-// to 217 seconds on it, so the suite gets the slowest serial files plus the
-// browser file's whole deadline: 1790 seconds, 15% over the slowest observed
-// total of about 1520. CI_JOB_SETUP_MS is the job's time outside the suite
-// (setup, npm ci, build, site tests: at most 70 seconds on Windows), which
-// must fit the job timeout in .github/workflows/ci.yml with the suite.
+// and 217 seconds on it in the first two; this fixture's steps bring it to
+// about 240. The suite gets the slowest serial files, rounded up to 1300
+// seconds, plus the browser file's whole deadline: 1790 seconds (1840 with the
+// wheel phase), 17% over the slowest likely total of 1527. CI_JOB_SETUP_MS
+// bounds the job's time outside the suite (setup, npm ci, build, site tests:
+// 46 to 52 seconds on Windows in those runs), which must fit the job timeout
+// in .github/workflows/ci.yml with the suite.
 export const SERIAL_FILES_MS = 1_300_000;
 export const CI_JOB_SETUP_MS = 120_000;
 export function uiFixtureBudget(wheelCap = Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP)) {
