@@ -1,0 +1,27 @@
+README.md
+  s_db9666a680f95f::t_f6caa137793a23 63,71,123
+docs/out-32-performance.md
+  s_db9666a680f95f::t_9a864459b463b2 11
+src/App.jsx
+  s_db9666a680f95f::t_684ea8d33c678a 45-46,2095,2129
+src/components/FilesPane.jsx
+  s_db9666a680f95f::t_4936a040ed0352 18,240-243,246,377
+tests/ui-races.jsx
+  s_db9666a680f95f::t_34e9f2bdb4770d 10403-10413
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8f2454adf292b33ac7752a66c5e3ff559d8d066e",
+  "prompts": {},
+  "sessions": {
+    "s_db9666a680f95f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b93266b2-0961-4e61-abf0-5cfaf407c1c5",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
