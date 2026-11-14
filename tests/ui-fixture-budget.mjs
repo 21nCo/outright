@@ -1,18 +1,31 @@
-// scripts/run-tests.mjs bounds each test file and tests/ui-races.test.mjs
-// bounds the browser fixture inside it; both read these deadlines so they
-// cannot drift apart when the fixture grows.
+// scripts/run-tests.mjs bounds the serial suite and each test file, and
+// tests/ui-races.test.mjs bounds the browser fixture inside it; all three
+// read these deadlines so they cannot drift apart when the fixture grows.
 //
-// macOS CI (Chrome 156) ran 151 of the 156 steps in 205.6 seconds, with
-// frame-bound steps about 2.4 times slower than on Windows and Ubuntu, which
-// finished all 156 in 134.5 and 127.5 seconds. Its last five steps take about
-// 27 seconds more, so the 280-second interaction phase keeps about 45 seconds
-// spare there. The test adds 25 seconds for cleanup. The file also runs the
-// harness unit tests and the injected-failure fixture first (17 seconds on
-// macOS), so its runner gets 65 seconds beyond the fixture. A focused 1000px
-// full-span wheel fixture gets a larger finite phase.
+// macOS CI ran 157 of the 162 steps in 274.9 seconds (run 43585106708); the
+// five left repeat steps that took about 45 seconds with reduced motion.
+// Ubuntu and Windows finished all 162 in 173.2 and 182.8 seconds. The 400-second interaction phase keeps
+// about 80 seconds spare for those roughly 320 seconds. The test adds 25
+// seconds for cleanup. The file also runs the harness unit tests and the
+// injected-failure fixture first (17 seconds on macOS), so its runner gets 65
+// seconds beyond the fixture. A focused 1000px full-span wheel fixture gets a
+// larger finite phase.
+//
+// The browser file runs last. Windows CI spent 1139, 1155 and 1287 seconds on
+// the files before it (runs 43569468883, 43585106708, 43595811460) and 200
+// and 217 seconds on it in the first two; this fixture's steps bring it to
+// about 240. The suite gets the slowest serial files, rounded up to 1300
+// seconds, plus the browser file's whole deadline: 1790 seconds (1840 with the
+// wheel phase), 17% over the slowest likely total of 1527. CI_JOB_SETUP_MS
+// bounds the job's time outside the suite (setup, npm ci, build, site tests:
+// 46 to 52 seconds on Windows in those runs), which must fit the job timeout
+// in .github/workflows/ci.yml with the suite.
+export const SERIAL_FILES_MS = 1_300_000;
+export const CI_JOB_SETUP_MS = 120_000;
 export function uiFixtureBudget(wheelCap = Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP)) {
   const smallWheelCap = wheelCap > 0 && wheelCap <= 1000;
-  const phaseMs = smallWheelCap ? 330_000 : 280_000;
+  const phaseMs = smallWheelCap ? 450_000 : 400_000;
   const fixtureMs = phaseMs + 25_000;
-  return { smallWheelCap, phaseMs, fixtureMs, fileMs: fixtureMs + 65_000 };
+  const fileMs = fixtureMs + 65_000;
+  return { smallWheelCap, phaseMs, fixtureMs, fileMs, suiteMs: SERIAL_FILES_MS + fileMs };
 }

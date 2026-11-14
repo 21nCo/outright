@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { domId, nextTabIndex } from "@/lib/accessibility";
 import { preferredTerminal, pruneExitedIds, savedOutputRows, savedPageText, savedRowPages, terminalEndLabel, terminalTabBadge, terminalTabLabel } from "@/lib/terminal-exit-state";
 import { api } from "@/lib/runtime-api";
+import { isQuickOpenShortcut } from "@/lib/pane-layout";
 import { createTerminalSearch, TERMINAL_MATCH_LIMIT } from "@/lib/terminal-search";
 
 const EMPTY_UNVERIFIED_IDS = new Set();
@@ -37,7 +38,7 @@ function findCoveredColumn(xterm, bar) {
   return Math.max(0, Math.floor((bar.getBoundingClientRect().left - screen.left) / (screen.width / xterm.cols)));
 }
 // Ctrl+F is a shell key, so outside macOS Find takes Ctrl+Shift+F. Either
-// shortcut is withheld from the process; every other key still reaches it.
+// shortcut is withheld from the process, as is Go to file (isQuickOpenShortcut: Ctrl+Shift+P there); every other key, Ctrl+P too, still reaches it.
 const MAC_SHORTCUTS = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
 const FIND_SHORTCUT = MAC_SHORTCUTS ? "Meta+F" : "Control+Shift+F";
 function isFindShortcut(event) {
@@ -138,7 +139,7 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     xterm.open(hostRef.current);
     xtermRef.current = xterm;
     // Find reads the shown buffer only; the process never sees its keys.
-    xterm.attachCustomKeyEventHandler((event) => !isFindShortcut(event));
+    xterm.attachCustomKeyEventHandler((event) => !isFindShortcut(event) && !isQuickOpenShortcut(event, undefined, true));
     const search = createTerminalSearch(xterm, setFindResult, {
       coveredRows: FIND_COVERED_ROWS,
       coveredColumn: () => findCoveredColumn(xterm, findBarRef.current),

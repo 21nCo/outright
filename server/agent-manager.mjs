@@ -780,7 +780,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     try {
       if (finished.message) publish({ type: "message.created", conversationId: state.conversation.id, payload: finished.message });
       publish({ type: "capacity.changed" });
-      emitTerminal(state.run.id, state.conversation.id, `run.${status}`, { exitCode: terminalExitCode, error: message || null, finishedAt });
+      emitTerminal(state.run.id, state.conversation, `run.${status}`, { exitCode: terminalExitCode, error: message || null, finishedAt });
     } finally { drain(); }
   }
 
@@ -808,7 +808,7 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
     const [stopped] = queue.splice(index, 1);
     admissionRetryRuns.delete(runId);
     if (!queue.length) { queueReadRetryPending = false; clearDiskRetry(); }
-    emitTerminal(runId, stopped.conversation.id, "run.stopped", { queued: true });
+    emitTerminal(runId, stopped.conversation, "run.stopped", { queued: true });
     return true;
   }
 
@@ -1279,14 +1279,15 @@ export function createAgentManager({ database, publish, onProvidersChanged = () 
   // full or unwritable, a bounded transient notification makes connected
   // clients refresh that durable state. The fault never reaches the close
   // listener, retry timer or stop request that committed it, nor retries
-  // that transaction.
-  function emitTerminal(runId, conversationId, type, payload) {
+  // that transaction. It names the chat's worktree, so a client can tell
+  // whose files the run may have changed without reading the chat.
+  function emitTerminal(runId, { id: conversationId, projectId, worktreeId }, type, payload) {
     let event = null;
     try { event = database.appendRunEvent(runId, type, payload); }
     catch (error) {
       if (!storageAdmissionFailure(error)) console.warn("Run terminal event failed after terminal commit", error);
     }
-    publish({ type: "run.event", conversationId, runId,
+    publish({ type: "run.event", conversationId, projectId, worktreeId, runId,
       payload: event ?? { runId, type, payload, seq: null, transient: true, createdAt: new Date().toISOString() } });
     return event;
   }

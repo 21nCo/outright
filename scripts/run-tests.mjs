@@ -41,11 +41,7 @@ let currentFile = null;
 let currentFileStartedAt = 0;
 const fileTimings = [];
 const suiteStartedAt = Date.now();
-// Windows CI ran the serial files ahead of the browser fixture in 870-1142s,
-// and the full fixture takes at least 143s. The 30-minute job also spends
-// about 160s before npm test and 40s after it, so 1440s covers that suite
-// with headroom and leaves at least 120s of the job timeout.
-const maxSuiteTimeoutMs = 1_440_000;
+const maxSuiteTimeoutMs = uiFixtureBudget().suiteMs;
 const requestedTimeout = Number(process.env.OUTRIGHT_TEST_SUITE_TIMEOUT_MS);
 const suiteTimeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
   ? Math.min(maxSuiteTimeoutMs, Math.max(1000, requestedTimeout)) : maxSuiteTimeoutMs;

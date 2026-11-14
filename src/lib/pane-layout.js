@@ -1,11 +1,11 @@
 // A worktree's pane arrangement is a versioned binary split tree. Each view
-// appears at most once, so a layout holds at most four panes and a view keeps
+// appears at most once, so a layout holds at most five panes and a view keeps
 // one mounted instance however its pane moves. The conversation view is always
 // present: the chat tabs above the main view control it.
 
 export const PANE_LAYOUT_VERSION = 1;
-export const PANE_VIEWS = Object.freeze(["conversation", "changes", "terminal", "context"]);
-export const PANE_VIEW_LABELS = Object.freeze({ conversation: "Conversation", changes: "Changes", terminal: "Terminal", context: "Context" });
+export const PANE_VIEWS = Object.freeze(["conversation", "changes", "terminal", "context", "files"]);
+export const PANE_VIEW_LABELS = Object.freeze({ conversation: "Conversation", changes: "Changes", terminal: "Terminal", context: "Context", files: "Files" });
 // Smallest usable size of each pane in CSS pixels, its header included. Each
 // covers the view's fixed chrome in its compact styles (the `pane` container
 // queries in styles.css) plus primary content: several message lines beside
@@ -18,7 +18,12 @@ export const MIN_PANE_SIZE = Object.freeze({
   changes: Object.freeze({ width: 280, height: 340 }),
   terminal: Object.freeze({ width: 260, height: 200 }),
   context: Object.freeze({ width: 240, height: 180 }),
+  // The toolbar, the go-to field, a few tree rows and a preview's first lines.
+  files: Object.freeze({ width: 280, height: 340 }),
 });
+export const APPLE_PLATFORM = typeof navigator !== "undefined" && /mac|iphone|ipad|ipod/i.test(navigator.userAgentData?.platform ?? navigator.platform ?? "");
+// Go to file: ⌘P on Apple platforms, where Ctrl+P moves up a line; Ctrl+P or Meta+P elsewhere, where Ctrl+P is a shell key too, so a focused terminal (shell) passes it to the process and withholds Ctrl+Shift+P instead, as Find takes Ctrl+Shift+F; the app's handler accepts both.
+export function isQuickOpenShortcut(event, apple = APPLE_PLATFORM, shell = false) { return Boolean(apple ? event.metaKey && !event.ctrlKey && !event.shiftKey : (event.metaKey || event.ctrlKey) && (!shell || event.shiftKey)) && !event.altKey && event.key?.toLowerCase() === "p"; }
 export const PANE_SEPARATOR_SIZE = 6;
 export const PANE_SIDES = Object.freeze(["left", "right", "up", "down"]);
 export const PANE_LAYOUT_STORAGE_KEY = "outright.pane-layouts";
