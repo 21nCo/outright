@@ -1,0 +1,27 @@
+tests/ui-races.test.mjs
+  s_d5699c6471292d::t_d34d15ffcbfb83 19-24,28-33,1078-1079,1082-1094
+tests/ui-fixture-budget.mjs
+  s_d5699c6471292d::t_bc05c8100bdbd6 9-12,22-23,25-26
+tests/preview-build.test.mjs
+  s_d5699c6471292d::t_58a8a527720818 110-111,132,185-211
+tests/vite.ui-races.config.mjs
+  s_d5699c6471292d::t_d5cdeefe4d298a 18-20,24,26,43-44,49,57-59,110-111
+tests/ui-races.jsx
+  s_d5699c6471292d::t_4cea4f3dd46837 9180-9186
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3b8346812d5e86a46c3967423df52dfa87e66466",
+  "prompts": {},
+  "sessions": {
+    "s_d5699c6471292d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "71ffc931-3a46-4ac8-9d64-1db7ac4da6af",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
