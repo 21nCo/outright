@@ -1,0 +1,23 @@
+src/App.jsx
+  s_19abec75182420::t_2c2388f14f5fe8 158-159,742-743
+src/components/FilesPane.jsx
+  s_19abec75182420::t_185aa9c0bbd646 143,158-161,165-167,195,309
+tests/ui-races.jsx
+  s_19abec75182420::t_5aab6d9f3e3295 10375-10381,10392,10432,10448-10461
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "43c291939879352db8e01ab96613606739db5c28",
+  "prompts": {},
+  "sessions": {
+    "s_19abec75182420": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d61a7abd-8c27-4e7c-ba23-13d43e2da322",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
