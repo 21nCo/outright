@@ -1,0 +1,31 @@
+server/agent-manager.mjs
+  s_e14c12a896ead7::t_9bbf9c548a92df 783,811,1282-1284,1290
+server/agent-manager.test.mjs
+  s_e14c12a896ead7::t_1101a21d721d5c 891-893
+tests/file-preview.test.mjs
+  s_e14c12a896ead7::t_58e27d6a0e2b0d 10,532,534,536-546
+tests/ui-races.jsx
+  s_e14c12a896ead7::t_d8e8c8f83e569d 10202,10205,10208-10209,10214-10216,10255-10256,10298-10299,10304-10311,10314,10316-10321,10426-10444,10669
+src/App.jsx
+  s_e14c12a896ead7::t_5e258d4095bb94 26,741-743,746,805-806,948
+src/components/FilesPane.jsx
+  s_e14c12a896ead7::t_272c7a3b7b9d87 132-137,140-148
+src/lib/file-tree.js
+  s_e14c12a896ead7::t_b4a81fe1e4e900 202-207
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e53b00cab53f8f0fff5a823f608d2a8cf015d63f",
+  "prompts": {},
+  "sessions": {
+    "s_e14c12a896ead7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "777b8542-a212-4d45-a334-0b81bc10d280",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
