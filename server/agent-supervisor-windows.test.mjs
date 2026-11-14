@@ -66,6 +66,7 @@ const control = (mode, ...args) => {
   return { status: result.status, state: result.stdout.trim() };
 };
 
+const exited = (child) => child.exitCode !== null || child.signalCode !== null;
 const readPid = (file) => existsSync(file) ? Number(readFileSync(file, "utf8").trim()) || 0 : 0;
 
 // One supervised provider per call, each in its own directory, all of which
@@ -75,11 +76,19 @@ function supervisors(t) {
   const provider = path.join(root, "provider.cjs");
   writeFileSync(provider, PROVIDER_SOURCE);
   const runs = [];
-  t.after(() => {
+  t.after(async () => {
+    const ended = [];
     for (const run of runs) {
+      // An owner is ended through its handle, which never signals a process that reused its pid.
       try { run.owner.kill(); } catch {}
-      for (const pid of [run.supervisorPid, run.providerPid(), run.escapedPid()]) if (alive(pid)) try { process.kill(pid); } catch {}
+      for (const pid of [run.supervisorPid, run.providerPid(), run.escapedPid()]) if (alive(pid)) { ended.push(pid); try { process.kill(pid); } catch {} }
     }
+    // Each process runs in its run's directory, which Windows keeps locked
+    // until the process has exited, so the tree is removed only after that.
+    const running = () => [...runs.map((run) => run.owner).filter((owner) => !exited(owner)).map((owner) => owner.pid), ...ended.filter(alive)];
+    const left = await waitUntil(() => !running().length, () => `cleanup left ${running().join(", ")} running`).then(() => null, (error) => error);
+    // A process still running keeps its directory locked; its error, not the EBUSY, is the one reported.
+    if (left) { try { removeTree(root); } catch {} throw left; }
     removeTree(root);
   });
   return async (name, modeArgs = []) => {
@@ -207,9 +216,15 @@ async function crashedManagedTerminal(t, windowMs) {
   const owner = spawn(process.execPath, ["--input-type=module", "-e", MANAGED_OWNER_SOURCE, managed, id, launchDirectory, directory, String(windowMs)],
     { cwd: directory, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
   let supervisorPid = 0;
-  t.after(() => {
+  t.after(async () => {
+    // As in supervisors(): the directory is removed only once its processes have exited.
     try { owner.kill(); } catch {}
-    if (alive(supervisorPid)) try { process.kill(supervisorPid); } catch {}
+    const ended = [supervisorPid].filter(alive);
+    for (const pid of ended) try { process.kill(pid); } catch {}
+    const running = () => [...(exited(owner) ? [] : [owner.pid]), ...ended.filter(alive)];
+    const left = await waitUntil(() => !running().length, () => `cleanup left ${running().join(", ")} running`).then(() => null, (error) => error);
+    // A process still running keeps its directory locked; its error, not the EBUSY, is the one reported.
+    if (left) { try { removeTree(directory); } catch {} throw left; }
     removeTree(directory);
   });
   let lines = "";

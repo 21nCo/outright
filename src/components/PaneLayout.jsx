@@ -1,5 +1,5 @@
 import { Component, useCallback, useEffect, useId, useImperativeHandle, useLayoutEffect, useRef, useState } from "react";
-import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ChatCircle, Columns, DotsSixVertical, DotsThree, GitDiff, Rows, TerminalWindow, TreeStructure, X } from "@phosphor-icons/react";
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ChatCircle, Columns, DotsSixVertical, DotsThree, FolderOpen, GitDiff, Rows, TerminalWindow, TreeStructure, X } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { nextTabIndex } from "@/lib/accessibility";
@@ -8,7 +8,7 @@ import {
   moveView, neighborView, openView, resizeSplit, swapViews,
 } from "@/lib/pane-layout";
 
-const VIEW_ICONS = { conversation: ChatCircle, changes: GitDiff, terminal: TerminalWindow, context: TreeStructure };
+const VIEW_ICONS = { conversation: ChatCircle, changes: GitDiff, terminal: TerminalWindow, context: TreeStructure, files: FolderOpen };
 const PANE_DRAG_TYPE = "application/x-outright-pane";
 const MOVE_SIDES = [["left", "Move left", ArrowLeft], ["right", "Move right", ArrowRight], ["up", "Move up", ArrowUp], ["down", "Move down", ArrowDown]];
 

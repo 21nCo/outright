@@ -888,6 +888,9 @@ test("a terminal event storage fault after commit is contained and the queue sti
       assert.ok(published.some((event) => event.runId === third.id && event.payload?.type === "run.stopped" && event.payload.transient === true));
       database.appendRunEvent = appendRunEvent;
       children[1].emit("close", 0, null);
+      // Each terminal event names its chat's worktree, so a client decides whose files changed without reading the chat.
+      const terminal = published.filter((event) => event.type === "run.event" && ["run.completed", "run.stopped"].includes(event.payload?.type));
+      assert.deepEqual(terminal.map((event) => [event.runId, event.projectId, event.worktreeId]), [[first.id, "p", "w"], [third.id, "p", "w"], [second.id, "p", "w"]], code);
       assert.equal(database.listAudit(100).filter((row) => row.action === "agent.run.completed" && row.target === first.id).length, 1,
         `${code} audited the committed finish more than once`);
     } finally {

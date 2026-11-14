@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync } from "node:fs";
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import WebSocket, { WebSocketServer } from "ws";
-import { uiFixtureBudget } from "./ui-fixture-budget.mjs";
+import { CI_JOB_SETUP_MS, SERIAL_FILES_MS, uiFixtureBudget } from "./ui-fixture-budget.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
@@ -672,12 +672,12 @@ test("nested runner deadline exceeds its child's full browser budget", () => {
 
 test("the per-file deadline outlives the browser fixture and the file's earlier tests", () => {
   // macOS CI spent 17 seconds on this file's earlier tests and needs about
-  // 232 seconds for the 156-step interaction phase.
+  // 320 seconds for the 162-step interaction phase.
   for (const budget of [ordinaryBudget, wheelBudget]) {
     assert(budget.fixtureMs >= budget.phaseMs + 25_000);
     assert(budget.fileMs >= budget.fixtureMs + 30_000);
   }
-  assert(ordinaryBudget.phaseMs >= 232_000 + 30_000);
+  assert(ordinaryBudget.phaseMs >= 320_000 + 60_000);
   assert(wheelBudget.phaseMs > ordinaryBudget.phaseMs);
   for (const cap of [Number.NaN, -1, 0, 1001, 5000]) assert.deepEqual(uiFixtureBudget(cap), ordinaryBudget, `cap=${cap}`);
   for (const cap of [1, 120, 1000]) assert.deepEqual(uiFixtureBudget(cap), wheelBudget, `cap=${cap}`);
@@ -685,6 +685,33 @@ test("the per-file deadline outlives the browser fixture and the file's earlier 
   const configured = uiFixtureBudget(Number(process.env.OUTRIGHT_TEST_WHEEL_DELTA_CAP));
   assert.deepEqual(uiFixtureBudget(), configured);
   assert.deepEqual([browserPhaseTimeout, browserFixtureTimeout, testFileTimeout], [configured.phaseMs, configured.fixtureMs, configured.fileMs]);
+});
+
+test("the serial suite deadline composes the slowest serial files with the browser file's and fits the CI job", () => {
+  // Windows CI's slowest observed total: 1287 seconds of serial files and the
+  // browser file at about 240 seconds with this fixture's steps.
+  const slowestTotal = 1_287_000 + 240_000;
+  const jobMs = Number(/timeout-minutes:\s*(\d+)/.exec(readFileSync(path.join(root, ".github", "workflows", "ci.yml"), "utf8"))?.[1]) * 60_000;
+  for (const budget of [ordinaryBudget, wheelBudget]) {
+    assert(budget.suiteMs >= SERIAL_FILES_MS + budget.fileMs, `suite ${budget.suiteMs} < serial files + file ${budget.fileMs}`);
+    assert(budget.suiteMs >= slowestTotal * 1.1, `suite ${budget.suiteMs} leaves under 10% over ${slowestTotal}`);
+    assert(budget.suiteMs + CI_JOB_SETUP_MS <= jobMs, `suite ${budget.suiteMs} and setup do not fit the ${jobMs}ms CI job`);
+  }
+  assert(SERIAL_FILES_MS >= 1_287_000);
+});
+
+test("scripts/run-tests.mjs gives the suite the composed deadline", { timeout: 30_000 }, () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "outright-suite-budget-"));
+  try {
+    const file = path.join(directory, "empty.test.mjs");
+    writeFileSync(file, "import test from 'node:test';\ntest('empty', () => {});\n");
+    const env = { ...process.env, CI: "1" };
+    delete env.NODE_TEST_CONTEXT;
+    delete env.OUTRIGHT_TEST_SUITE_TIMEOUT_MS;
+    const result = spawnSync(process.execPath, [path.join(root, "scripts", "run-tests.mjs"), file], { encoding: "utf8", env, timeout: 25_000 });
+    assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+    assert.match(result.stderr, new RegExp(`budgetMs=${uiFixtureBudget().suiteMs} `), result.stderr);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
 test("parent permits a slow child beyond the old shorter watchdog", { timeout: 5_000 }, async () => {
@@ -1009,7 +1036,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       devtoolsReady: devtools?.socket.readyState, viteOutput: output.slice(-500) }));
     assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
     const selectedCount = process.env.OUTRIGHT_UI_STEP?.split(",").length;
-    const expectedCount = selectedCount ?? 154 + motionStepCount;
+    const expectedCount = selectedCount ?? 156 + motionStepCount;
     const completedCount = Number(state.text.match(/(\d+) interaction regressions passed/)?.[1]);
     assert.equal(completedCount, expectedCount,
       `browser fixture completed ${completedCount || 0} of ${expectedCount} expected interactions; last step: ${state.progress?.step ?? "unknown"}`);
