@@ -10099,11 +10099,16 @@ async function filesFocusRegression() {
   await until(() => row("entry:f-079.txt") && shown(row("entry:f-079.txt")), "Go to file did not scroll a listed row into view");
   assert(document.activeElement === jump, "Go to file moved focus out of its field");
   assert(frame.scrollLeft === 20, `Go to file scrolled the pane around the tree: ${frame.scrollLeft}`);
+  // A row wider than the tree (as deep rows are) lets it scroll sideways; the row focused next is brought back on that axis too.
+  row("entry:f-079.txt").style.minWidth = "2000px";
   tree().scrollTop = tree().scrollHeight;
+  tree().scrollLeft = tree().scrollWidth;
   row("entry:f-079.txt").focus();
   frame.scrollLeft = 20;
   pressKey(row("entry:f-079.txt"), "Home");
-  await until(() => document.activeElement === row("entry:docs") && shown(row("entry:docs")), "Home did not focus and show the first row");
+  const leftIn = (element) => element.getBoundingClientRect().left >= tree().getBoundingClientRect().left - 1;
+  await until(() => document.activeElement === row("entry:docs") && shown(row("entry:docs")) && leftIn(row("entry:docs")), "Home did not focus and show the first row on both axes");
+  row("entry:f-079.txt").style.minWidth = "";
   assert(frame.scrollLeft === 20, `moving focus in the tree scrolled the pane around it: ${frame.scrollLeft}`);
   frame.style.overflow = "";
   spacer.remove();

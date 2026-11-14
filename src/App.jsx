@@ -738,8 +738,7 @@ export function App() {
   }, [loadConversation, conversationListPending, conversationLoadFailed, conversationDetailReady, selectedConversationId]);
   const selectedRecoveryRunId = recoveryGate(conversation)?.id ?? null;
 
-  // Asks the mounted Files pane for one coalesced refresh (`completions`) after a reconnect that missed events or found a restarted runtime (no event),
-  // or a run end in the shown worktree: its event names its chat's worktree, archived or not, so no chat is read; one without it matches a listed chat.
+  // Asks the mounted Files pane for one coalesced refresh (`completions`) after a reconnect that missed events or found a restarted runtime (no event), or a run end in the shown worktree: its event names its chat's worktree, archived or not, so no chat is read; one without it matches a listed chat.
   const refreshShownFiles = useCallback((runEvent) => {
     const owner = runEvent?.worktreeId ? runEvent : runEvent && conversationsRef.current.find((chat) => chat.id === runEvent.conversationId);
     if (filesShownRef.current && (!runEvent || (owner?.projectId === selectedProjectRef.current && owner?.worktreeId === selectedWorktreeRef.current))) setFilesCompletions((count) => count + 1);

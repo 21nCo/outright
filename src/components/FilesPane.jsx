@@ -398,11 +398,12 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   </section>;
 }
 
-// Rows laid out late (content-visibility) can move a row, so it is checked for a few frames. Only the tree scrolls: scrollIntoView would also scroll the page and panes around it.
+// Rows laid out late (content-visibility) can move a row, so it is checked for a few frames. Only the tree scrolls, on both axes: scrollIntoView would also scroll the page and panes around it.
 function scrollIntoTree(tree, row, frames, frameRef) {
   if (!row?.isConnected) return;
-  const box = row.getBoundingClientRect(), top = tree.getBoundingClientRect().top + tree.clientTop, bottom = top + tree.clientHeight;
+  const box = row.getBoundingClientRect(), view = tree.getBoundingClientRect(), top = view.top + tree.clientTop, bottom = top + tree.clientHeight;
   if (box.top < top || box.bottom > bottom) tree.scrollTop += box.top < top ? box.top - top : box.bottom - bottom;
+  tree.scrollLeft += Math.min(0, box.left - view.left - tree.clientLeft); // a row as wide as the tree, scrolled out sideways by deeper rows
   if (frames) frameRef.current = requestAnimationFrame(() => scrollIntoTree(tree, row, frames - 1, frameRef));
 }
 
