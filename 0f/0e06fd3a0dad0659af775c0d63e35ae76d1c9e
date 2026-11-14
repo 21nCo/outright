@@ -1,0 +1,19 @@
+cubic.yaml
+  s_c93c64b39225e7::t_3c64681bab1d5c 2-4,10-84,103-104
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0f0e06fd3a0dad0659af775c0d63e35ae76d1c9e",
+  "prompts": {},
+  "sessions": {
+    "s_c93c64b39225e7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1d3d4-1d1a-7e80-a1f9-6934059414b6",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
