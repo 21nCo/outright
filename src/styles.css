@@ -501,8 +501,8 @@ select { height: 34px; padding: 0 28px 0 10px; border: 1px solid var(--input); b
 .tree-row.is-hidden .tree-label { opacity: .72; }
 .tree-row[aria-disabled="true"] { cursor: default; }
 .tree-more .tree-label, .tree-error .tree-label { color: var(--foreground); text-decoration: underline; text-underline-offset: 2px; }
-.tree-caret, .tree-icon { display: inline-flex; align-items: center; justify-content: center; }
-.tree-caret svg { width: 10px; height: 10px; }
+.file-tree .tree-caret, .tree-icon { display: inline-flex; align-items: center; justify-content: center; }
+.file-tree .tree-caret svg { width: 10px; height: 10px; }
 .tree-icon svg { width: 14px; height: 14px; }
 .tree-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tree-note { max-width: 12em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted-foreground); font-size: 9px; }

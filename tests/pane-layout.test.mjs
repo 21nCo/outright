@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   MAX_SAVED_LAYOUTS, MIN_PANE_SIZE, PANE_LAYOUT_STORAGE_KEY, PANE_SEPARATOR_SIZE, PANE_VIEWS, applyPreset, closeView, computePaneRects,
-  defaultPaneLayout, layoutViews, loadPaneLayout, moveView, neighborView, normalizePaneLayout, openView, paneRestoreMessage, resizeSplit, savePaneLayout, swapViews,
+  defaultPaneLayout, isQuickOpenShortcut, layoutViews, loadPaneLayout, moveView, neighborView, normalizePaneLayout, openView, paneRestoreMessage, resizeSplit, savePaneLayout, swapViews,
 } from "../src/lib/pane-layout.js";
 
 const pane = (view) => ({ type: "pane", view });
@@ -195,4 +195,20 @@ test("the restore notice names the repair that happened", () => {
   assert.equal(paneRestoreMessage(["view", "ratio", "conversation"]),
     "Restored the pane layout; panes that could not be restored were left out, the conversation pane was added back and pane sizes that were not valid were reset");
   for (const problem of ["storage", "store", "unreadable", "version"]) assert.match(paneRestoreMessage([problem]), /could not be read; showing the default layout/);
+});
+
+test("Go to file is Meta+P on Apple platforms and Ctrl+P or Meta+P elsewhere", () => {
+  const key = (init) => ({ key: "p", metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, ...init });
+  assert.equal(isQuickOpenShortcut(key({ metaKey: true }), true), true);
+  assert.equal(isQuickOpenShortcut(key({ key: "P", metaKey: true }), true), true);
+  // Ctrl+P moves up a line on macOS, in a text field and in the shell.
+  assert.equal(isQuickOpenShortcut(key({ ctrlKey: true }), true), false);
+  assert.equal(isQuickOpenShortcut(key({ ctrlKey: true }), false), true);
+  assert.equal(isQuickOpenShortcut(key({ metaKey: true }), false), true);
+  // Shift, Alt, another key or no modifier is not Go to file.
+  for (const apple of [true, false]) {
+    const modifier = apple ? { metaKey: true } : { ctrlKey: true };
+    for (const other of [{ shiftKey: true }, { altKey: true }, { key: "o" }]) assert.equal(isQuickOpenShortcut(key({ ...modifier, ...other }), apple), false, JSON.stringify([apple, other]));
+    assert.equal(isQuickOpenShortcut(key({}), apple), false);
+  }
 });

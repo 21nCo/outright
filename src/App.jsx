@@ -37,10 +37,9 @@ import { answerAccountText, runAccountText, withStartedRunAccount } from "@/lib/
 import { bufferConversationRuntimeEvent, checkpointCursors, draftAfterSubmission, isComposerSubmitKey, isStaleCheckpointMessage, messagePrecedesPage, recordCheckpointCursor, recoveryBelongsToConversation, recoveryGate, recoveryNoticeAction, replayConversationEvents, shouldReloadConversationForResolvedRun, streamingTextAfterRuntimeEvent, upsertRuntimeMessage } from "@/recovery-policy";
 import { createTerminalCommandFence } from "@/lib/terminal-command-fence";
 import { lifecycleFor, mergeLifecycleSnapshot, removalRequest, teardownProblem, upsertLifecycleState } from "@/lib/worktree-lifecycle";
-import { PANE_LAYOUT_PRESETS, PANE_STORE_PROBLEMS, applyPreset, defaultPaneLayout, focusView, layoutViews, loadPaneLayout, paneRestoreMessage, savePaneLayout } from "@/lib/pane-layout";
+import { APPLE_PLATFORM, PANE_LAYOUT_PRESETS, PANE_STORE_PROBLEMS, applyPreset, defaultPaneLayout, focusView, isQuickOpenShortcut, layoutViews, loadPaneLayout, paneRestoreMessage, savePaneLayout } from "@/lib/pane-layout";
 
 const CHAT_TAB_DRAG_TYPE = "application/x-outright-chat-tab";
-const APPLE_PLATFORM = typeof navigator !== "undefined" && /mac|iphone|ipad|ipod/i.test(navigator.userAgentData?.platform ?? navigator.platform ?? "");
 // Go to file is ⌘P on Apple platforms and Ctrl+P elsewhere (the keyboard handler).
 const QUICK_OPEN_HINT = APPLE_PLATFORM ? "⌘P" : "Ctrl+P";
 const MAX_RENDERED_MESSAGES = 1000;
@@ -975,9 +974,7 @@ export function App() {
         event.preventDefault();
         paneLayoutRef.current?.open("terminal");
       }
-      // On macOS only ⌘P: Ctrl+P moves up a line in a text field there.
-      const quickOpenKey = APPLE_PLATFORM ? event.metaKey && !event.ctrlKey : event.metaKey || event.ctrlKey;
-      if (quickOpenKey && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "p") {
+      if (isQuickOpenShortcut(event)) {
         // The open drawer or a dialog owns the keyboard; the workspace is inert and the key keeps its browser action (Print).
         if (!paneLayoutRef.current || (isNarrow && sidebarOpen) || document.querySelector('[role="dialog"][data-open]:not(#project-sidebar)')) return;
         event.preventDefault();
@@ -990,6 +987,13 @@ export function App() {
     };
     window.addEventListener("keydown", keyboard); return () => window.removeEventListener("keydown", keyboard);
   }, [isNarrow, sidebarOpen]);
+  useEffect(() => {
+    // At 520px or less the Panes menu replaces the pane toggles (styles.css); focus on a hidden one moves to its replacement. Some browsers blur it first, so the last one focused counts until focus or a press goes elsewhere.
+    const compact = window.matchMedia("(max-width: 520px)"), CONTROLS = ".workspace-tools .pane-toggles button, .workspace-tools .pane-menu-trigger", last = { current: null };
+    const note = (event) => { last.current = event.target.closest?.(CONTROLS) ?? null; }, forget = (event) => { if (!event.target.closest?.(CONTROLS)) last.current = null; };
+    const replace = () => { const current = document.activeElement, control = !current || current === document.body ? last.current : current.closest?.(CONTROLS); if (!control?.isConnected || control.getClientRects().length) return; last.current = document.querySelector(compact.matches ? ".workspace-tools .pane-menu-trigger" : ".workspace-tools .pane-toggles button"); last.current?.focus(); };
+    document.addEventListener("focusin", note); document.addEventListener("pointerdown", forget, true); compact.addEventListener("change", replace); window.addEventListener("resize", replace); return () => { document.removeEventListener("focusin", note); document.removeEventListener("pointerdown", forget, true); compact.removeEventListener("change", replace); window.removeEventListener("resize", replace); };
+  }, []);
   useEffect(() => {
     const narrow = window.matchMedia("(max-width: 760px)");
     let wasNarrow = narrow.matches;

@@ -2811,6 +2811,15 @@ async function terminalScrollbackFindRegression() {
   const resizesBeforeFind = resizes();
   const mac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
   const shortcut = mac ? { metaKey: true } : { ctrlKey: true, shiftKey: true };
+  // Go to file (⌘P on macOS, Ctrl+P elsewhere) passes through the terminal to the
+  // app's window handler, which opens Files: the shell gets nothing.
+  let windowKey = null;
+  const seeWindowKey = (event) => { windowKey = event; };
+  window.addEventListener("keydown", seeWindowKey);
+  key(textarea(), { key: "p", code: "KeyP", keyCode: 80, ...(mac ? { metaKey: true } : { ctrlKey: true }) });
+  window.removeEventListener("keydown", seeWindowKey);
+  assert(windowKey?.key === "p" && !windowKey.defaultPrevented && inputs().join("") === "\x1b",
+    `Go to file in the terminal ${windowKey ? "" : "did not reach the window and "}sent ${JSON.stringify(inputs())}`);
   key(textarea(), { key: mac ? "f" : "F", code: "KeyF", keyCode: 70, ...shortcut });
   await until(() => find() && document.activeElement === find(), "Find shortcut focuses the query");
   const opener = host.querySelector('[aria-label="Find in terminal"]');
@@ -10071,6 +10080,12 @@ async function filesFocusRegression() {
   await go("f-079.txt");
   await until(() => row("entry:f-079.txt") && shown(row("entry:f-079.txt")), "Go to file did not scroll a listed row into view");
   assert(document.activeElement === jump, "Go to file moved focus out of its field");
+  // A row activated as soon as the reveal scrolls ends the reveal's follow-up scrolling: the tree stays where the user put it.
+  tree().scrollTop = 0;
+  const userTookTree = new Promise((resolve) => tree().addEventListener("scroll", () => { row("entry:notes.md").click(); tree().scrollTop = 0; resolve(); }, { once: true }));
+  await go("f-078.txt");
+  await userTookTree;
+  await remainsTrue(() => tree().scrollTop === 0, 300, "a reveal's follow-up frames scrolled the tree back after the user activated a row");
   tree().scrollTop = 0;
   listings.length = 0;
   await go("many/m-650.txt");
@@ -10288,6 +10303,17 @@ async function filesInheritedRegression() {
       assert(!host.querySelector(".files-pane") && host.querySelector("#project-sidebar").contains(document.activeElement), "⌘P in the narrow drawer opened Files or took focus from the drawer");
       window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
       await until(() => !host.querySelector("#main-workspace")?.hasAttribute("inert"), "the narrow drawer did not close");
+      // Crossing 520px moves focus from a pane toggle the toolbar hides to the Panes menu, and back to a toggle.
+      // CDP can acknowledge a hidden tab's new metrics before its resize event, so the test sends that event.
+      const panesTrigger = () => host.querySelector(".pane-menu-trigger");
+      const crossTo = async (width) => { await window.__fixtureSetViewport(width); await until(() => window.innerWidth === width, `real ${width}px layout`); window.dispatchEvent(new Event("resize")); };
+      // The fixture page lacks system focus, so focus() sends no focusin; send the one a focused window would.
+      filesToggle().focus();
+      filesToggle().dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+      await crossTo(390);
+      await until(() => panesTrigger()?.getClientRects().length && document.activeElement === panesTrigger(), "crossing to 390px did not move focus from the hidden Files toggle to the Panes menu");
+      await crossTo(640);
+      await until(() => document.activeElement?.closest(".pane-toggles") && document.activeElement.getClientRects().length, "crossing back to 640px did not move focus from the hidden Panes menu to a pane toggle");
       await window.__fixtureSetViewport(1280);
       window.dispatchEvent(new Event("resize"));
       await until(() => filesToggle()?.getClientRects().length, "the wide layout did not return");
@@ -10301,6 +10327,9 @@ async function filesInheritedRegression() {
     await until(() => row("entry:docs"), "the root was not listed");
     row("entry:docs").click();
     await until(() => row("entry:docs/guide.md"), "docs was not listed");
+    // The Files tree's carets are its own size; the sidebar's project carets keep theirs.
+    const caretWidth = (selector) => host.querySelector(`${selector} .tree-caret svg`)?.getBoundingClientRect().width;
+    assert(caretWidth(".project-row") === 13 && caretWidth(".file-tree") === 10, `caret widths: sidebar ${caretWidth(".project-row")}, Files ${caretWidth(".file-tree")}`);
     const dispatch = (event) => fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify(event) }));
     const send = (conversationId, type, owner) => dispatch({ type: "run.event", conversationId, ...owner, runId: `run-${conversationId}-${type}`, payload: { type } });
     const chatReads = () => requests.filter((request) => request.kind === "chat list" || request.kind === "chat detail").length;
@@ -10459,6 +10488,21 @@ async function filesInheritedRegression() {
     await remainsTrue(() => dotReads() === revealDotReads, 300, `a reveal of a hidden path read dotfolders with hidden files off: ${dotReads()} after ${revealDotReads}`);
     await toggleHidden(true);
     await remainsTrue(() => row("entry:.cache")?.getAttribute("aria-expanded") === "false" && document.activeElement === field(), 300, "a stopped reveal of .cache/deep/x.md opened .cache or took focus");
+    // An open of a hidden folder still waiting for the runtime's answer ends too: once hidden
+    // files are hidden and shown again, its late folder answer neither reveals nor reads it.
+    const folderAnswer = deferred();
+    answers.set(".cache/deep", async () => { await folderAnswer.promise; return response({ error: ".cache/deep is a folder", code: "IS_DIRECTORY" }, 400); });
+    await jumpTo(".cache/deep");
+    await until(() => asked("preview", ".cache/deep") && row("entry:.cache/deep"), "Go to file did not reveal .cache/deep and ask for it");
+    await toggleHidden(false);
+    await toggleHidden(true);
+    const answerDotReads = dotReads();
+    folderAnswer.resolve();
+    await until(() => /\.cache\/deep is a folder/.test(host.querySelector(".files-pane [role=status]")?.textContent ?? ""), "the late folder answer was not announced");
+    await remainsTrue(() => dotReads() === answerDotReads && row("entry:.cache")?.getAttribute("aria-expanded") === "false" && document.activeElement === field(), 300,
+      `a late folder answer after hidden files were hidden restarted its reveal: ${dotReads()} after ${answerDotReads}`);
+    assert(!/open in the tree/.test(host.querySelector(".files-pane [role=status]")?.textContent ?? ""), "a late folder answer after hidden files were hidden said .cache/deep is open in the tree");
+    answers.delete(".cache/deep");
     await toggleHidden(false);
 
     // A background refresh that fails for a passing reason keeps the shown

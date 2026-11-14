@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { domId, nextTabIndex } from "@/lib/accessibility";
 import { preferredTerminal, pruneExitedIds, savedOutputRows, savedPageText, savedRowPages, terminalEndLabel, terminalTabBadge, terminalTabLabel } from "@/lib/terminal-exit-state";
 import { api } from "@/lib/runtime-api";
+import { isQuickOpenShortcut } from "@/lib/pane-layout";
 import { createTerminalSearch, TERMINAL_MATCH_LIMIT } from "@/lib/terminal-search";
 
 const EMPTY_UNVERIFIED_IDS = new Set();
@@ -137,8 +138,8 @@ function WorktreeTerminalPane({ worktree, runtimeEvent, terminalsVersion = 0, un
     xterm.loadAddon(fit);
     xterm.open(hostRef.current);
     xtermRef.current = xterm;
-    // Find reads the shown buffer only; the process never sees its keys.
-    xterm.attachCustomKeyEventHandler((event) => !isFindShortcut(event));
+    // Find reads the shown buffer only, and Go to file goes to the app's handler; the process sees neither key.
+    xterm.attachCustomKeyEventHandler((event) => !isFindShortcut(event) && !isQuickOpenShortcut(event));
     const search = createTerminalSearch(xterm, setFindResult, {
       coveredRows: FIND_COVERED_ROWS,
       coveredColumn: () => findCoveredColumn(xterm, findBarRef.current),

@@ -42,6 +42,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
   const abortListing = (directory) => { controllersRef.current.get(directory)?.abort(); controllersRef.current.delete(directory); };
   // The read in flight for each folder, with the reveal (find, active) it serves.
   const readsRef = useRef(new Map());
+  const scrollFrameRef = useRef(0), stopScroll = () => cancelAnimationFrame(scrollFrameRef.current); // A reveal's next follow-up scroll (scrollIntoTree), which a stopped or newer reveal, or a wheel or press in the tree, cancels.
   useEffect(() => { aliveRef.current = true; return () => { aliveRef.current = false; for (const controller of controllersRef.current.values()) controller.abort(); }; }, []);
 
   const reportable = (error) => error.status === 429 || (error.status >= 500 && error.payload?.code !== "LISTING_UNAVAILABLE");
@@ -106,7 +107,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     return true;
   };
   // A reload's read stays: it was asked for in its own right.
-  const dropReveal = () => { for (const [directory, read] of readsRef.current) if (read.active && !read.reload) dropListing(directory, true); };
+  const dropReveal = () => { stopScroll(); for (const [directory, read] of readsRef.current) if (read.active && !read.reload) dropListing(directory, true); };
 
   // Reads the next page of the listing that is shown, with that listing's
   // cursor and hidden-file policy. It never supersedes a first-page read.
@@ -156,9 +157,9 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     if (listedHiddenRef.current === showHidden) return;
     listedHiddenRef.current = showHidden;
     // A reveal of a path with a hidden name ends when hidden files are hidden: the
-    // reload then closes its folders and ends their reads, and nothing is focused.
-    const shownReveal = revealTargetRef.current;
-    if (!showHidden && revealRef.current === shownReveal.generation && shownReveal.path.split("/").some((name) => name.startsWith("."))) stopReveal();
+    // reload then closes its folders and ends their reads, and nothing is focused. So does an open of one waiting for the runtime's answer (claimOpen).
+    const shownReveal = revealTargetRef.current, hiddenName = (path) => path.split("/").some((name) => name.startsWith("."));
+    if (!showHidden) { if (hiddenName(pendingOpenRef.current)) pendingOpenRef.current = ""; if (revealRef.current === shownReveal.generation && hiddenName(shownReveal.path)) stopReveal(); }
     reloadAll();
   }, [showHidden, reloadAll]);
 
@@ -226,7 +227,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     const tree = treeRef.current;
     if (!tree) return;
     // A revealed row is scrolled into view wherever focus is (scrollIntoTree).
-    if (foundIndex >= 0 && scrollRef.current === focusedId) { scrollRef.current = ""; scrollIntoTree(tree, rowElement(tree, focusedId), 8); }
+    if (foundIndex >= 0 && scrollRef.current === focusedId) { scrollRef.current = ""; stopScroll(); scrollIntoTree(tree, rowElement(tree, focusedId), 8, scrollFrameRef); }
     const current = document.activeElement;
     const currentRow = current && tree.contains(current) ? current.closest("[data-row-id]") : null;
     let target = "";
@@ -393,7 +394,7 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
     </form>
     <span className="sr-only" role="status" aria-live="polite">{announcement}</span>
     <div className="files-layout">
-      <div className="file-tree" role="tree" aria-label={`Files in ${worktree.name}`} aria-busy={root?.status === "loading"} ref={treeRef} onKeyDown={onTreeKeyDown} onClick={onTreeClick} onFocus={onTreeFocus} onBlur={onTreeBlur}>
+      <div className="file-tree" role="tree" aria-label={`Files in ${worktree.name}`} aria-busy={root?.status === "loading"} ref={treeRef} onKeyDown={onTreeKeyDown} onClick={onTreeClick} onFocus={onTreeFocus} onBlur={onTreeBlur} onWheel={stopScroll} onPointerDown={stopScroll}>
         {rows.map((row) => <TreeRow key={row.id} row={row} label={rowLabel(row)} active={row.id === activeId} selected={row.type === "entry" && row.entry.path === (resolved.file === selected ? resolved.path : selected)}
           onFocus={() => { moveRef.current = false; setFocusedId(row.id); }} />)}
       </div>
@@ -405,11 +406,11 @@ export function FilesPane({ project, worktree, settings, completions, quickOpen,
 }
 
 // Rows laid out late (content-visibility) can move a row, so it is checked for a few frames.
-function scrollIntoTree(tree, row, frames) {
+function scrollIntoTree(tree, row, frames, frameRef) {
   if (!row?.isConnected) return;
   const box = row.getBoundingClientRect(), view = tree.getBoundingClientRect();
   if (box.top < view.top || box.bottom > view.bottom) row.scrollIntoView({ block: "nearest" });
-  if (frames) requestAnimationFrame(() => scrollIntoTree(tree, row, frames - 1));
+  if (frames) frameRef.current = requestAnimationFrame(() => scrollIntoTree(tree, row, frames - 1, frameRef));
 }
 
 function withFolder(folders, directory, folder) {
