@@ -1,6 +1,7 @@
 // A fixture that ignores its owner's cancel (tests/preview-build.test.mjs).
 // It starts a service in a group of its own that ignores SIGTERM and
-// reports it, and a helper in its own group that holds its output open.
+// reports it, and a helper in the fixture's own group that holds its output
+// open, so the owner's stop of the fixture's group must reach it too.
 import { spawn } from "node:child_process";
 
 const marker = `outright-owned-hang-${process.pid}-${Date.now()}`;

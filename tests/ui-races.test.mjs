@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -20,8 +21,8 @@ const exitedLeader = path.join(root, "tests", "fixtures", "exited-leader.mjs");
 // SIGKILL) cancels it the same way. The browser test then stops waiting,
 // and its own cleanup stops Chrome, Vite and their files before the file
 // exits. It reports each tree it starts to the owner first, with a marker
-// of its command line, so the owner can stop them itself if that cleanup
-// hangs.
+// that only that launch's command line has, so the owner can stop them
+// itself if that cleanup hangs.
 const ownerCancel = new AbortController();
 if (process.send) {
   process.on("message", (message) => { if (message === "cancel") ownerCancel.abort(new Error("The fixture's owner cancelled it")); });
@@ -802,6 +803,12 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
   // Reserve the last part of the test's own bound for independent cleanup.
   const deadline = Date.now() + browserPhaseTimeout;
   let phase = "allocate fixture";
+  // The build serves the production-only steps, not the development
+  // server's module paths that others load directly (files pdf viewer,
+  // library and worker load), so a built run takes only the steps it names.
+  if (process.env.OUTRIGHT_UI_BUILD === "1" && !process.env.OUTRIGHT_UI_STEP) {
+    throw new Error("OUTRIGHT_UI_BUILD=1 runs only the steps OUTRIGHT_UI_STEP names, such as \"files pdf build load\"");
+  }
   const remaining = () => {
     ownerCancel.signal.throwIfAborted();
     const duration = deadline - Date.now();
@@ -833,14 +840,17 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     throw error;
   }
   const server = built ? ["preview", "--outDir", built] : [];
-  const vite = spawn(process.execPath, [viteCli, ...server, "--config", "tests/vite.ui-races.config.mjs", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
+  // The title is this launch's alone, so an owner that stops reported trees
+  // never takes another run's Vite, with a recycled process ID, for this one.
+  const viteTitle = `outright-ui-races-vite-${randomUUID()}`;
+  const vite = spawn(process.execPath, [`--title=${viteTitle}`, viteCli, ...server, "--config", "tests/vite.ui-races.config.mjs", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
     cwd: root,
     env: { ...process.env, NO_COLOR: "1" },
     stdio: ["ignore", "pipe", "pipe"],
     detached: process.platform !== "win32",
     windowsHide: true,
   });
-  reportOwned("Vite", vite, "vite.ui-races.config.mjs");
+  reportOwned("Vite", vite, viteTitle);
   let output = "";
   vite.stdout.on("data", (chunk) => { output += chunk; });
   vite.stderr.on("data", (chunk) => { output += chunk; });
@@ -1112,8 +1122,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       devtoolsReady: devtools?.socket.readyState, viteOutput: output.slice(-500) }));
     assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
     const selectedCount = process.env.OUTRIGHT_UI_STEP?.split(",").length;
-    // A built fixture adds its one production-only step ("files pdf build load").
-    const expectedCount = selectedCount ?? 163 + (built ? 1 : 0) + motionStepCount;
+    const expectedCount = selectedCount ?? 163 + motionStepCount;
     const completedCount = Number(state.text.match(/(\d+) interaction regressions passed/)?.[1]);
     assert.equal(completedCount, expectedCount,
       `browser fixture completed ${completedCount || 0} of ${expectedCount} expected interactions; last step: ${state.progress?.step ?? "unknown"}`);

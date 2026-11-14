@@ -85,7 +85,8 @@ const fixtureRawFiles = {
 // has it.
 // Rollup's module IDs use "/" on every platform, so the source folder is
 // compared in that form (path.join would give "\\" on Windows).
-const VIEWER_ONLY = ["/src/components/PdfPreview.jsx", "/src/lib/pdf-canvas.js", "/src/lib/pdf-worker.js"];
+const VIEWER_ONLY = ["/src/components/PdfPreview.jsx", "/src/lib/pdf-canvas.js", "/src/lib/pdf-document.js",
+  "/src/lib/pdf-text.js", "/src/lib/pdf-worker.js"];
 const SOURCE = `${normalizePath(path.join(root, "src"))}/`;
 function fixtureChunks(id) {
   const chunk = manualChunks(id);
