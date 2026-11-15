@@ -1,0 +1,19 @@
+tests/preview-build.test.mjs
+  s_33b0b48ed1a7c7::t_ddfccf992879f3 83-90,93-98,247,557-566
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ad086d4bee09c462cec177834a022af4f20da66f",
+  "prompts": {},
+  "sessions": {
+    "s_33b0b48ed1a7c7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2dcf8fd0-50f6-4e46-a084-a3a0832a33ac",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
