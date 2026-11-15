@@ -1,0 +1,19 @@
+tests/preview-build.test.mjs
+  s_c3199e8844d1f1::t_306e5d7eea7fc9 304-330,518-519,528-555,557,655-665
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7fc4752e6faa003db32cd93c9dcd38131f8da272",
+  "prompts": {},
+  "sessions": {
+    "s_c3199e8844d1f1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "31c4fc1c-13d5-4e28-b263-9f58dba09604",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
