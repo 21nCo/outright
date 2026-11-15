@@ -1,0 +1,21 @@
+tests/preview-build.test.mjs
+  s_9f71762b6873d9::t_f1ed2290d9b6d9 152-154
+tests/ui-races.test.mjs
+  s_9f71762b6873d9::t_9eae5352656e0e 167-171
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0158fa45a335ce36f13856c429aa27af0de3b5f4",
+  "prompts": {},
+  "sessions": {
+    "s_9f71762b6873d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d475513f-e4f4-44e8-9faa-becdb917860f",
+        "model": "unknown"
+      },
+      "human_author": "Aravind Samala <samalaaravind02@gmail.com>"
+    }
+  }
+}
