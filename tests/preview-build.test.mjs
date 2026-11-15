@@ -110,13 +110,13 @@ function selectOwned(rows, child, owned, profile) {
     .map(([pid, group, command]) => [pid, groups.has(group) ? group : null, command]);
 }
 
-// [pid, parent, start time (a FILETIME, as text), command] for each process.
+// [pid, parent, start time (Unix ms), command] for each process.
 function windowsProcesses() {
   const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
-    "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,@{n='Created';e={[string]$_.CreationDate.ToFileTimeUtc()}},CommandLine | ConvertTo-Json -Compress"],
+    "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,@{n='Created';e={([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds()}},CommandLine | ConvertTo-Json -Compress"],
   { encoding: "utf8", timeout: 15_000, windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
   if (result.status !== 0) throw new Error(`Cannot list Windows processes: ${result.stderr || result.error}`);
-  return [JSON.parse(result.stdout || "[]")].flat().map((row) => [row.ProcessId, row.ParentProcessId, row.Created ?? "", row.CommandLine ?? ""]);
+  return [JSON.parse(result.stdout || "[]")].flat().map((row) => [row.ProcessId, row.ParentProcessId, row.Created ?? 0, row.CommandLine ?? ""]);
 }
 
 // Windows has no process groups and no environment in this listing, so the
@@ -134,18 +134,20 @@ function selectWindows(rows, child, owned, profile, { descendants = true } = {})
     grew = false;
     for (const row of rows) {
       const parent = selected.get(row[1]);
-      if (parent && !selected.has(row[0]) && BigInt(row[2] || 0) >= BigInt(parent[2] || 0)) { selected.set(row[0], row); grew = true; }
+      if (parent && !selected.has(row[0]) && row[2] >= parent[2]) { selected.set(row[0], row); grew = true; }
     }
   }
   return [...selected.values()].filter(([pid]) => pid !== process.pid);
 }
 
 // Stops each target only if its ID still names the process listed, by its
-// start time, checked just before the stop.
+// start time. A .NET Process handle is held across that check and Kill()
+// (as ui-races.test.mjs's killWindowsOwned does), so an ID reused between
+// them cannot become the target. One that has gone is skipped.
 function stopVerified(targets) {
-  const script = `$ErrorActionPreference = 'SilentlyContinue'; foreach ($t in (ConvertFrom-Json '${JSON.stringify(targets)}')) {
-    $p = Get-CimInstance Win32_Process -Filter "ProcessId=$($t.pid)"
-    if ($p -and [string]$p.CreationDate.ToFileTimeUtc() -eq $t.created) { Stop-Process -Id $t.pid -Force } }`;
+  const script = `foreach ($t in (ConvertFrom-Json '${JSON.stringify(targets)}')) {
+    try { $p = [System.Diagnostics.Process]::GetProcessById([int]$t.pid) } catch { continue }
+    try { $handle = $p.Handle; if (([DateTimeOffset]$p.StartTime).ToUnixTimeMilliseconds() -eq [long]$t.created) { $p.Kill() } } catch { } finally { $p.Dispose() } }`;
   const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], { windowsHide: true, timeout: 30_000 });
   if (result.status !== 0) throw new Error(`Cannot stop Windows processes: ${result.stderr || result.error}`);
 }
@@ -163,10 +165,12 @@ function ownedLeft(child, owned, profile, { list } = {}) {
 }
 
 // Signals every target, each on its own: one that fails does not keep the
-// others running, and one that is no longer the run's when its turn comes
-// is not signalled. A group that rejects the signal (macOS Chrome can put
-// protected helpers in its group, ui-races.test.mjs) is stopped through its
-// members. Failures are reported after every target has been tried.
+// others running. The run's processes are listed again before each signal,
+// so a target that is no longer the run's is not signalled, and the members
+// with the token of a group whose leader has just gone become targets of
+// their own. A group that rejects the signal (macOS Chrome can put protected
+// helpers in its group, ui-races.test.mjs) is stopped through its members.
+// Failures are reported after every target has been tried.
 function stopOwned(child, owned, profile, { list, kill = (target, signal) => process.kill(target, signal), ...windows } = {}) {
   if (process.platform === "win32") { stopWindows(child, owned, profile, { list, ...windows }); return; }
   const current = () => ownedLeft(child, owned, profile, { list });
@@ -180,9 +184,13 @@ function stopOwned(child, owned, profile, { list, kill = (target, signal) => pro
       return false;
     }
   };
-  for (const target of targetsOf(current())) {
-    if (!targetsOf(current()).has(target) || signal(target) || target > 0) continue;
-    for (const [pid, group] of current()) if (-group === target) signal(pid);
+  const tried = new Set();
+  for (let turns = 0; turns < 1_000; turns++) {
+    const target = [...targetsOf(current())].find((candidate) => !tried.has(candidate));
+    if (target === undefined) break;
+    tried.add(target);
+    if (signal(target) || target > 0) continue;
+    for (const [pid, group] of current()) if (-group === target && !tried.has(pid)) { tried.add(pid); signal(pid); }
   }
   if (errors.length) throw new AggregateError(errors, `Cannot stop the run's processes: ${errors.map((error) => error.message).join("; ")}`);
 }
@@ -248,12 +256,17 @@ const commandOf = (pid) => spawnSync("/bin/ps", ["-o", "command=", "-p", String(
 
 // Another run's processes, alive for this whole file: their command lines
 // have what this file's runs use (owned-hang's marker and a fixture Vite
-// title), but they are not this file's. No run's stop may take them.
+// title), but they are not this file's. No run's stop may take them. The
+// decoy stays in this file's group (runs are in groups of their own), so
+// the suite's stop of the file's group takes it, and it exits when its
+// input closes, as it does when this file dies by any means.
 const decoyMarker = `outright-owned-hang-decoy-${randomUUID()} outright-ui-races-vite-decoy-${randomUUID()}`;
+const decoyArgs = (marker) => ["-e", "process.stdin.on('end', () => process.exit()); process.stdin.resume(); setInterval(() => {}, 1000);", marker];
+const decoyOptions = { stdio: ["pipe", "ignore", "ignore"] };
 let decoy;
 before(() => {
   if (process.platform === "win32") return;
-  decoy = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", decoyMarker], { stdio: "ignore", detached: true });
+  decoy = spawn(process.execPath, decoyArgs(decoyMarker), decoyOptions);
 });
 afterAll(() => { if (decoy?.exitCode === null && decoy.signalCode === null) decoy.kill("SIGKILL"); });
 const ownedReported = (owned, roles, limitMs) => new Promise((resolve) => {
@@ -461,13 +474,13 @@ test("the forced stop does not signal a target whose ID names another process by
   const owned = [{ role: "Vite", pid: 300, marker: "outright-ui-races-vite-test" }, { role: "service", pid: 400, marker: "outright-owned-hang-test" }];
   const listings = [
     [[300, 300, "outright-ui-races-vite-test", true], [400, 400, "node -e outright-owned-hang-test", true], [500, 500, "helper", true]],
-    // Before its turn Vite's ID is another run's Vite, and the helper's another process.
-    [[300, 300, "outright-ui-races-vite-other", false], [400, 400, "node -e outright-owned-hang-test", true], [500, 500, "unrelated", false]],
+    // After Vite's turn the helper's ID names another process.
+    [[400, 400, "node -e outright-owned-hang-test", true], [500, 500, "unrelated", false]],
   ];
   let call = 0;
   const signalled = [];
   stopOwned(gone, owned, profile, { list: () => listings[Math.min(call++, 1)], kill: (target) => signalled.push(target) });
-  assert.deepEqual(signalled, [-400]);
+  assert.deepEqual(signalled, [-300, -400]);
 });
 
 test("on Windows the forced stop takes the run's roots and their later children, and checks each start time again", () => {
@@ -475,18 +488,63 @@ test("on Windows the forced stop takes the run's roots and their later children,
   const child = { pid: 10, exitCode: 0, signalCode: null };
   const owned = [{ role: "Vite", pid: 20, marker: "outright-ui-races-vite-test" }, { role: "Chrome", pid: 30, marker: profile }];
   const rows = [
-    [20, 10, "200", "node --title=outright-ui-races-vite-test vite.js"], [21, 20, "210", "esbuild --service"],
-    [30, 10, "300", `chrome.exe --user-data-dir=${profile}`], [31, 30, "310", "chrome.exe --type=renderer"], [32, 31, "320", "chrome.exe --type=gpu"],
+    [20, 10, 200, "node --title=outright-ui-races-vite-test vite.js"], [21, 20, 210, "esbuild --service"],
+    [30, 10, 300, `chrome.exe --user-data-dir=${profile}`], [31, 30, 310, "chrome.exe --type=renderer"], [32, 31, 320, "chrome.exe --type=gpu"],
     // 40 reused a reported ID; 41 names a selected parent but started before it, so its parent ID was reused.
-    [40, 1, "400", "node another-run.js"], [41, 30, "100", "older process"], [42, 40, "420", "child of another run"],
+    [40, 1, 400, "node another-run.js"], [41, 30, 100, "older process"], [42, 40, 420, "child of another run"],
   ];
   const reportedAgain = [...owned, { role: "Vite", pid: 40, marker: "outright-ui-races-vite-earlier" }];
   assert.deepEqual(selectWindows(rows, child, reportedAgain, profile).map(([pid]) => pid), [20, 30, 21, 31, 32]);
   let targets;
   const running = { pid: 10, exitCode: null, signalCode: null, kill: (signal) => { running.killed = signal; } };
-  stopWindows(running, owned, profile, { list: () => [[10, 1, "100", "node fixture"], ...rows], stop: (list) => { targets = list; } });
+  stopWindows(running, owned, profile, { list: () => [[10, 1, 100, "node fixture"], ...rows], stop: (list) => { targets = list; } });
   assert.equal(running.killed, "SIGKILL");
-  assert.deepEqual(targets, [{ pid: 20, created: "200" }, { pid: 30, created: "300" }, { pid: 21, created: "210" }, { pid: 31, created: "310" }, { pid: 32, created: "320" }]);
+  assert.deepEqual(targets, [{ pid: 20, created: 200 }, { pid: 30, created: 300 }, { pid: 21, created: 210 }, { pid: 31, created: 310 }, { pid: 32, created: 320 }]);
+});
+
+test("the forced stop goes on through the token members of a group whose leader leaves before its turn", { skip: process.platform === "win32" }, () => {
+  const profile = "/tmp/outright-fixture-owner-test";
+  const gone = { pid: 100, exitCode: 0, signalCode: null };
+  const owned = [{ role: "Vite", pid: 300, marker: "outright-ui-races-vite-test" }, { role: "Chrome", pid: 200, marker: profile }];
+  const vite = [[300, 300, "outright-ui-races-vite-test", true], [301, 300, "esbuild --service", true], [302, 300, "another run's helper", false]];
+  const chrome = [[200, 200, `chrome --user-data-dir=${profile}`, true], [201, 200, "chrome helper", true]];
+  const stop = (listings, refuse) => {
+    let call = 0;
+    const signalled = [];
+    stopOwned(gone, owned, profile, { list: () => listings[Math.min(call++, listings.length - 1)],
+      kill: (target) => { signalled.push(target); if (target === refuse) throw refused(target); } });
+    return signalled;
+  };
+  // Vite leaves while Chrome's group is stopped: its token member is still stopped.
+  assert.deepEqual(stop([[...chrome, ...vite], vite.slice(1)]), [-200, 301]);
+  // Chrome's group refuses the signal, and Chrome leaves before its members are listed.
+  assert.deepEqual(stop([chrome, chrome.slice(1)], -200), [-200, 201]);
+});
+
+test("the owner's decoy does not outlive a file that is killed", { skip: process.platform === "win32", timeout: 30_000 }, async () => {
+  const file = spawn(process.execPath, ["-e", `const c = require("node:child_process").spawn(process.execPath, ...JSON.parse(process.argv[1]));
+    console.log(c.pid); setInterval(() => {}, 1000);`, JSON.stringify([decoyArgs(`outright-decoy-probe-${randomUUID()}`), decoyOptions])], { stdio: ["ignore", "pipe", "ignore"] });
+  const pid = await new Promise((resolve) => file.stdout.once("data", (chunk) => resolve(Number.parseInt(chunk, 10))));
+  assert(commandOf(pid).includes("outright-decoy-probe-"), "the probe's decoy did not start");
+  file.kill("SIGKILL");
+  const until = Date.now() + 10_000;
+  while (commandOf(pid) && Date.now() < until) await after(100);
+  assert.equal(commandOf(pid), "", "the decoy outlived its file");
+});
+
+test("on Windows the verified stop ends a process only while its start time matches", { skip: process.platform !== "win32", timeout: 60_000 }, async () => {
+  const target = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true });
+  try {
+    await new Promise((resolve) => target.once("spawn", resolve));
+    const [, , created] = windowsProcesses().find(([pid]) => pid === target.pid);
+    stopVerified([{ pid: target.pid, created: created - 1 }]);
+    await after(500);
+    assert.equal(target.exitCode ?? target.signalCode, null, "a process with another start time was stopped");
+    stopVerified([{ pid: target.pid, created }]);
+    const until = Date.now() + 10_000;
+    while (target.exitCode === null && target.signalCode === null && Date.now() < until) await after(100);
+    assert.notEqual(target.exitCode ?? target.signalCode, null, "the verified process was not stopped");
+  } finally { target.kill(); }
 });
 
 // Last in the file: every run above has been stopped by now.
