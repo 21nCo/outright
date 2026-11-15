@@ -82,31 +82,38 @@ test("the production build keeps every dynamic import in the preview path retrya
 const tokenOf = (profile) => `OUTRIGHT_TEST_UI_PROFILE=${profile}`;
 // On macOS ps -E adds each process's environment (only this user's) to its
 // command, so one listing gives the token with the group and command it
-// belongs to; no second listing can pair them with another process. Linux
-// reads it from /proc: a reused ID there shows the token only if the new
-// process is the run's too.
+// belongs to; no second listing can pair them with another process. That
+// listing decides; the command shown in messages comes from a plain
+// listing, so no process's environment reaches the output. Linux reads the
+// token from /proc: a reused ID there shows it only if the new process is
+// the run's too. Rows: [pid, group, command, has the token, shown].
 function posixProcesses(profile, { run = spawnSync } = {}) {
   const linux = process.platform === "linux";
-  const result = run("/bin/ps", [linux ? "-axo" : "-axEww", ...(linux ? [] : ["-o"]), "pid=,pgid=,stat=,command="], { encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024 * 1024 });
-  if (result.status !== 0) throw new Error(`Cannot list processes: ${result.stderr || result.error}`);
+  const list = (args) => {
+    const result = run("/bin/ps", [...args, "pid=,pgid=,stat=,command="], { encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024 * 1024 });
+    if (result.status !== 0) throw new Error(`Cannot list processes: ${result.stderr || result.error}`);
+    return result.stdout.split("\n").map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s*(.*)$/))
+      .filter((fields) => fields && !fields[3].startsWith("Z")).map((fields) => [Number(fields[1]), Number(fields[2]), fields[4]]);
+  };
   const token = tokenOf(profile);
-  const carries = linux
-    ? (pid) => { try { return readFileSync(`/proc/${pid}/environ`, "latin1").split("\0").includes(token); } catch { return false; } }
-    : (pid, command) => `${command} `.includes(` ${token} `);
-  return result.stdout.split("\n").map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s*(.*)$/))
-    .filter((fields) => fields && !fields[3].startsWith("Z"))
-    .map((fields) => [Number(fields[1]), Number(fields[2]), fields[4], carries(Number(fields[1]), fields[4])]);
+  if (linux) {
+    const carries = (pid) => { try { return readFileSync(`/proc/${pid}/environ`, "latin1").split("\0").includes(token); } catch { return false; } };
+    return list(["-axo"]).map(([pid, group, command]) => [pid, group, command, carries(pid), command]);
+  }
+  const rows = list(["-axEww", "-o"]);
+  const shown = new Map(list(["-axo"]).map(([pid, , command]) => [pid, command]));
+  return rows.map(([pid, group, command]) => [pid, group, command, `${command} `.includes(` ${token} `), shown.get(pid) ?? ""]);
 }
 
-// Each process in rows ([pid, group, command, has the token]) that is the
-// run's: [pid, group to stop or null, command].
+// Each process in rows ([pid, group, command, has the token, shown]) that is
+// the run's: [pid, group to stop or null, command to show].
 function selectOwned(rows, child, owned, profile) {
   // An exited file that Node has not yet reaped keeps its ID.
   const running = child.exitCode === null && child.signalCode === null;
   const leads = ({ pid, marker }) => rows.some(([id, group, command]) => id === pid && group === pid && command.includes(marker));
   const groups = new Set([...(running ? [child.pid] : []), ...owned.filter(leads).map((entry) => entry.pid)]);
   return rows.filter(([pid, group, command, carries]) => pid !== process.pid && (groups.has(group) || carries || command.includes(profile)))
-    .map(([pid, group, command]) => [pid, groups.has(group) ? group : null, command]);
+    .map(([pid, group, command, , shown = command]) => [pid, groups.has(group) ? group : null, shown]);
 }
 
 // [pid, parent, start time (Unix ms), command] for each process.
@@ -142,13 +149,18 @@ function selectWindows(rows, child, owned, profile, { descendants = true } = {})
 // Stops each target only if its ID still names the process listed, by its
 // start time. A .NET Process handle is held across that check and Kill()
 // (as ui-races.test.mjs's killWindowsOwned does), so an ID reused between
-// them cannot become the target. One that has gone is skipped.
+// them cannot become the target. One that has gone is skipped; one that
+// could not be stopped and still runs is reported.
 function stopVerified(targets) {
-  const script = `foreach ($t in (ConvertFrom-Json '${JSON.stringify(targets)}')) {
+  const script = `$failed = @(); foreach ($t in (ConvertFrom-Json '${JSON.stringify(targets)}')) {
     try { $p = [System.Diagnostics.Process]::GetProcessById([int]$t.pid) } catch { continue }
-    try { $handle = $p.Handle; if (([DateTimeOffset]$p.StartTime).ToUnixTimeMilliseconds() -eq [long]$t.created) { $p.Kill() } } catch { } finally { $p.Dispose() } }`;
+    try { $handle = $p.Handle; if (([DateTimeOffset]$p.StartTime).ToUnixTimeMilliseconds() -eq [long]$t.created) { $p.Kill() } }
+    catch { $alive = $true; try { $alive = -not $p.HasExited } catch { }; if ($alive) { $failed += "$($t.pid): $($_.Exception.Message)" } }
+    finally { $p.Dispose() } }
+  if ($failed.Count) { [Console]::Error.WriteLine($failed -join '; '); exit 1 }
+  exit 0`;
   const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], { windowsHide: true, timeout: 30_000 });
-  if (result.status !== 0) throw new Error(`Cannot stop Windows processes: ${result.stderr || result.error}`);
+  if (result.status !== 0) throw new Error(`Cannot stop Windows processes: ${result.stderr?.toString().trim() || result.error}`);
 }
 
 function stopWindows(child, owned, profile, { list = windowsProcesses, stop = stopVerified } = {}) {
@@ -244,7 +256,7 @@ async function runOwned(args, { env, cancelAt, graceMs, closeMs = 10_000, cancel
   } finally {
     if (!result) { child.stdout.destroy(); child.stderr.destroy(); }
     try {
-      left = ownedLeft(child, owned, profile).map(([pid, , command]) => `${pid} ${command.slice(0, 300)}`);
+      left = ownedLeft(child, owned, profile).map(([pid, , command]) => `${pid} ${command}`);
       if (left.length) tryStop();
     } catch (error) { stopErrors.push(error); }
     rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
@@ -547,7 +559,12 @@ test("on Windows the verified stop ends a process only while its start time matc
     stopVerified([{ pid: target.pid, created: created - 1 }]);
     await after(500);
     assert.equal(target.exitCode ?? target.signalCode, null, "a process with another start time was stopped");
-    stopVerified([{ pid: target.pid, created }]);
+    // One that has gone by then is skipped, not a failure.
+    const exited = spawn(process.execPath, ["-e", ""], { stdio: "ignore", windowsHide: true });
+    await new Promise((resolve) => exited.once("spawn", resolve));
+    const [, , exitedCreated] = windowsProcesses().find(([pid]) => pid === exited.pid) ?? [, , 0];
+    await new Promise((resolve) => (exited.exitCode === null ? exited.once("exit", resolve) : resolve()));
+    stopVerified([{ pid: target.pid, created }, { pid: exited.pid, created: exitedCreated }]);
     const until = Date.now() + 10_000;
     while (target.exitCode === null && target.signalCode === null && Date.now() < until) await after(100);
     assert.notEqual(target.exitCode ?? target.signalCode, null, "the verified process was not stopped");
@@ -557,11 +574,23 @@ test("on Windows the verified stop ends a process only while its start time matc
 test("on macOS one listing gives each process's group, command and token together", { skip: process.platform !== "darwin" }, () => {
   const profile = "/tmp/outright-fixture-owner-test";
   // A second listing would show Vite's ID as another process with the token.
-  const listings = [" 300   300 S    outright-ui-races-vite-test HOME=/x\n", ` 300   300 S    other OUTRIGHT_TEST_UI_PROFILE=${profile}\n`];
-  let calls = 0;
-  const rows = posixProcesses(profile, { run: () => ({ status: 0, stdout: listings[calls++] }) });
-  assert.equal(calls, 1);
-  assert.deepEqual(rows, [[300, 300, "outright-ui-races-vite-test HOME=/x", false]]);
+  // The plain listing, read second, shows Vite's ID as another process.
+  let envListings = 0;
+  const run = (command, args) => (args.includes("-axEww") ? (envListings++, { status: 0, stdout: " 300   300 S    outright-ui-races-vite-test HOME=/x\n" })
+    : { status: 0, stdout: " 300   900 S    other\n" });
+  const rows = posixProcesses(profile, { run });
+  assert.equal(envListings, 1);
+  assert.deepEqual(rows, [[300, 300, "outright-ui-races-vite-test HOME=/x", false, "other"]]);
+});
+
+test("no process's environment reaches what the owner shows", { skip: process.platform === "win32" }, () => {
+  const profile = "/tmp/outright-fixture-owner-test";
+  const env = ` API_KEY=REVIEW_SENTINEL OUTRIGHT_TEST_UI_PROFILE=${profile}`;
+  const run = (command, args) => ({ status: 0, stdout: ` 400   400 S    node helper${args.includes("-axEww") ? env : ""}\n` });
+  const listed = process.platform === "linux" ? [[400, 400, "node helper", true, "node helper"]] : posixProcesses(profile, { run });
+  const left = selectOwned(listed, { pid: 1, exitCode: 0, signalCode: null }, [], profile);
+  assert.deepEqual(left, [[400, null, "node helper"]]);
+  assert(!JSON.stringify(left).includes("REVIEW_SENTINEL"));
 });
 
 // Last in the file: every run above has been stopped by now.
