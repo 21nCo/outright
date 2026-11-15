@@ -149,18 +149,28 @@ function selectWindows(rows, child, owned, profile, { descendants = true } = {})
 // Stops each target only if its ID still names the process listed, by its
 // start time. A .NET Process handle is held across that check and Kill()
 // (as ui-races.test.mjs's killWindowsOwned does), so an ID reused between
-// them cannot become the target. One that has gone is skipped; one that
-// could not be stopped and still runs is reported.
+// them cannot become the target. The start time is read again from the same
+// CIM listing the target came from, so the check compares one source's
+// values exactly. One that has gone is skipped; one that could not be
+// stopped and still runs is reported. Returns what it did with each target,
+// with .NET's own start time beside the listed one.
 function stopVerified(targets) {
-  const script = `$failed = @(); foreach ($t in (ConvertFrom-Json '${JSON.stringify(targets)}')) {
-    try { $p = [System.Diagnostics.Process]::GetProcessById([int]$t.pid) } catch { continue }
-    try { $handle = $p.Handle; if (([DateTimeOffset]$p.StartTime).ToUnixTimeMilliseconds() -eq [long]$t.created) { $p.Kill() } }
-    catch { $alive = $true; try { $alive = -not $p.HasExited } catch { }; if ($alive) { $failed += "$($t.pid): $($_.Exception.Message)" } }
+  const script = `$done = @(); $failed = @(); foreach ($t in (ConvertFrom-Json '${JSON.stringify(targets)}')) {
+    try { $p = [System.Diagnostics.Process]::GetProcessById([int]$t.pid) } catch { $done += "$($t.pid) gone"; continue }
+    try { $handle = $p.Handle
+      $row = Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$t.pid)"
+      $listed = if ($row) { ([DateTimeOffset]$row.CreationDate).ToUnixTimeMilliseconds() } else { 'none' }
+      $started = 'none'; try { $started = ([DateTimeOffset]$p.StartTime).ToUnixTimeMilliseconds() } catch { }
+      $seen = "listed=$listed started=$started expected=$($t.created)"
+      if ($row -and $listed -eq [long]$t.created) { $p.Kill(); $done += "$($t.pid) stopped $seen" } else { $done += "$($t.pid) skipped $seen" } }
+    catch { $alive = $true; try { $alive = -not $p.HasExited } catch { }; if ($alive) { $failed += "$($t.pid): $($_.Exception.Message)" } else { $done += "$($t.pid) gone" } }
     finally { $p.Dispose() } }
+  [Console]::Out.Write($done -join ';')
   if ($failed.Count) { [Console]::Error.WriteLine($failed -join '; '); exit 1 }
   exit 0`;
   const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], { windowsHide: true, timeout: 30_000 });
   if (result.status !== 0) throw new Error(`Cannot stop Windows processes: ${result.stderr?.toString().trim() || result.error}`);
+  return result.stdout.toString().split(";").filter(Boolean);
 }
 
 function stopWindows(child, owned, profile, { list = windowsProcesses, stop = stopVerified } = {}) {
@@ -265,9 +275,26 @@ async function runOwned(args, { env, cancelAt, graceMs, closeMs = 10_000, cancel
   const cancelToCloseMs = result && cancelledAt ? result.closedAt - cancelledAt : null;
   return { ...result, outcome, output, owned, left, stopErrors, profile, cancelToCloseMs, outputClosed: Boolean(result) };
 }
+// A cancel point for runOwned, which races it with the run closing: it
+// waits on no process, so it must not hold the event loop open.
 const after = (ms) => new Promise((resolve) => { setTimeout(resolve, ms).unref?.(); });
-// A process's command line as ps shows it, or "" once it has gone.
-const commandOf = (pid) => spawnSync("/bin/ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8", timeout: 5_000 }).stdout?.trim() ?? "";
+// Waits that poll for a process to go use this ref'd timer: once the process
+// has gone, nothing else may hold the event loop open for the rest of a test.
+const pause = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+// Whether a child of this file exits within ms (an already exited one does).
+const exitsWithin = (child, ms) => new Promise((resolve) => {
+  if (child.exitCode !== null || child.signalCode !== null) { resolve(true); return; }
+  const timer = setTimeout(() => { child.off("exit", exited); resolve(false); }, ms);
+  const exited = () => { clearTimeout(timer); resolve(true); };
+  child.once("exit", exited);
+});
+// A running process's command line as ps shows it, or "" once it has gone.
+// A process that has exited is gone even while it waits as a zombie for a
+// parent to reap it, which a container's PID 1 may never do.
+const commandOf = (pid) => {
+  const [, state = "", command = ""] = /^\s*(\S+)\s?(.*)$/s.exec(spawnSync("/bin/ps", ["-o", "stat=,command=", "-p", String(pid)], { encoding: "utf8", timeout: 5_000 }).stdout?.trim() ?? "") ?? [];
+  return state.startsWith("Z") ? "" : command.trim();
+};
 
 // Another run's processes, alive for this whole file: their command lines
 // have what this file's runs use (owned-hang's marker and a fixture Vite
@@ -547,27 +574,33 @@ test("the owner's decoy does not outlive a file that is killed", { skip: process
   assert(commandOf(pid).includes("outright-decoy-probe-"), "the probe's decoy did not start");
   file.kill("SIGKILL");
   const until = Date.now() + 10_000;
-  while (commandOf(pid) && Date.now() < until) await after(100);
+  while (commandOf(pid) && Date.now() < until) await pause(100);
   assert.equal(commandOf(pid), "", "the decoy outlived its file");
 });
 
-test("on Windows the verified stop ends a process only while its start time matches", { skip: process.platform !== "win32", timeout: 60_000 }, async () => {
+test("on Windows the verified stop ends a process only while its start time matches", { skip: process.platform !== "win32", timeout: 60_000 }, async (t) => {
   const target = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true });
+  const spawnedAt = Date.now();
+  let ended = null;
+  target.once("exit", (code, signal) => { ended = `exited (${code ?? signal}) ${Date.now() - spawnedAt}ms after it started`; });
+  const report = (phase, done) => { const line = `${phase}: ${done.join("; ")}; target ${ended ?? "running"}`; t.diagnostic(line); return line; };
   try {
     await new Promise((resolve) => target.once("spawn", resolve));
     const [, , created] = windowsProcesses().find(([pid]) => pid === target.pid);
-    stopVerified([{ pid: target.pid, created: created - 1 }]);
-    await after(500);
-    assert.equal(target.exitCode ?? target.signalCode, null, "a process with another start time was stopped");
+    const mismatched = stopVerified([{ pid: target.pid, created: created - 1 }]);
+    const stoppedEarly = await exitsWithin(target, 1_000);
+    const first = report("another start time", mismatched);
+    assert(!stoppedEarly && mismatched.some((line) => line.startsWith(`${target.pid} skipped `)), `a process with another start time was stopped: ${first}`);
     // One that has gone by then is skipped, not a failure.
     const exited = spawn(process.execPath, ["-e", ""], { stdio: "ignore", windowsHide: true });
     await new Promise((resolve) => exited.once("spawn", resolve));
     const [, , exitedCreated] = windowsProcesses().find(([pid]) => pid === exited.pid) ?? [, , 0];
-    await new Promise((resolve) => (exited.exitCode === null ? exited.once("exit", resolve) : resolve()));
-    stopVerified([{ pid: target.pid, created }, { pid: exited.pid, created: exitedCreated }]);
-    const until = Date.now() + 10_000;
-    while (target.exitCode === null && target.signalCode === null && Date.now() < until) await after(100);
-    assert.notEqual(target.exitCode ?? target.signalCode, null, "the verified process was not stopped");
+    await exitsWithin(exited, 10_000);
+    const matching = stopVerified([{ pid: target.pid, created }, { pid: exited.pid, created: exitedCreated }]);
+    const stopped = await exitsWithin(target, 10_000);
+    const second = report("its own start time", matching);
+    assert(stopped && matching.some((line) => line.startsWith(`${target.pid} stopped `)), `the verified process was not stopped: ${second}`);
+    assert(!matching.some((line) => line.startsWith(`${exited.pid} stopped `)), `a process that had gone was stopped: ${second}`);
   } finally { target.kill(); }
 });
 
