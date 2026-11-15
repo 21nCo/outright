@@ -45,7 +45,8 @@ async function until(check, label, timeoutMs = 5000) {
   const deadline = performance.now() + timeoutMs;
   while (!check()) {
     // A hidden page paints no frames, so frame-driven focus cannot settle.
-    if (performance.now() > deadline) throw new Error(`Timed out: ${label}; page ${document.visibilityState}`);
+    // A label given as a function adds what the step saw when it timed out.
+    if (performance.now() > deadline) throw new Error(`Timed out: ${typeof label === "function" ? label() : label}; page ${document.visibilityState}`);
     await frame();
   }
 }
@@ -2208,7 +2209,9 @@ async function chatDetailRefreshOwnershipRegression() {
   const runs = [];
   let trustRequests = 0;
   let requireTrust = true;
+  const requested = [];
   route = async (url, options) => {
+    if (requested.length < 12) requested.push(url.pathname);
     if (url.pathname === "/api/bootstrap") return response({ projects, projectGroups: { groups: [], memberships: {} }, settings: { provider: "codex", approvalPolicy: "read-only", reasoningEffort: "medium" }, providers: [{ id: "codex", available: true }], templates: [], trustedProjects: [] });
     if (url.pathname === "/api/conversations") return response({ conversations: [chats.A] });
     if (url.pathname === "/api/conversations/chat-A") {
@@ -2227,7 +2230,7 @@ async function chatDetailRefreshOwnershipRegression() {
     return response({});
   };
   root.render(<TooltipProvider><App /></TooltipProvider>);
-  await until(() => host.querySelector('textarea[placeholder*="Ask codex"]'), "loaded old detail");
+  await until(() => host.querySelector('textarea[placeholder*="Ask codex"]'), () => `loaded old detail (requests ${requested.join(" ") || "none"}; composer ${JSON.stringify(host.querySelector("textarea")?.placeholder ?? null)}; busy ${host.querySelectorAll('[aria-busy="true"]').length}; text ${JSON.stringify(host.textContent.slice(0, 120))})`);
   const composer = host.querySelector('textarea[aria-label="Message the agent"]');
   setControlValue(composer, "Must use current detail");
   const refresh = () => fixtureSockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "runtime.connected", payload: { restarted: true } }) }));

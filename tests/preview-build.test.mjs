@@ -290,10 +290,16 @@ const exitsWithin = (child, ms) => new Promise((resolve) => {
 });
 // A running process's command line as ps shows it, or "" once it has gone.
 // A process that has exited is gone even while it waits as a zombie for a
-// parent to reap it, which a container's PID 1 may never do.
-const commandOf = (pid) => {
-  const [, state = "", command = ""] = /^\s*(\S+)\s?(.*)$/s.exec(spawnSync("/bin/ps", ["-o", "stat=,command=", "-p", String(pid)], { encoding: "utf8", timeout: 5_000 }).stdout?.trim() ?? "") ?? [];
-  return state.startsWith("Z") ? "" : command.trim();
+// parent to reap it, which a container's PID 1 may never do. Only ps's
+// own answer that the ID is absent (exit 1, no rows, no error text) means
+// gone: a query that fails, times out or is killed throws instead.
+const commandOf = (pid, { run = spawnSync } = {}) => {
+  const result = run("/bin/ps", ["-o", "stat=,command=", "-p", String(pid)], { encoding: "utf8", timeout: 5_000 });
+  const output = result.stdout?.trim() ?? "";
+  if (!result.error && result.signal == null && result.status === 1 && output === "" && !result.stderr?.trim()) return "";
+  const row = !result.error && result.signal == null && result.status === 0 ? /^(\S+)\s?(.*)$/s.exec(output) : null;
+  if (!row) throw new Error(`Cannot query process ${pid}: ${result.error?.message ?? `status ${result.status}, signal ${result.signal}`} ${result.stderr ?? ""}`.trim());
+  return row[1].startsWith("Z") ? "" : row[2].trim();
 };
 
 // Another run's processes, alive for this whole file: their command lines
@@ -565,6 +571,28 @@ test("the forced stop goes on through the token members of a group whose leader 
   // next helper's ID names another process, which is left alone.
   const helpers = [...chrome, [202, 200, "chrome helper", true]];
   assert.deepEqual(stop([helpers, helpers, helpers, [[202, 900, "unrelated", false]]], -200), [-200, 200, 201]);
+});
+
+test("a process query that fails is not read as a process that has gone", { skip: process.platform === "win32", timeout: 30_000 }, async () => {
+  const answer = (result) => ({ run: () => ({ status: 0, signal: null, stdout: "", stderr: "", ...result }) });
+  const timedOut = Object.assign(new Error("spawnSync /bin/ps ETIMEDOUT"), { code: "ETIMEDOUT" });
+  assert.throws(() => commandOf(4242, answer({ error: timedOut, status: null, signal: "SIGTERM" })), /Cannot query process 4242: spawnSync \/bin\/ps ETIMEDOUT/);
+  assert.throws(() => commandOf(4242, answer({ error: Object.assign(new Error("spawnSync /bin/ps ENOENT"), { code: "ENOENT" }), status: null, stdout: undefined })), /ENOENT/);
+  assert.throws(() => commandOf(4242, answer({ status: null, signal: "SIGKILL" })), /signal SIGKILL/);
+  assert.throws(() => commandOf(4242, answer({ status: 1, stderr: "ps: cannot read process table" })), /cannot read process table/);
+  assert.throws(() => commandOf(4242, answer({ status: 0 })), /status 0/);
+  assert.equal(commandOf(4242, answer({ status: 1 })), "");
+  assert.equal(commandOf(4242, answer({ stdout: "Z+   [node] <defunct>\n" })), "");
+  assert.equal(commandOf(4242, answer({ stdout: "S    node -e decoy\n" })), "node -e decoy");
+  // The same answers from the real ps: a running process, then the ID once it has gone.
+  const marker = `outright-query-probe-${randomUUID()}`;
+  const probe = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", marker], { stdio: "ignore" });
+  try {
+    await new Promise((resolve) => probe.once("spawn", resolve));
+    assert(commandOf(probe.pid).includes(marker), "a running process was not reported running");
+  } finally { probe.kill("SIGKILL"); }
+  assert(await exitsWithin(probe, 10_000), "the probe did not exit");
+  assert.equal(commandOf(probe.pid), "");
 });
 
 test("the owner's decoy does not outlive a file that is killed", { skip: process.platform === "win32", timeout: 30_000 }, async () => {
