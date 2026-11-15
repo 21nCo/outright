@@ -3,8 +3,9 @@
 // reports it, and a helper in the fixture's own group that holds its output
 // open, so the owner's stop of the fixture's group must reach it too.
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 
-const marker = `outright-owned-hang-${process.pid}-${Date.now()}`;
+const marker = `outright-owned-hang-${randomUUID()}`;
 const holdOn = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
 const service = spawn(process.execPath, ["-e", holdOn, marker], { stdio: "ignore", detached: process.platform !== "win32", windowsHide: true });
 spawn(process.execPath, ["-e", holdOn], { stdio: ["ignore", "inherit", "inherit"], windowsHide: true });

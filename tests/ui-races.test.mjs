@@ -822,11 +822,13 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
   const profile = process.env.OUTRIGHT_TEST_UI_PROFILE ?? mkdtempSync(path.join(tmpdir(), "outright-ui-races-"));
   // OUTRIGHT_UI_BUILD=1 builds the fixture as the app is built and serves
   // the build (tests/preview-build.test.mjs), so a step loads production
-  // chunks instead of the development server's modules.
+  // chunks instead of the development server's modules. Under an owner the
+  // build goes in the owner's profile, which the owner removes even when it
+  // has to force the fixture to stop (mid-build, or in a stalled cleanup).
   let built = null;
   try {
     if (process.env.OUTRIGHT_UI_BUILD === "1") {
-      built = mkdtempSync(path.join(tmpdir(), "outright-ui-build-"));
+      built = mkdtempSync(path.join(process.env.OUTRIGHT_TEST_UI_PROFILE ?? tmpdir(), "outright-ui-build-"));
       phase = "build the fixture";
       const result = spawnSync(process.execPath, [viteCli, "build", "--config", "tests/vite.ui-races.config.mjs", "--outDir", built, "--emptyOutDir", "--logLevel", "warn"], {
         cwd: root, env: { ...process.env, NO_COLOR: "1" }, encoding: "utf8", timeout: Math.min(120_000, remaining()), windowsHide: true,

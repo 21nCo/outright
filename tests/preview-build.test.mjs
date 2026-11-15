@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { after as afterAll, before } from "node:test";
 import { fileURLToPath } from "node:url";
 import { build } from "vite";
 import { uiFixtureBudget } from "./ui-fixture-budget.mjs";
@@ -65,60 +65,112 @@ test("the production build keeps every dynamic import in the preview path retrya
 // that launch's command line has (Vite's run-unique title, Chrome's private
 // profile). When cancelAt settles the owner asks the file over IPC to
 // cancel, which its own cleanup answers by stopping its trees and files
-// and exiting, within graceMs. Past that the owner stops the file's group,
-// each reported tree whose command line still has its marker, and every
-// process started with the owner's profile (Chrome's helpers can leave
-// Chrome's group). On Windows it ends the file's process tree and the same
-// reported and profile-owned processes. Either way, nothing the run started
-// may outlive it or keep its output open.
-function posixProcesses() {
+// and exiting, within graceMs. Past that the owner stops what is still the
+// run's. The profile is also the run's token: the file passes
+// OUTRIGHT_TEST_UI_PROFILE on to everything it starts, and no other process
+// can have it. A process is the run's when it has the token (in its
+// environment, or as Chrome's profile on its command line), or is in a
+// group the owner can prove is the run's: the file's while it runs, or a
+// reported tree's whose leader still has its marker. A group whose leader
+// has gone is not proof (its ID may now be another run's), so only its
+// members with the token are taken. Each target is checked again just
+// before it is signalled. On Windows the owner ends the file through its
+// own handle, and each process that has the token, a reported marker, or a
+// selected parent that started before it, once its start time is checked
+// again. Either way, nothing the run started may outlive it or keep its
+// output open.
+const tokenOf = (profile) => `OUTRIGHT_TEST_UI_PROFILE=${profile}`;
+function posixProcesses(profile) {
   const result = spawnSync("/bin/ps", ["-axo", "pid=,pgid=,stat=,command="], { encoding: "utf8", timeout: 5_000 });
   if (result.status !== 0) throw new Error(`Cannot list processes: ${result.stderr || result.error}`);
-  return result.stdout.split("\n").map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s*(.*)$/))
+  const rows = result.stdout.split("\n").map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s*(.*)$/))
     .filter((fields) => fields && !fields[3].startsWith("Z")).map((fields) => [Number(fields[1]), Number(fields[2]), fields[4]]);
+  const token = tokenOf(profile);
+  let carries;
+  if (process.platform === "linux") {
+    carries = (pid) => { try { return readFileSync(`/proc/${pid}/environ`, "latin1").split("\0").includes(token); } catch { return false; } };
+  } else {
+    // ps -E adds each process's environment (only this user's) to its command.
+    const listed = spawnSync("/bin/ps", ["-axEww", "-o", "pid=,command="], { encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024 * 1024 });
+    if (listed.status !== 0) throw new Error(`Cannot list process environments: ${listed.stderr || listed.error}`);
+    const pids = new Set(listed.stdout.split("\n").filter((line) => `${line} `.includes(` ${token} `)).map((line) => Number.parseInt(line, 10)));
+    carries = (pid) => pids.has(pid);
+  }
+  return rows.map(([pid, group, command]) => [pid, group, command, carries(pid)]);
 }
 
-// Each process in rows ([pid, group, command]) that is the run's:
-// [pid, group to stop or null, command].
+// Each process in rows ([pid, group, command, has the token]) that is the
+// run's: [pid, group to stop or null, command].
 function selectOwned(rows, child, owned, profile) {
+  // An exited file that Node has not yet reaped keeps its ID.
   const running = child.exitCode === null && child.signalCode === null;
-  // A group is the run's while its leader is the run's own process (the file,
-  // or a reported tree whose command line still has its marker), or once its
-  // leader has gone: a group's id is not reused while any member remains.
-  const leader = (group) => rows.find(([pid]) => pid === group);
-  const groups = new Set([
-    ...(running || !leader(child.pid) ? [child.pid] : []),
-    ...owned.filter((entry) => !leader(entry.pid) || leader(entry.pid)[2].includes(entry.marker)).map((entry) => entry.pid),
-  ]);
-  return rows.filter(([pid, group, command]) => pid !== process.pid && (groups.has(group) || command.includes(profile)))
+  const leads = ({ pid, marker }) => rows.some(([id, group, command]) => id === pid && group === pid && command.includes(marker));
+  const groups = new Set([...(running ? [child.pid] : []), ...owned.filter(leads).map((entry) => entry.pid)]);
+  return rows.filter(([pid, group, command, carries]) => pid !== process.pid && (groups.has(group) || carries || command.includes(profile)))
     .map(([pid, group, command]) => [pid, groups.has(group) ? group : null, command]);
 }
 
-function ownedLeft(child, owned, profile, { list = posixProcesses } = {}) {
-  if (process.platform === "win32") {
-    const running = child.exitCode === null && child.signalCode === null;
-    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
-      "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"], { encoding: "utf8", timeout: 15_000, windowsHide: true });
-    if (result.status !== 0) throw new Error(`Cannot list Windows processes: ${result.stderr || result.error}`);
-    return [JSON.parse(result.stdout || "[]")].flat().filter(({ ProcessId, CommandLine }) => (ProcessId === child.pid && running)
-      || (CommandLine && (CommandLine.includes(profile) || owned.some((entry) => entry.pid === ProcessId && CommandLine.includes(entry.marker)))))
-      .map(({ ProcessId, CommandLine }) => [ProcessId, null, CommandLine ?? ""]);
+// [pid, parent, start time (a FILETIME, as text), command] for each process.
+function windowsProcesses() {
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+    "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,@{n='Created';e={[string]$_.CreationDate.ToFileTimeUtc()}},CommandLine | ConvertTo-Json -Compress"],
+  { encoding: "utf8", timeout: 15_000, windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
+  if (result.status !== 0) throw new Error(`Cannot list Windows processes: ${result.stderr || result.error}`);
+  return [JSON.parse(result.stdout || "[]")].flat().map((row) => [row.ProcessId, row.ParentProcessId, row.Created ?? "", row.CommandLine ?? ""]);
+}
+
+// Windows has no process groups and no environment in this listing, so the
+// run's processes are its roots (the running file, a reported tree's leader
+// with its marker, anything with the profile on its command line) and their
+// descendants. A parent ID can be reused, so a process is taken as a
+// child only if it started after the parent it names. The check for what
+// is left takes only the roots: a console child's conhost.exe, its child,
+// can outlast it for a moment.
+function selectWindows(rows, child, owned, profile, { descendants = true } = {}) {
+  const running = child.exitCode === null && child.signalCode === null;
+  const selected = new Map(rows.filter(([pid, , , command]) => (pid === child.pid && running) || command.includes(profile)
+    || owned.some((entry) => entry.pid === pid && command.includes(entry.marker))).map((row) => [row[0], row]));
+  for (let grew = descendants; grew;) {
+    grew = false;
+    for (const row of rows) {
+      const parent = selected.get(row[1]);
+      if (parent && !selected.has(row[0]) && BigInt(row[2] || 0) >= BigInt(parent[2] || 0)) { selected.set(row[0], row); grew = true; }
+    }
   }
-  return selectOwned(list(), child, owned, profile);
+  return [...selected.values()].filter(([pid]) => pid !== process.pid);
+}
+
+// Stops each target only if its ID still names the process listed, by its
+// start time, checked just before the stop.
+function stopVerified(targets) {
+  const script = `$ErrorActionPreference = 'SilentlyContinue'; foreach ($t in (ConvertFrom-Json '${JSON.stringify(targets)}')) {
+    $p = Get-CimInstance Win32_Process -Filter "ProcessId=$($t.pid)"
+    if ($p -and [string]$p.CreationDate.ToFileTimeUtc() -eq $t.created) { Stop-Process -Id $t.pid -Force } }`;
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], { windowsHide: true, timeout: 30_000 });
+  if (result.status !== 0) throw new Error(`Cannot stop Windows processes: ${result.stderr || result.error}`);
+}
+
+function stopWindows(child, owned, profile, { list = windowsProcesses, stop = stopVerified } = {}) {
+  // Node's handle names the file itself, never a process that reused its ID.
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  const targets = selectWindows(list(), child, owned, profile).filter(([pid]) => pid !== child.pid);
+  if (targets.length) stop(targets.map(([pid, , created]) => ({ pid, created })));
+}
+
+function ownedLeft(child, owned, profile, { list } = {}) {
+  if (process.platform === "win32") return selectWindows((list ?? windowsProcesses)(), child, owned, profile, { descendants: false }).map(([pid, , , command]) => [pid, null, command]);
+  return selectOwned((list ?? (() => posixProcesses(profile)))(), child, owned, profile);
 }
 
 // Signals every target, each on its own: one that fails does not keep the
-// others running. A group that rejects the signal (macOS Chrome can put
+// others running, and one that is no longer the run's when its turn comes
+// is not signalled. A group that rejects the signal (macOS Chrome can put
 // protected helpers in its group, ui-races.test.mjs) is stopped through its
-// members in the same listing. Failures are reported after every target has
-// been tried.
-function stopOwned(child, owned, profile, { list, kill = (target, signal) => process.kill(target, signal) } = {}) {
-  const left = ownedLeft(child, owned, profile, { list });
-  if (process.platform === "win32") {
-    if (child.exitCode === null && child.signalCode === null) spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, timeout: 15_000 });
-    for (const [pid] of left) spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, timeout: 15_000 });
-    return;
-  }
+// members. Failures are reported after every target has been tried.
+function stopOwned(child, owned, profile, { list, kill = (target, signal) => process.kill(target, signal), ...windows } = {}) {
+  if (process.platform === "win32") { stopWindows(child, owned, profile, { list, ...windows }); return; }
+  const current = () => ownedLeft(child, owned, profile, { list });
+  const targetsOf = (left) => new Set(left.map(([pid, group]) => (group === null ? pid : -group)));
   const errors = [];
   const signal = (target) => {
     try { kill(target, "SIGKILL"); return true; }
@@ -128,9 +180,9 @@ function stopOwned(child, owned, profile, { list, kill = (target, signal) => pro
       return false;
     }
   };
-  for (const target of new Set(left.map(([pid, group]) => (group === null ? pid : -group)))) {
-    if (signal(target) || target > 0) continue;
-    for (const [pid, group] of left) if (-group === target) signal(pid);
+  for (const target of targetsOf(current())) {
+    if (!targetsOf(current()).has(target) || signal(target) || target > 0) continue;
+    for (const [pid, group] of current()) if (-group === target) signal(pid);
   }
   if (errors.length) throw new AggregateError(errors, `Cannot stop the run's processes: ${errors.map((error) => error.message).join("; ")}`);
 }
@@ -138,18 +190,18 @@ function stopOwned(child, owned, profile, { list, kill = (target, signal) => pro
 // cancel defaults to asking the file over IPC; a test may end the owner
 // instead. A closed channel does not throw on send: it reports the error
 // later, to the callback, so asking a file that has gone is a no-op.
-// stop may give stopOwned another kill (the EPERM test). The output is
+// stop may give stopOwned another kill (the EPERM test); owned may be the
+// caller's own list of the reports, to see them as they come. The output is
 // closed, the run checked for what is left and the profile removed even if
 // a stop fails; the run's stop failures are returned in stopErrors.
 const askCancel = (child) => { if (child.connected) child.send("cancel", () => {}); };
-async function runOwned(args, { env, cancelAt, graceMs, closeMs = 10_000, cancel = askCancel, stop = {} }) {
+async function runOwned(args, { env, cancelAt, graceMs, closeMs = 10_000, cancel = askCancel, stop = {}, owned = [] }) {
   const profile = mkdtempSync(path.join(tmpdir(), "outright-fixture-owner-"));
   const runEnv = { ...env, OUTRIGHT_TEST_UI_PROFILE: profile };
   delete runEnv.NODE_TEST_CONTEXT;
   const child = spawn(process.execPath, args, {
     cwd: root, env: runEnv, stdio: ["ignore", "pipe", "pipe", "ipc"], detached: process.platform !== "win32", windowsHide: true,
   });
-  const owned = [];
   let output = "";
   child.stdout.on("data", (chunk) => { output += chunk; });
   child.stderr.on("data", (chunk) => { output += chunk; });
@@ -157,17 +209,19 @@ async function runOwned(args, { env, cancelAt, graceMs, closeMs = 10_000, cancel
     if (typeof message?.owned === "string" && Number.isInteger(message.pid) && typeof message.marker === "string" && message.marker) owned.push({ role: message.owned, pid: message.pid, marker: message.marker });
   });
   // "close" comes only once the file has exited and every holder of its output has closed it.
-  const closed = new Promise((resolve) => child.once("close", (code, signal) => resolve({ code, signal })));
+  const closed = new Promise((resolve) => child.once("close", (code, signal) => resolve({ code, signal, closedAt: Date.now() })));
   const within = (ms) => { let timer; return Promise.race([closed, new Promise((resolve) => { timer = setTimeout(() => resolve(null), ms); })]).finally(() => clearTimeout(timer)); };
   const stopErrors = [];
   const tryStop = () => { try { stopOwned(child, owned, profile, stop); } catch (error) { stopErrors.push(error); } };
   let outcome = "finished";
   let result = null;
   let left = [];
+  let cancelledAt = null;
   try {
-    result = await Promise.race([closed, cancelAt(owned).then(() => null)]);
+    result = await Promise.race([closed, cancelAt(owned, profile).then(() => null)]);
     if (!result) {
       outcome = "cancelled";
+      cancelledAt = Date.now();
       cancel(child);
       result = await within(graceMs);
     }
@@ -184,9 +238,24 @@ async function runOwned(args, { env, cancelAt, graceMs, closeMs = 10_000, cancel
     } catch (error) { stopErrors.push(error); }
     rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
-  return { ...result, outcome, output, owned, left, stopErrors, profile, outputClosed: Boolean(result) };
+  // How long the file took to close after the cancel, for a failure's message.
+  const cancelToCloseMs = result && cancelledAt ? result.closedAt - cancelledAt : null;
+  return { ...result, outcome, output, owned, left, stopErrors, profile, cancelToCloseMs, outputClosed: Boolean(result) };
 }
 const after = (ms) => new Promise((resolve) => { setTimeout(resolve, ms).unref?.(); });
+// A process's command line as ps shows it, or "" once it has gone.
+const commandOf = (pid) => spawnSync("/bin/ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8", timeout: 5_000 }).stdout?.trim() ?? "";
+
+// Another run's processes, alive for this whole file: their command lines
+// have what this file's runs use (owned-hang's marker and a fixture Vite
+// title), but they are not this file's. No run's stop may take them.
+const decoyMarker = `outright-owned-hang-decoy-${randomUUID()} outright-ui-races-vite-decoy-${randomUUID()}`;
+let decoy;
+before(() => {
+  if (process.platform === "win32") return;
+  decoy = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", decoyMarker], { stdio: "ignore", detached: true });
+});
+afterAll(() => { if (decoy?.exitCode === null && decoy.signalCode === null) decoy.kill("SIGKILL"); });
 const ownedReported = (owned, roles, limitMs) => new Promise((resolve) => {
   const until = Date.now() + limitMs;
   const check = () => (roles.every((role) => owned.some((entry) => entry.role === role)) || Date.now() > until ? resolve() : setTimeout(check, 50).unref());
@@ -233,6 +302,30 @@ test("in the production build, failed PDF viewer and pdf.js chunks load again in
   assert.match(run.output, /(?:#|ℹ) pass 1\b/, run.output.slice(-4000));
 });
 
+// The build runs before anything reports, and blocks the file, so a run
+// stopped mid-build is forced. Its build is in the owner's profile, which
+// the owner removes.
+test("a built fixture forced to stop mid-build leaves neither its build nor the owner's profile", { timeout: 120_000 }, async () => {
+  const env = { ...process.env, OUTRIGHT_UI_BUILD: "1", OUTRIGHT_UI_STEP: "files pdf build load" };
+  let build;
+  const building = (owned, profile) => new Promise((resolve) => {
+    const until = Date.now() + 60_000;
+    const check = () => {
+      // The profile is gone once the run has ended without a build.
+      build = existsSync(profile) ? readdirSync(profile).find((name) => name.startsWith("outright-ui-build-")) : undefined;
+      if (build || !existsSync(profile) || Date.now() > until) resolve(); else setTimeout(check, 50);
+    };
+    check();
+  });
+  const run = await runOwned(browserRun, { env, cancelAt: building, cancel: () => {}, graceMs: 0 });
+  assert(build, `the fixture did not build in the owner's profile: ${run.output.slice(-2000)}`);
+  assert.equal(run.outcome, "forced", run.output.slice(-2000));
+  assert(run.outputClosed, "the fixture's output stayed open");
+  assert.deepEqual(run.left, [], "the fixture left processes running");
+  assert.deepEqual(run.stopErrors, []);
+  assert(!existsSync(path.join(run.profile, build)) && !existsSync(run.profile), "the build or the owner's profile was left behind");
+});
+
 test("a hung fixture is cancelled by its owner, and its Vite, Chrome and output end with it", { timeout: 120_000 }, async () => {
   const env = { ...process.env, OUTRIGHT_TEST_UI_HANG: "1", OUTRIGHT_UI_STEP: "recovery actions" };
   delete env.OUTRIGHT_UI_BUILD;
@@ -253,7 +346,13 @@ test("a hung fixture is cancelled by its owner, and its Vite, Chrome and output 
 // Chrome run in groups of their own. This owner starts the fixture as
 // runOwned does, passes its own output on, and relays what it reports; the
 // fixture must take the owner's channel closing as a cancel. The fixture's
-// title is this launch's alone, its marker.
+// title is this launch's alone, its marker. On Windows, libuv puts each
+// child it does not detach in a job that ends when its parent does
+// (src/win/process.c, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE): Windows ends the
+// fixture as its owner dies, and the fixture's own job ends its Vite and
+// Chrome, before the fixture can say why (the owner's output closes about
+// a second after the kill, with nothing more in it). There the fixture
+// still must not outlive its owner, nor leave anything running.
 const dyingOwner = `
 const { spawn } = require("node:child_process");
 const title = process.argv[2];
@@ -268,13 +367,14 @@ test("a hung fixture whose owner is killed stops its Vite, Chrome and output", {
     env, cancelAt: (owned) => ownedReported(owned, ["Vite", "Chrome"], 60_000).then(() => after(1_000)), graceMs: cleanupGraceMs,
     cancel: (child) => child.kill("SIGKILL"),
   });
-  assert.deepEqual(run.owned.map((entry) => entry.role).sort(), ["Chrome", "Vite", "fixture"], run.output.slice(-2000));
-  assert.equal(run.outcome, "cancelled", `the fixture did not end when its owner died: ${run.output.slice(-2000)}`);
-  assert.equal(run.signal, "SIGKILL");
-  assert.match(run.output, /The fixture's owner went away/);
-  assert.doesNotMatch(run.output, /UI harness cleanup failed/);
-  assert(run.outputClosed, "the fixture's output stayed open");
-  assert.deepEqual(run.left, [], "the fixture left processes running");
+  const seen = JSON.stringify({ outcome: run.outcome, signal: run.signal, cancelToCloseMs: run.cancelToCloseMs, left: run.left, output: run.output.slice(-2000) });
+  assert.deepEqual(run.owned.map((entry) => entry.role).sort(), ["Chrome", "Vite", "fixture"], seen);
+  assert.equal(run.outcome, "cancelled", `the fixture did not end when its owner died: ${seen}`);
+  assert.equal(run.signal, "SIGKILL", seen);
+  if (process.platform !== "win32") assert.match(run.output, /The fixture's owner went away/, seen);
+  assert.doesNotMatch(run.output, /UI harness cleanup failed/, seen);
+  assert(run.outputClosed, `the fixture's output stayed open: ${seen}`);
+  assert.deepEqual(run.left, [], `the fixture left processes running: ${seen}`);
   assert.deepEqual(run.stopErrors, []);
   assertMarkersAreTheRunsOwn(run);
 });
@@ -322,18 +422,15 @@ test("a forced stop whose group signals are refused stops the run through its me
 });
 
 test("a forced stop that cannot stop a process still closes the run and removes its profile, and reports the failure", { skip: process.platform === "win32", timeout: 60_000 }, async () => {
-  // The service refuses every signal; the fixture and its helper do not.
-  let service = [];
-  const list = () => {
-    const rows = posixProcesses();
-    service = rows.filter(([, , command]) => command.includes("outright-owned-hang-")).map(([pid]) => pid);
-    return rows;
-  };
-  const kill = (target, signal) => { if (service.includes(Math.abs(target))) throw refused(target); process.kill(target, signal); };
+  // The reported service refuses every signal; the fixture and its helper
+  // do not. Only what the run reported is refused, and killed afterwards.
+  const owned = [];
+  const service = (target) => owned.some((entry) => entry.role === "service" && entry.pid === Math.abs(target));
+  const kill = (target, signal) => { if (service(target)) throw refused(target); process.kill(target, signal); };
   let run;
   try {
     run = await runOwned([ownedHang], {
-      env: process.env, cancelAt: (owned) => ownedReported(owned, ["service"], 10_000), graceMs: 1_000, stop: { list, kill },
+      env: process.env, owned, cancelAt: () => ownedReported(owned, ["service"], 10_000), graceMs: 1_000, stop: { kill },
     });
     assert.equal(run.outcome, "forced", run.output);
     assert(run.outputClosed, "the fixture's output stayed open");
@@ -342,6 +439,59 @@ test("a forced stop that cannot stop a process still closes the run and removes 
     assert(run.left[0].startsWith(`${run.owned[0].pid} `), run.left.join("\n"));
     assert(run.stopErrors.length >= 1 && run.stopErrors.every((error) => /EPERM/.test(error.message)), run.stopErrors.map((error) => error.message).join("; "));
   } finally {
-    for (const pid of service) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
+    for (const entry of owned) if (commandOf(entry.pid).includes(entry.marker)) process.kill(entry.pid, "SIGKILL");
   }
+});
+
+test("the forced stop takes only the members of a leaderless group that have the run's token", { skip: process.platform === "win32" }, () => {
+  const profile = "/tmp/outright-fixture-owner-test";
+  const gone = { pid: 100, exitCode: 0, signalCode: null };
+  const owned = [{ role: "Vite", pid: 300, marker: "outright-ui-races-vite-test" }];
+  // Vite (300) has gone; its group's ID may now be another run's.
+  const rows = [[301, 300, "esbuild --service", true], [302, 300, "another run's helper", false], [101, 100, "node helper", true], [103, 100, "another run's node", false]];
+  assert.deepEqual(selectOwned(rows, gone, owned, profile), [[301, null, "esbuild --service"], [101, null, "node helper"]]);
+  const signalled = [];
+  stopOwned(gone, owned, profile, { list: () => rows, kill: (target) => signalled.push(target) });
+  assert.deepEqual(signalled, [301, 101]);
+});
+
+test("the forced stop does not signal a target whose ID names another process by its turn", { skip: process.platform === "win32" }, () => {
+  const profile = "/tmp/outright-fixture-owner-test";
+  const gone = { pid: 100, exitCode: 0, signalCode: null };
+  const owned = [{ role: "Vite", pid: 300, marker: "outright-ui-races-vite-test" }, { role: "service", pid: 400, marker: "outright-owned-hang-test" }];
+  const listings = [
+    [[300, 300, "outright-ui-races-vite-test", true], [400, 400, "node -e outright-owned-hang-test", true], [500, 500, "helper", true]],
+    // Before its turn Vite's ID is another run's Vite, and the helper's another process.
+    [[300, 300, "outright-ui-races-vite-other", false], [400, 400, "node -e outright-owned-hang-test", true], [500, 500, "unrelated", false]],
+  ];
+  let call = 0;
+  const signalled = [];
+  stopOwned(gone, owned, profile, { list: () => listings[Math.min(call++, 1)], kill: (target) => signalled.push(target) });
+  assert.deepEqual(signalled, [-400]);
+});
+
+test("on Windows the forced stop takes the run's roots and their later children, and checks each start time again", () => {
+  const profile = "C:\\Temp\\outright-fixture-owner-test";
+  const child = { pid: 10, exitCode: 0, signalCode: null };
+  const owned = [{ role: "Vite", pid: 20, marker: "outright-ui-races-vite-test" }, { role: "Chrome", pid: 30, marker: profile }];
+  const rows = [
+    [20, 10, "200", "node --title=outright-ui-races-vite-test vite.js"], [21, 20, "210", "esbuild --service"],
+    [30, 10, "300", `chrome.exe --user-data-dir=${profile}`], [31, 30, "310", "chrome.exe --type=renderer"], [32, 31, "320", "chrome.exe --type=gpu"],
+    // 40 reused a reported ID; 41 names a selected parent but started before it, so its parent ID was reused.
+    [40, 1, "400", "node another-run.js"], [41, 30, "100", "older process"], [42, 40, "420", "child of another run"],
+  ];
+  const reportedAgain = [...owned, { role: "Vite", pid: 40, marker: "outright-ui-races-vite-earlier" }];
+  assert.deepEqual(selectWindows(rows, child, reportedAgain, profile).map(([pid]) => pid), [20, 30, 21, 31, 32]);
+  let targets;
+  const running = { pid: 10, exitCode: null, signalCode: null, kill: (signal) => { running.killed = signal; } };
+  stopWindows(running, owned, profile, { list: () => [[10, 1, "100", "node fixture"], ...rows], stop: (list) => { targets = list; } });
+  assert.equal(running.killed, "SIGKILL");
+  assert.deepEqual(targets, [{ pid: 20, created: "200" }, { pid: 30, created: "300" }, { pid: 21, created: "210" }, { pid: 31, created: "310" }, { pid: 32, created: "320" }]);
+});
+
+// Last in the file: every run above has been stopped by now.
+test("no run's stop took another run's processes", { skip: process.platform === "win32" }, () => {
+  assert.equal(decoy.exitCode, null);
+  assert.equal(decoy.signalCode, null);
+  assert(commandOf(decoy.pid).includes(decoyMarker), "another run's process was stopped");
 });

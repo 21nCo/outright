@@ -110,5 +110,9 @@ export default defineConfig({
   },
   // The app builds its PDF worker as an ES module (vite.config.mjs).
   worker: { format: "es" },
+  // Vite's first scan follows the page's imports, not the worker's, so on
+  // an empty cache the first worker load (pdf-worker-entry.js) would find
+  // pdf.js's worker late, re-optimize and reload the page mid-run.
+  optimizeDeps: { include: ["pdfjs-dist/build/pdf.worker.min.mjs"] },
   plugins: [tailwindcss(), react(), fixtureRawFiles, pdfjsAssetsPlugin()],
 });
