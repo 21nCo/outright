@@ -164,7 +164,11 @@ function killWindowsOwned(item) {
   if (!Number.isSafeInteger(item.CreatedMs)) throw new Error(`Windows process ${item.ProcessId} has no verified creation time`);
   // A .NET Process handle is held across the identity check and Kill(), so a
   // recycled numeric PID cannot become the termination target between them.
-  const command = `$p=[System.Diagnostics.Process]::GetProcessById(${Number(item.ProcessId)}); try { $handle=$p.Handle; if (([DateTimeOffset]$p.StartTime).ToUnixTimeMilliseconds() -eq ${item.CreatedMs}) { $p.Kill() } } finally { $p.Dispose() }`;
+  // The start time is read again from the CIM listing CreatedMs came from, so
+  // the check compares one source's values exactly. A target left running is
+  // found by the caller's liveness check.
+  const pid = Number(item.ProcessId);
+  const command = `$p=[System.Diagnostics.Process]::GetProcessById(${pid}); try { $handle=$p.Handle; $row=Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}'; if ($row -and ([DateTimeOffset]$row.CreationDate).ToUnixTimeMilliseconds() -eq ${item.CreatedMs}) { $p.Kill() } } finally { $p.Dispose() }`;
   const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command],
     { encoding: "utf8", windowsHide: true, timeout: 8_000 });
   // A process exiting during acquisition is not an error if the later liveness

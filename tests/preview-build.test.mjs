@@ -149,9 +149,9 @@ function selectWindows(rows, child, owned, profile, { descendants = true } = {})
 // Stops each target only if its ID still names the process listed, by its
 // start time. A .NET Process handle is held across that check and Kill()
 // (as ui-races.test.mjs's killWindowsOwned does), so an ID reused between
-// them cannot become the target. The start time is read again from the same
-// CIM listing the target came from, so the check compares one source's
-// values exactly. One that has gone is skipped; one that could not be
+// them cannot become the target. Like killWindowsOwned, it reads the start
+// time again from the CIM listing the target came from, so the check
+// compares one source's values exactly. One that has gone is skipped; one that could not be
 // stopped and still runs is reported. Returns what it did with each target,
 // with .NET's own start time beside the listed one.
 function stopVerified(targets) {
