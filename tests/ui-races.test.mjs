@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -14,6 +15,31 @@ const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
 const stubbornChild = path.join(root, "tests", "fixtures", "stubborn-child.mjs");
 const cooperativeChild = path.join(root, "tests", "fixtures", "cooperative-child.mjs");
 const exitedLeader = path.join(root, "tests", "fixtures", "exited-leader.mjs");
+
+// An owner that runs this file (tests/preview-build.test.mjs) may cancel it
+// over IPC, and losing the owner (its channel closes when it dies, even by
+// SIGKILL) cancels it the same way. The browser test then stops waiting,
+// and its own cleanup stops Chrome, Vite and their files before the file
+// exits. It reports each tree it starts to the owner first, with a marker
+// that only that launch's command line has, so the owner can stop them
+// itself if that cleanup hangs.
+const ownerCancel = new AbortController();
+if (process.send) {
+  process.on("message", (message) => { if (message === "cancel") ownerCancel.abort(new Error("The fixture's owner cancelled it")); });
+  process.once("disconnect", () => {
+    // A dead owner may have closed this file's output too; a failed write
+    // must not end the file before its cleanup has run.
+    for (const stream of [process.stdout, process.stderr]) stream.on("error", () => {});
+    ownerCancel.abort(new Error("The fixture's owner went away"));
+  });
+  process.channel?.unref();
+}
+// A closed channel does not throw on send: it reports the error later, to the
+// callback here, so a report to an owner that has gone is a no-op.
+function reportOwned(role, child, marker) {
+  if (!process.connected || !child?.pid) return;
+  process.send({ owned: role, pid: child.pid, marker }, () => {});
+}
 
 function chromeExecutable() {
   const candidates = [
@@ -44,6 +70,7 @@ async function unusedPort() {
 
 async function waitForServer(url, child, logs, deadline = Date.now() + 20_000) {
   while (Date.now() < deadline) {
+    ownerCancel.signal.throwIfAborted();
     if (child.exitCode !== null) throw new Error(`Vite exited before the UI harness loaded:\n${logs()}`);
     try {
       const response = await fetch(url, { signal: AbortSignal.timeout(Math.max(1, Math.min(2_000, deadline - Date.now()))) });
@@ -137,7 +164,11 @@ function killWindowsOwned(item) {
   if (!Number.isSafeInteger(item.CreatedMs)) throw new Error(`Windows process ${item.ProcessId} has no verified creation time`);
   // A .NET Process handle is held across the identity check and Kill(), so a
   // recycled numeric PID cannot become the termination target between them.
-  const command = `$p=[System.Diagnostics.Process]::GetProcessById(${Number(item.ProcessId)}); try { $handle=$p.Handle; if (([DateTimeOffset]$p.StartTime).ToUnixTimeMilliseconds() -eq ${item.CreatedMs}) { $p.Kill() } } finally { $p.Dispose() }`;
+  // The start time is read again from the CIM listing CreatedMs came from, so
+  // the check compares one source's values exactly. A target left running is
+  // found by the caller's liveness check.
+  const pid = Number(item.ProcessId);
+  const command = `$p=[System.Diagnostics.Process]::GetProcessById(${pid}); try { $handle=$p.Handle; $row=Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}'; if ($row -and ([DateTimeOffset]$row.CreationDate).ToUnixTimeMilliseconds() -eq ${item.CreatedMs}) { $p.Kill() } } finally { $p.Dispose() }`;
   const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command],
     { encoding: "utf8", windowsHide: true, timeout: 8_000 });
   // A process exiting during acquisition is not an error if the later liveness
@@ -261,6 +292,7 @@ async function cleanupResources(steps) {
 
 async function waitForJson(url, child, logs, diagnostic, deadline = Date.now() + 45_000) {
   while (Date.now() < deadline) {
+    ownerCancel.signal.throwIfAborted();
     if (hasExited(child)) throw new Error(`Chrome exited before DevTools was ready: ${diagnostic()}; output: ${logs()}`);
     try {
       const response = await fetch(url, { signal: AbortSignal.timeout(Math.max(1, Math.min(2_000, deadline - Date.now()))) });
@@ -275,6 +307,7 @@ async function waitForDevToolsPort(profile, child, logs, diagnostic, deadline) {
   const marker = path.join(profile, "DevToolsActivePort");
   let lastMarker = "missing";
   while (Date.now() < deadline) {
+    ownerCancel.signal.throwIfAborted();
     if (hasExited(child)) throw new Error(`Chrome exited before DevTools selected a port: ${diagnostic()}; output: ${logs()}`);
     if (existsSync(marker)) {
       try {
@@ -351,6 +384,7 @@ async function closeDevTools(devtools) {
 async function waitForFixture(send, deadline, diagnostics = () => "") {
   let state;
   while (Date.now() < deadline) {
+    ownerCancel.signal.throwIfAborted();
     let evaluated;
     try {
       evaluated = await send("Runtime.evaluate", {
@@ -672,12 +706,12 @@ test("nested runner deadline exceeds its child's full browser budget", () => {
 
 test("the per-file deadline outlives the browser fixture and the file's earlier tests", () => {
   // macOS CI spent 17 seconds on this file's earlier tests and needs about
-  // 320 seconds for the 162-step interaction phase.
+  // 340 seconds for the 169-step interaction phase.
   for (const budget of [ordinaryBudget, wheelBudget]) {
     assert(budget.fixtureMs >= budget.phaseMs + 25_000);
     assert(budget.fileMs >= budget.fixtureMs + 30_000);
   }
-  assert(ordinaryBudget.phaseMs >= 320_000 + 60_000);
+  assert(ordinaryBudget.phaseMs >= 340_000 + 80_000);
   assert(wheelBudget.phaseMs > ordinaryBudget.phaseMs);
   for (const cap of [Number.NaN, -1, 0, 1001, 5000]) assert.deepEqual(uiFixtureBudget(cap), ordinaryBudget, `cap=${cap}`);
   for (const cap of [1, 120, 1000]) assert.deepEqual(uiFixtureBudget(cap), wheelBudget, `cap=${cap}`);
@@ -688,16 +722,18 @@ test("the per-file deadline outlives the browser fixture and the file's earlier 
 });
 
 test("the serial suite deadline composes the slowest serial files with the browser file's and fits the CI job", () => {
-  // Windows CI's slowest observed total: 1287 seconds of serial files and the
-  // browser file at about 240 seconds with this fixture's steps.
-  const slowestTotal = 1_287_000 + 240_000;
+  // Windows CI's slowest observed total (tests/ui-fixture-budget.mjs): 1287
+  // seconds of serial files, about 59 for the production preview build file
+  // (39 observed and about 20 for its owner tests) and the browser file at
+  // about 260 seconds with this fixture's steps: 1606.
+  const slowestTotal = 1_287_000 + 59_000 + 260_000;
   const jobMs = Number(/timeout-minutes:\s*(\d+)/.exec(readFileSync(path.join(root, ".github", "workflows", "ci.yml"), "utf8"))?.[1]) * 60_000;
   for (const budget of [ordinaryBudget, wheelBudget]) {
     assert(budget.suiteMs >= SERIAL_FILES_MS + budget.fileMs, `suite ${budget.suiteMs} < serial files + file ${budget.fileMs}`);
     assert(budget.suiteMs >= slowestTotal * 1.1, `suite ${budget.suiteMs} leaves under 10% over ${slowestTotal}`);
     assert(budget.suiteMs + CI_JOB_SETUP_MS <= jobMs, `suite ${budget.suiteMs} and setup do not fit the ${jobMs}ms CI job`);
   }
-  assert(SERIAL_FILES_MS >= 1_287_000);
+  assert(SERIAL_FILES_MS >= 1_287_000 + 59_000);
 });
 
 test("scripts/run-tests.mjs gives the suite the composed deadline", { timeout: 30_000 }, () => {
@@ -771,20 +807,56 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
   // Reserve the last part of the test's own bound for independent cleanup.
   const deadline = Date.now() + browserPhaseTimeout;
   let phase = "allocate fixture";
+  // The build serves the production-only steps, not the development
+  // server's module paths that others load directly (files pdf viewer,
+  // library and worker load), so a built run takes only the steps it names.
+  if (process.env.OUTRIGHT_UI_BUILD === "1" && !process.env.OUTRIGHT_UI_STEP) {
+    throw new Error("OUTRIGHT_UI_BUILD=1 runs only the steps OUTRIGHT_UI_STEP names, such as \"files pdf build load\"");
+  }
   const remaining = () => {
+    ownerCancel.signal.throwIfAborted();
     const duration = deadline - Date.now();
     if (duration <= 0) throw new Error(`UI fixture exceeded its pre-cleanup deadline during ${phase}`);
     return duration;
   };
   const port = await unusedPort();
+  // A cancel or the deadline while waiting for the port ends the test before
+  // it allocates anything.
+  remaining();
   const profile = process.env.OUTRIGHT_TEST_UI_PROFILE ?? mkdtempSync(path.join(tmpdir(), "outright-ui-races-"));
-  const vite = spawn(process.execPath, [viteCli, "--config", "tests/vite.ui-races.config.mjs", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
+  // OUTRIGHT_UI_BUILD=1 builds the fixture as the app is built and serves
+  // the build (tests/preview-build.test.mjs), so a step loads production
+  // chunks instead of the development server's modules. Under an owner the
+  // build goes in the owner's profile, which the owner removes even when it
+  // has to force the fixture to stop (mid-build, or in a stalled cleanup).
+  let built = null;
+  try {
+    if (process.env.OUTRIGHT_UI_BUILD === "1") {
+      built = mkdtempSync(path.join(process.env.OUTRIGHT_TEST_UI_PROFILE ?? tmpdir(), "outright-ui-build-"));
+      phase = "build the fixture";
+      const result = spawnSync(process.execPath, [viteCli, "build", "--config", "tests/vite.ui-races.config.mjs", "--outDir", built, "--emptyOutDir", "--logLevel", "warn"], {
+        cwd: root, env: { ...process.env, NO_COLOR: "1" }, encoding: "utf8", timeout: Math.min(120_000, remaining()), windowsHide: true,
+      });
+      if (result.status !== 0) throw new Error(`The fixture did not build: ${result.error?.message ?? ""}${result.stderr?.slice(-2000) ?? ""}`);
+    }
+  } catch (error) {
+    // Nothing has started yet; the cleanup below covers only what follows.
+    if (built) rmSync(built, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    if (!process.env.OUTRIGHT_TEST_UI_PROFILE) rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    throw error;
+  }
+  const server = built ? ["preview", "--outDir", built] : [];
+  // The title is this launch's alone, so an owner that stops reported trees
+  // never takes another run's Vite, with a recycled process ID, for this one.
+  const viteTitle = `outright-ui-races-vite-${randomUUID()}`;
+  const vite = spawn(process.execPath, [`--title=${viteTitle}`, viteCli, ...server, "--config", "tests/vite.ui-races.config.mjs", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
     cwd: root,
     env: { ...process.env, NO_COLOR: "1" },
     stdio: ["ignore", "pipe", "pipe"],
     detached: process.platform !== "win32",
     windowsHide: true,
   });
+  reportOwned("Vite", vite, viteTitle);
   let output = "";
   vite.stdout.on("data", (chunk) => { output += chunk; });
   vite.stderr.on("data", (chunk) => { output += chunk; });
@@ -827,6 +899,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       });
     } finally { closeSync(logFd); }
     browser.profile = profile;
+    reportOwned("Chrome", browser, profile);
     const logs = () => {
       try { return readFileSync(browserLog, "utf8").slice(-10_000); }
       catch { return ""; }
@@ -1015,7 +1088,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
         }
         if (event.params.name !== "__requestFixtureViewport") return;
         const width = Number(event.params.payload);
-        if (![1280, 1200, 900, 760, 640, 620, 390, 360].includes(width)) throw new Error(`Unexpected fixture viewport: ${width}`);
+        if (![1280, 1200, 900, 760, 640, 620, 390, 360, 320].includes(width)) throw new Error(`Unexpected fixture viewport: ${width}`);
         await send("Emulation.setDeviceMetricsOverride", { width, height: 844, deviceScaleFactor: 1, mobile: false });
         await send("Runtime.evaluate", { expression: `window.dispatchEvent(new CustomEvent("fixture-viewport-ready", { detail: ${width} }))` });
       })().catch((error) => { viewportError = error; });
@@ -1027,6 +1100,25 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
     await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
     await send("Page.navigate", { url });
     phase = "run browser interaction fixtures";
+    // An injected hang (tests/preview-build.test.mjs): the fixture never
+    // reports, so only the owner's cancel, losing the owner, or the phase
+    // deadline ends this wait.
+    if (process.env.OUTRIGHT_TEST_UI_HANG === "1") {
+      phase = "hang until the owner cancels";
+      let timer;
+      let onAbort;
+      try {
+        await new Promise((_, reject) => {
+          onAbort = () => reject(ownerCancel.signal.reason);
+          timer = setTimeout(() => reject(new Error(`UI fixture exceeded its pre-cleanup deadline during ${phase}`)), Math.max(0, deadline - Date.now()));
+          if (ownerCancel.signal.aborted) onAbort();
+          else ownerCancel.signal.addEventListener("abort", onAbort, { once: true });
+        });
+      } finally {
+        clearTimeout(timer);
+        ownerCancel.signal.removeEventListener("abort", onAbort);
+      }
+    }
     const state = await waitForFixture(async (method, params) => {
       if (viewportError) throw viewportError;
       if (pageErrors.length) throw new Error(`Uncaught browser error: ${pageErrors.join("; ")}`);
@@ -1036,7 +1128,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
       devtoolsReady: devtools?.socket.readyState, viteOutput: output.slice(-500) }));
     assert.equal(pageErrors.length, 0, `Uncaught browser error: ${pageErrors.join("; ")}`);
     const selectedCount = process.env.OUTRIGHT_UI_STEP?.split(",").length;
-    const expectedCount = selectedCount ?? 156 + motionStepCount;
+    const expectedCount = selectedCount ?? 163 + motionStepCount;
     const completedCount = Number(state.text.match(/(\d+) interaction regressions passed/)?.[1]);
     assert.equal(completedCount, expectedCount,
       `browser fixture completed ${completedCount || 0} of ${expectedCount} expected interactions; last step: ${state.progress?.step ?? "unknown"}`);
@@ -1057,6 +1149,7 @@ test("browser interaction regressions pass in headless Chrome", { timeout: brows
         ["Chrome tree", () => stop(browser)],
         ["Vite tree", () => stop(vite)],
         ["Chrome profile", () => rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })],
+        ["fixture build", () => built && rmSync(built, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })],
       ]);
     } catch (error) {
       if (failure) throw new AggregateError([failure, error], `UI fixture failed: ${failure.message}; ${error.message}`);
