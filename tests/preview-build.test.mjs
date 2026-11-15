@@ -184,13 +184,17 @@ function stopOwned(child, owned, profile, { list, kill = (target, signal) => pro
       return false;
     }
   };
+  // Each turn signals one target from a fresh listing: first the members of
+  // a group that refused the signal, then the next target not yet tried.
   const tried = new Set();
+  const refusing = new Set();
   for (let turns = 0; turns < 1_000; turns++) {
-    const target = [...targetsOf(current())].find((candidate) => !tried.has(candidate));
+    const left = current();
+    const target = left.find(([pid, group]) => refusing.has(group) && !tried.has(pid))?.[0]
+      ?? [...targetsOf(left)].find((candidate) => !tried.has(candidate));
     if (target === undefined) break;
     tried.add(target);
-    if (signal(target) || target > 0) continue;
-    for (const [pid, group] of current()) if (-group === target && !tried.has(pid)) { tried.add(pid); signal(pid); }
+    if (!signal(target) && target < 0) refusing.add(-target);
   }
   if (errors.length) throw new AggregateError(errors, `Cannot stop the run's processes: ${errors.map((error) => error.message).join("; ")}`);
 }
@@ -519,6 +523,10 @@ test("the forced stop goes on through the token members of a group whose leader 
   assert.deepEqual(stop([[...chrome, ...vite], vite.slice(1)]), [-200, 301]);
   // Chrome's group refuses the signal, and Chrome leaves before its members are listed.
   assert.deepEqual(stop([chrome, chrome.slice(1)], -200), [-200, 201]);
+  // Chrome's group refuses the signal; once its first helper is stopped, the
+  // next helper's ID names another process, which is left alone.
+  const helpers = [...chrome, [202, 200, "chrome helper", true]];
+  assert.deepEqual(stop([helpers, helpers, helpers, [[202, 900, "unrelated", false]]], -200), [-200, 200, 201]);
 });
 
 test("the owner's decoy does not outlive a file that is killed", { skip: process.platform === "win32", timeout: 30_000 }, async () => {
