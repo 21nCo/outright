@@ -301,6 +301,33 @@ const commandOf = (pid, { run = spawnSync } = {}) => {
   if (!row) throw new Error(`Cannot query process ${pid}: ${result.error?.message ?? `status ${result.status}, signal ${result.signal}`} ${result.stderr ?? ""}`.trim());
   return row[1].startsWith("Z") ? "" : row[2].trim();
 };
+// Kills each owned entry that still runs under its marker. Each entry stands
+// on its own: a query or kill that fails skips only that entry (an ID that was
+// not verified is never signalled), and every failure is returned.
+function killLeftovers(owned, { query = commandOf, kill = (pid, signal) => process.kill(pid, signal) } = {}) {
+  const errors = [];
+  for (const entry of owned) {
+    try {
+      if (query(entry.pid).includes(entry.marker)) kill(entry.pid, "SIGKILL");
+    } catch (error) {
+      if (error.code !== "ESRCH") errors.push(error);
+    }
+  }
+  return errors;
+}
+// Runs body, then cleanup whatever body did. Cleanup's errors are reported
+// with body's own failure, never in its place, and fail a body that passed.
+async function withCleanup(body, cleanup) {
+  let outcome;
+  try { outcome = { value: await body() }; } catch (error) { outcome = { error }; }
+  const errors = cleanup();
+  if (errors.length > 0) {
+    const all = "error" in outcome ? [outcome.error, ...errors] : errors;
+    throw new AggregateError(all, all.map((error) => error.message).join("; "), "error" in outcome ? { cause: outcome.error } : undefined);
+  }
+  if ("error" in outcome) throw outcome.error;
+  return outcome.value;
+}
 
 // Another run's processes, alive for this whole file: their command lines
 // have what this file's runs use (owned-hang's marker and a fixture Vite
@@ -488,9 +515,8 @@ test("a forced stop that cannot stop a process still closes the run and removes 
   const owned = [];
   const service = (target) => owned.some((entry) => entry.role === "service" && entry.pid === Math.abs(target));
   const kill = (target, signal) => { if (service(target)) throw refused(target); process.kill(target, signal); };
-  let run;
-  try {
-    run = await runOwned([ownedHang], {
+  await withCleanup(async () => {
+    const run = await runOwned([ownedHang], {
       env: process.env, owned, cancelAt: () => ownedReported(owned, ["service"], 10_000), graceMs: 1_000, stop: { kill },
     });
     assert.equal(run.outcome, "forced", run.output);
@@ -499,8 +525,36 @@ test("a forced stop that cannot stop a process still closes the run and removes 
     assert.equal(run.left.length, 1, run.left.join("\n"));
     assert(run.left[0].startsWith(`${run.owned[0].pid} `), run.left.join("\n"));
     assert(run.stopErrors.length >= 1 && run.stopErrors.every((error) => /EPERM/.test(error.message)), run.stopErrors.map((error) => error.message).join("; "));
+  }, () => killLeftovers(owned));
+});
+
+test("cleanup visits every owned entry, never signals one it could not verify, and reports its failures with the test's own", { skip: process.platform === "win32", timeout: 30_000 }, async () => {
+  const marker = `outright-cleanup-probe-${randomUUID()}`;
+  const start = (role) => spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", `${marker}-${role}`], { stdio: "ignore" });
+  const children = [start("unverified"), start("verified")];
+  // Read straight from ps, not through commandOf, the helper under test uses.
+  const runs = (child) => spawnSync("/bin/ps", ["-o", "command=", "-p", String(child.pid)], { encoding: "utf8" }).stdout.includes(`${marker}-`);
+  try {
+    await Promise.all(children.map((child) => new Promise((resolve) => child.once("spawn", resolve))));
+    const owned = children.map((child, index) => ({ pid: child.pid, marker: `${marker}-${index === 0 ? "unverified" : "verified"}` }));
+    const timedOut = new Error(`Cannot query process ${owned[0].pid}: spawnSync /bin/ps ETIMEDOUT`);
+    const query = (pid) => { if (pid === owned[0].pid) throw timedOut; return commandOf(pid); };
+    const signalled = [];
+    const kill = (pid, signal) => { signalled.push(pid); process.kill(pid, signal); };
+    const original = new Error("the test's own failure");
+    await assert.rejects(withCleanup(() => { throw original; }, () => killLeftovers(owned, { query, kill })),
+      (error) => error instanceof AggregateError && error.cause === original && error.errors[0] === original && error.errors[1] === timedOut
+        && error.message.includes("the test's own failure") && error.message.includes("ETIMEDOUT"));
+    assert.deepEqual(signalled, [owned[1].pid], "cleanup signalled an entry it could not verify, or skipped one it could");
+    assert(await exitsWithin(children[1], 10_000) && !runs(children[1]), "the verified entry outlived cleanup");
+    assert(runs(children[0]), "the unverified entry was stopped");
+    // A body that passed fails on its cleanup's errors; a body's failure with
+    // a clean cleanup is reported unchanged.
+    await assert.rejects(withCleanup(() => "passed", () => [timedOut]), (error) => error instanceof AggregateError && error.errors[0] === timedOut && error.cause === undefined);
+    await assert.rejects(withCleanup(() => { throw original; }, () => []), (error) => error === original);
+    assert.equal(await withCleanup(() => "passed", () => []), "passed");
   } finally {
-    for (const entry of owned) if (commandOf(entry.pid).includes(entry.marker)) process.kill(entry.pid, "SIGKILL");
+    for (const child of children) child.kill("SIGKILL");
   }
 });
 
@@ -598,12 +652,17 @@ test("a process query that fails is not read as a process that has gone", { skip
 test("the owner's decoy does not outlive a file that is killed", { skip: process.platform === "win32", timeout: 30_000 }, async () => {
   const file = spawn(process.execPath, ["-e", `const c = require("node:child_process").spawn(process.execPath, ...JSON.parse(process.argv[1]));
     console.log(c.pid); setInterval(() => {}, 1000);`, JSON.stringify([decoyArgs(`outright-decoy-probe-${randomUUID()}`), decoyOptions])], { stdio: ["ignore", "pipe", "ignore"] });
-  const pid = await new Promise((resolve) => file.stdout.once("data", (chunk) => resolve(Number.parseInt(chunk, 10))));
-  assert(commandOf(pid).includes("outright-decoy-probe-"), "the probe's decoy did not start");
-  file.kill("SIGKILL");
-  const until = Date.now() + 10_000;
-  while (commandOf(pid) && Date.now() < until) await pause(100);
-  assert.equal(commandOf(pid), "", "the decoy outlived its file");
+  try {
+    const pid = await new Promise((resolve) => file.stdout.once("data", (chunk) => resolve(Number.parseInt(chunk, 10))));
+    assert(commandOf(pid).includes("outright-decoy-probe-"), "the probe's decoy did not start");
+    file.kill("SIGKILL");
+    const until = Date.now() + 10_000;
+    while (commandOf(pid) && Date.now() < until) await pause(100);
+    assert.equal(commandOf(pid), "", "the decoy outlived its file");
+  } finally {
+    // A query that failed must not leave the file running (its decoy ends with it).
+    file.kill("SIGKILL");
+  }
 });
 
 test("on Windows the verified stop ends a process only while its start time matches", { skip: process.platform !== "win32", timeout: 60_000 }, async (t) => {
