@@ -80,23 +80,22 @@ test("the production build keeps every dynamic import in the preview path retrya
 // again. Either way, nothing the run started may outlive it or keep its
 // output open.
 const tokenOf = (profile) => `OUTRIGHT_TEST_UI_PROFILE=${profile}`;
-function posixProcesses(profile) {
-  const result = spawnSync("/bin/ps", ["-axo", "pid=,pgid=,stat=,command="], { encoding: "utf8", timeout: 5_000 });
+// On macOS ps -E adds each process's environment (only this user's) to its
+// command, so one listing gives the token with the group and command it
+// belongs to; no second listing can pair them with another process. Linux
+// reads it from /proc: a reused ID there shows the token only if the new
+// process is the run's too.
+function posixProcesses(profile, { run = spawnSync } = {}) {
+  const linux = process.platform === "linux";
+  const result = run("/bin/ps", [linux ? "-axo" : "-axEww", ...(linux ? [] : ["-o"]), "pid=,pgid=,stat=,command="], { encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024 * 1024 });
   if (result.status !== 0) throw new Error(`Cannot list processes: ${result.stderr || result.error}`);
-  const rows = result.stdout.split("\n").map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s*(.*)$/))
-    .filter((fields) => fields && !fields[3].startsWith("Z")).map((fields) => [Number(fields[1]), Number(fields[2]), fields[4]]);
   const token = tokenOf(profile);
-  let carries;
-  if (process.platform === "linux") {
-    carries = (pid) => { try { return readFileSync(`/proc/${pid}/environ`, "latin1").split("\0").includes(token); } catch { return false; } };
-  } else {
-    // ps -E adds each process's environment (only this user's) to its command.
-    const listed = spawnSync("/bin/ps", ["-axEww", "-o", "pid=,command="], { encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024 * 1024 });
-    if (listed.status !== 0) throw new Error(`Cannot list process environments: ${listed.stderr || listed.error}`);
-    const pids = new Set(listed.stdout.split("\n").filter((line) => `${line} `.includes(` ${token} `)).map((line) => Number.parseInt(line, 10)));
-    carries = (pid) => pids.has(pid);
-  }
-  return rows.map(([pid, group, command]) => [pid, group, command, carries(pid)]);
+  const carries = linux
+    ? (pid) => { try { return readFileSync(`/proc/${pid}/environ`, "latin1").split("\0").includes(token); } catch { return false; } }
+    : (pid, command) => `${command} `.includes(` ${token} `);
+  return result.stdout.split("\n").map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s*(.*)$/))
+    .filter((fields) => fields && !fields[3].startsWith("Z"))
+    .map((fields) => [Number(fields[1]), Number(fields[2]), fields[4], carries(Number(fields[1]), fields[4])]);
 }
 
 // Each process in rows ([pid, group, command, has the token]) that is the
@@ -245,7 +244,7 @@ async function runOwned(args, { env, cancelAt, graceMs, closeMs = 10_000, cancel
   } finally {
     if (!result) { child.stdout.destroy(); child.stderr.destroy(); }
     try {
-      left = ownedLeft(child, owned, profile).map(([pid, , command]) => `${pid} ${command}`);
+      left = ownedLeft(child, owned, profile).map(([pid, , command]) => `${pid} ${command.slice(0, 300)}`);
       if (left.length) tryStop();
     } catch (error) { stopErrors.push(error); }
     rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
@@ -553,6 +552,16 @@ test("on Windows the verified stop ends a process only while its start time matc
     while (target.exitCode === null && target.signalCode === null && Date.now() < until) await after(100);
     assert.notEqual(target.exitCode ?? target.signalCode, null, "the verified process was not stopped");
   } finally { target.kill(); }
+});
+
+test("on macOS one listing gives each process's group, command and token together", { skip: process.platform !== "darwin" }, () => {
+  const profile = "/tmp/outright-fixture-owner-test";
+  // A second listing would show Vite's ID as another process with the token.
+  const listings = [" 300   300 S    outright-ui-races-vite-test HOME=/x\n", ` 300   300 S    other OUTRIGHT_TEST_UI_PROFILE=${profile}\n`];
+  let calls = 0;
+  const rows = posixProcesses(profile, { run: () => ({ status: 0, stdout: listings[calls++] }) });
+  assert.equal(calls, 1);
+  assert.deepEqual(rows, [[300, 300, "outright-ui-races-vite-test HOME=/x", false]]);
 });
 
 // Last in the file: every run above has been stopped by now.
