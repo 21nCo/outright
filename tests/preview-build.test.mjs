@@ -97,7 +97,7 @@ function posixProcesses(profile, { run = spawnSync } = {}) {
   };
   const token = tokenOf(profile);
   if (linux) {
-    const carries = (pid) => { try { return readFileSync(`/proc/${pid}/environ`, "latin1").split("\0").includes(token); } catch { return false; } };
+    const carries = (pid) => { try { return readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").includes(token); } catch { return false; } };
     return list(["-axo"]).map(([pid, group, command]) => [pid, group, command, carries(pid), command]);
   }
   const rows = list(["-axEww", "-o"]);
@@ -591,6 +591,15 @@ test("no process's environment reaches what the owner shows", { skip: process.pl
   const left = selectOwned(listed, { pid: 1, exitCode: 0, signalCode: null }, [], profile);
   assert.deepEqual(left, [[400, null, "node helper"]]);
   assert(!JSON.stringify(left).includes("REVIEW_SENTINEL"));
+});
+
+test("on Linux a process is known by a token whose profile path is not ASCII", { skip: process.platform !== "linux", timeout: 30_000 }, async () => {
+  const profile = path.join(tmpdir(), `outright-fixture-owner-é-${randomUUID()}`);
+  const helper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", env: { ...process.env, OUTRIGHT_TEST_UI_PROFILE: profile } });
+  try {
+    await new Promise((resolve) => helper.once("spawn", resolve));
+    assert(posixProcesses(profile).some(([pid, , , carries]) => pid === helper.pid && carries), "the helper's token was not recognised");
+  } finally { helper.kill("SIGKILL"); }
 });
 
 // Last in the file: every run above has been stopped by now.
